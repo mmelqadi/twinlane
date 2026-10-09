@@ -424,6 +424,7 @@ class CodexSourceTests(TempState):
         self.assertIn('codex binary not found', r['note'])
         self.assertEqual(meter.finish_codex(r, self.policy)['status'], 'unknown')
 
+    @unittest.skipUnless(os.name == 'nt', 'the desktop-app copy is Windows-only')
     def test_app_server_read_holds_a_lease_on_the_private_copy(self):
         # a prune during the read must not remove the copy the app-server runs from.
         app = os.path.join(self.tmp, 'dotcodex', 'plugins', '.plugin-appserver')
@@ -446,6 +447,7 @@ class CodexSourceTests(TempState):
         self.assertEqual(len(held), 1, held)
         self.assertEqual(os.listdir(leases), [])  # released after the read
 
+    @unittest.skipUnless(os.name == 'nt', 'the desktop-app copy is Windows-only')
     def test_app_server_read_names_an_earlier_copy(self):
         # , author's choice 1: reading through an older copy must be visible in the reading.
         app = os.path.join(self.tmp, 'dotcodex', 'plugins', '.plugin-appserver')
