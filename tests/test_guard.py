@@ -3,6 +3,7 @@ import io
 import json
 import os
 import sys
+import tempfile
 import unittest
 from contextlib import redirect_stdout
 from unittest import mock
@@ -14,7 +15,9 @@ import test_support  # noqa: E402; isolated temp home before importing twinlane
 from twinlane import common, guard  # noqa: E402
 
 ALLOW = common.load_policy()['claude']['intel_allow']
-WT = '\x43:\x2fUsers/alice/worktrees/task-a'
+WT = ('\x43:\x2fUsers/alice/worktrees/task-a' if os.name == 'nt' else
+      os.path.join(tempfile.gettempdir(), 'twinlane-guard-worktree', 'task-a'))
+OTHER = os.path.join(tempfile.gettempdir(), 'twinlane-guard-other', 'x.py')
 
 
 def bash(cmd):
@@ -83,21 +86,46 @@ class IntelProfile(unittest.TestCase):
 class CodeProfile(unittest.TestCase):
     """the code profile is confined to its worktree, not only by the prompt."""
 
-    def test_file_tools_outside_the_worktree(self):
+    def test_file_tools_inside_and_sibling_worktree(self):
         self.assertIsNone(guard.evaluate('Edit', {'file_path': WT + '/src/x.py'}, 'code', WT, ALLOW))
         self.assertIsNone(guard.evaluate('Write', {'file_path': 'src/new.py'}, 'code', WT, ALLOW))
-        for path in ('\x43:/work/example-repo/src/x.py', WT + '/../task-b/x.php', '\x43:\\projects-alt\\a.php',
-                     '/c/work/example-repo/x.php'):
+        path = WT + '/../task-b/x.py'
+        self.assertIsNotNone(guard.evaluate('Edit', {'file_path': path}, 'code', WT, ALLOW))
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows drive-letter paths only')
+    def test_file_tools_outside_the_windows_worktree(self):
+        for path in ('\x43:/work/example-repo/src/x.py', '\x43:\\projects-alt\\a.py',
+                     '/c/work/example-repo/x.py'):
             self.assertIsNotNone(guard.evaluate('Edit', {'file_path': path}, 'code', WT, ALLOW), path)
 
-    def test_writing_shell_commands_outside_the_worktree(self):
-        self.assertIsNotNone(guard.evaluate('Bash', bash('cp a.php \x43:/work-alt/a.php'), 'code', WT, ALLOW))
+    @unittest.skipIf(os.name == 'nt', 'POSIX absolute paths only')
+    def test_file_tools_outside_the_posix_worktree(self):
+        self.assertIsNotNone(guard.evaluate('Edit', {'file_path': OTHER}, 'code', WT, ALLOW))
+
+    def test_writing_shell_commands_inside_the_worktree(self):
+        self.assertIsNone(guard.evaluate('Bash', bash(f'cp a.py {WT}/b.py'), 'code', WT, ALLOW))
+        self.assertIsNone(guard.evaluate('Bash', bash('python -m py_compile a.py > /dev/null'), 'code', WT, ALLOW))
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows drive-letter paths only')
+    def test_writing_shell_commands_outside_the_windows_worktree(self):
+        self.assertIsNotNone(guard.evaluate('Bash', bash('cp a.py \x43:/work-alt/a.py'), 'code', WT, ALLOW))
         self.assertIsNotNone(guard.evaluate('PowerShell', bash('Set-Content -Path \x43:\\projects\\x.txt -Value 1'),
                                             'code', WT, ALLOW))
-        self.assertIsNone(guard.evaluate('Bash', bash(f'cp a.php {WT}/b.php'), 'code', WT, ALLOW))
-        self.assertIsNone(guard.evaluate('Bash', bash('cat \x43:/work/example-repo/CLAUDE.md'), 'code', WT,
+        self.assertIsNone(guard.evaluate('Bash', bash('cat \x43:/work/example-repo/README.md'), 'code', WT,
                                          ALLOW))  # reading outside is fine
-        self.assertIsNone(guard.evaluate('Bash', bash('php -l a.php > /dev/null'), 'code', WT, ALLOW))
+
+    @unittest.skipUnless(os.name == 'nt', 'cmd switches only exist on Windows')
+    def test_cmd_switches_inside_the_windows_worktree_are_not_paths(self):
+        for cmd in ('del /Q build\\x.txt', 'rmdir /S /Q build', 'robocopy src dst /MIR', 'xcopy src dst /E /I'):
+            self.assertIsNone(guard.evaluate('Bash', bash(cmd), 'code', WT, ALLOW), cmd)
+        self.assertIsNotNone(guard.evaluate('Bash', bash('rm -f /c/other/a.py'), 'code', WT, ALLOW))
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX absolute paths only')
+    def test_writing_shell_commands_outside_the_posix_worktree(self):
+        self.assertIsNotNone(guard.evaluate('Bash', bash(f'cp a.py {OTHER}'), 'code', WT, ALLOW))
+        self.assertIsNotNone(guard.evaluate('PowerShell', bash(f'Set-Content -Path {OTHER} -Value 1'),
+                                            'code', WT, ALLOW))
+        self.assertIsNone(guard.evaluate('Bash', bash(f'cat {OTHER}'), 'code', WT, ALLOW))
 
 
 class HookProtocol(unittest.TestCase):

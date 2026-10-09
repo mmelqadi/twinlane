@@ -249,9 +249,45 @@ class FmtAge(unittest.TestCase):
 PING = os.path.join(os.environ.get('SystemRoot', 'C' + r':\Windows'), 'System32', 'PING.EXE')
 
 
+class CodexBinaryPortable(unittest.TestCase):
+    def test_version_order(self):
+        key = common.codex_version_key
+        self.assertLess(key('0.162.0-alpha.2'), key('0.162.0'))
+        self.assertLess(key('0.162.0-alpha.2'), key('0.162.0-alpha.10'))
+        self.assertLess(key('0.162.0-alpha.10'), key('0.162.0-beta.1'))
+        self.assertLess(key('0.9.0'), key('0.10.0'))
+        self.assertLess(key('0.161.9'), key('codex-cli 0.162.0-alpha.1'))
+        self.assertIsNone(key('codex dev build'))
+
+    @unittest.skipIf(common.IS_WIN, 'POSIX binary selection only')
+    def test_posix_uses_only_an_explicit_binary_without_a_copy(self):
+        with tempfile.TemporaryDirectory(prefix='twinlane-codex-') as tmp:
+            local = os.path.join(tmp, 'local')
+            source = os.path.join(local, 'OpenAI', 'Codex', 'bin', 'build', 'codex.exe')
+            os.makedirs(os.path.dirname(source))
+            with open(source, 'wb') as h:
+                h.write(b'app fixture')
+            for name in common.CODEX_HELPERS:
+                with open(os.path.join(os.path.dirname(source), name), 'wb') as h:
+                    h.write(b'helper fixture')
+            override = os.path.join(tmp, 'codex')
+            with open(override, 'wb') as h:
+                h.write(b'override fixture')
+            bin_dir = os.path.join(tmp, 'bin')
+            with mock.patch.dict(os.environ, {'TWINLANE_CODEX_BIN': '', 'LOCALAPPDATA': local}, clear=False), \
+                    mock.patch.object(common, 'BIN', bin_dir):
+                self.assertEqual(common.acquire_codex()[::2], (None, None))
+                self.assertIsNone(common.codex_bin())
+                self.assertFalse(os.path.exists(bin_dir))
+                os.environ['TWINLANE_CODEX_BIN'] = override
+                self.assertEqual(common.acquire_codex()[::2], (override, None))
+                self.assertEqual(common.codex_bin(), override)
+                self.assertFalse(os.path.exists(bin_dir))
+
+
+@unittest.skipUnless(common.IS_WIN, 'the desktop-app copy is Windows-only')
 class CodexBinary(unittest.TestCase):
-    """The desktop app empties OpenAI/Codex/bin/<hash>/ when it exits; twinlane runs a private, leased copy of its CLI
-    and fails closed rather than fall to the app's own exe or the refused PATH CLI."""
+    """The desktop-app CLI copy is Windows-only and fails closed rather than run an unverified binary."""
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -611,15 +647,6 @@ class CodexBinary(unittest.TestCase):
         bundle = self._exe(self._bundle('abc'), body=b'new', mtime=time.time() - 3600)
         self.assertEqual(common.codex_source_bin(), (bundle, 'app'))
         self.assertTrue(os.path.basename(os.path.dirname(common.codex_bin())).startswith('codex-v0.162.0-alpha.2-'))
-
-    def test_version_order(self):
-        key = common.codex_version_key
-        self.assertLess(key('0.162.0-alpha.2'), key('0.162.0'))
-        self.assertLess(key('0.162.0-alpha.2'), key('0.162.0-alpha.10'))
-        self.assertLess(key('0.162.0-alpha.10'), key('0.162.0-beta.1'))
-        self.assertLess(key('0.9.0'), key('0.10.0'))
-        self.assertLess(key('0.161.9'), key('codex-cli 0.162.0-alpha.1'))
-        self.assertIsNone(key('codex dev build'))
 
     def test_release_beats_its_prerelease(self):
         self._versions({b'pre': '0.162.0-alpha.9', b'rel': '0.162.0'})

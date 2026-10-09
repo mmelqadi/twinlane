@@ -36,7 +36,9 @@ WRITE_FLAGS = re.compile(r'(^|\s)(--output(=|\s|$)|--ext-diff|--pre(=|\s|$))')
 WRITE_VERBS = re.compile(r'(^|[\s;&|(])(cp|mv|rm|rmdir|del|erase|copy|move|ren|rename|robocopy|xcopy|mkdir|md|touch|'
                          r'tee|truncate|ln|install|sed\s+-i|perl\s+-i|copy-item|move-item|remove-item|'
                          r'set-content|add-content|out-file|new-item|rename-item|clear-content)(?=\s|$)', re.I)
-ABS_PATH = re.compile(r'(?<![\w/])([A-Za-z]:[\\/][^\s"\'|;&<>]*|/[a-zA-Z]/[^\s"\'|;&<>]*|'
+# On Windows a bare /X is usually a cmd switch (del /Q, robocopy /MIR), so only Git Bash drive paths (/c/...) count.
+_SLASH_ROOT = r'/[a-zA-Z]/[^\s"\'|;&<>]*' if os.name == 'nt' else r'/[^\s"\'|;&<>]*'
+ABS_PATH = re.compile(r'(?<![\w/])([A-Za-z]:[\\/][^\s"\'|;&<>]*|' + _SLASH_ROOT + r'|'
                       r'\\' r'\\' r'[^\s"\'|;&<>]+)')
 SEGMENT_SPLIT = re.compile(r'&&|\|\||[;|&\r\n]')  # a lone & (background) starts a new command too
 

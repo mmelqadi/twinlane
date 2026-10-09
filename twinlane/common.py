@@ -425,6 +425,8 @@ def _pick_codex_source() -> tuple[str | None, str, str | None]:
     copied, never run in place. A build without every helper (the app mid-extract) is never a source;
     complete builds rank by version, then mtime, so an older build rewritten later does not beat a newer one."""
     env = os.environ.get('TWINLANE_CODEX_BIN')
+    if not IS_WIN:
+        return (env, 'env', None) if env and os.path.isfile(env) else (None, 'none', None)
     if env and os.path.isfile(env) and not _app_owned(env):
         return env, 'env', None
     found = [env] if env and os.path.isfile(env) else (
@@ -462,6 +464,9 @@ def resolve_codex() -> tuple[str | None, str]:
     anything else is worth showing (job notes, twinlane status).
     Run the result only under a lease: see acquire_codex()."""
     src, origin, version = _pick_codex_source()
+    if not IS_WIN:
+        return (src, f'TWINLANE_CODEX_BIN as set: {src}') if src else (
+            None, 'no Codex binary configured (set TWINLANE_CODEX_BIN)')
     if origin == 'env':
         return src, f'TWINLANE_CODEX_BIN as set: {src}'
     if src:
@@ -483,6 +488,9 @@ def acquire_codex() -> tuple[str | None, str, str | None]:
     OS protects the copy (Windows refuses to delete a running codex.exe, and _discard() deletes it first).
     Lease and prune both run under bin/.lock, so a copy pruned between resolution and lease is resolved again
     instead of being run half-deleted."""
+    if not IS_WIN:
+        binary, why = resolve_codex()
+        return binary, why, None
     for _ in range(3):
         binary, why = resolve_codex()
         folder = _private_folder(binary)

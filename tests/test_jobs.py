@@ -290,19 +290,20 @@ class ArgvAndEnv(JobsBase):
 
     def test_py_bin_runs_under_this_python(self):
         self.assertEqual(jobs.claude_launcher(FAKE_CLAUDE), [sys.executable, FAKE_CLAUDE])
-        self.assertEqual(jobs.claude_launcher('\x43:/x/claude.exe'), ['\x43:/x/claude.exe'])
+        executable = os.path.join(self.tmp, 'claude.exe')
+        self.assertEqual(jobs.claude_launcher(executable), [executable])
 
     def test_codex_args_never_add_credits_by_default(self):
         p = jobs.engine_params('codex', 'code', {}, POLICY, 'code')
-        args = jobs.codex_args(p, POLICY, 'b.md', '\x43:/w', '\x43:/o')
+        args = jobs.codex_args(p, POLICY, 'b.md', self.work, os.path.join(self.tmp, 'out'))
         self.assertNotIn('--allow-credits', args)
         self.assertIn('--write', args)
         self.assertEqual(args[args.index('--tier') + 1], POLICY['codex']['tier_by_kind']['code'])
         lenient = json.loads(json.dumps(POLICY))
         lenient['codex']['allow_credits'] = True
-        self.assertNotIn('--allow-credits', jobs.codex_args(p, lenient, 'b.md', '\x43:/w', '\x43:/o'))
+        self.assertNotIn('--allow-credits', jobs.codex_args(p, lenient, 'b.md', self.work, os.path.join(self.tmp, 'out')))
         intel = jobs.engine_params('codex', 'sweep', {}, POLICY, 'intel')
-        self.assertNotIn('--write', jobs.codex_args(intel, POLICY, 'b.md', '\x43:/w', '\x43:/o'))
+        self.assertNotIn('--write', jobs.codex_args(intel, POLICY, 'b.md', self.work, os.path.join(self.tmp, 'out')))
         self.assertEqual(jobs.codex_launcher(), [sys.executable, FAKE_CODEX])
 
     def test_contract_is_profile_specific(self):
