@@ -1,0 +1,52 @@
+{
+  "policy_version": 1,
+  "thresholds": {"caution_pct": 75, "handoff_pct": 80, "stop_pct": 85, "hard_pct": 100},
+  "meter": {"cache_ttl_s": 120, "hook_cache_max_age_s": 300, "auto_refresh_claude": false,
+    "after_read_timeout_s": 10, "overlap_scan_timeout_s": 5},
+  "claude": {
+    "models": {"default": "claude-opus-5-5", "fast": "claude-sonnet-5-5", "cheap": "claude-haiku-4-5"},
+    "fast_kinds": [],
+    "effort_by_kind": {"plan": "high", "review": "high", "intel": "medium", "code": "high",
+      "parallel": "medium", "sweep": "low", "integrate": "high", "verify": "high"},
+    "max_turns_by_profile": {"intel": 150, "code": 250},
+    "timeout_s_by_profile": {"intel": 3600, "code": 7200},
+    "code_permission_mode": "acceptEdits", "max_parallel": 4,
+    "extra_usage_allowed": false, "stale_reading_max_age_s": 1800,
+    "deny": [
+      "Bash(git commit:*)", "Bash(git push:*)", "Bash(git reset --hard:*)", "Bash(git clean:*)",
+      "Bash(git rebase:*)", "Bash(git merge:*)", "Bash(git worktree remove:*)", "Bash(git branch -D:*)",
+      "PowerShell(git commit*)", "PowerShell(git push*)", "PowerShell(git reset --hard*)",
+      "PowerShell(git clean*)", "PowerShell(git rebase*)", "PowerShell(git merge*)",
+      "PowerShell(git worktree remove*)", "PowerShell(git branch -D*)",
+      "Bash(claude:*)", "Bash(codex:*)", "Bash(twinlane run:*)",
+      "PowerShell(claude*)", "PowerShell(codex*)", "PowerShell(twinlane run*)"
+    ],
+    "intel_deny": ["Edit", "Write", "MultiEdit", "NotebookEdit", "PowerShell",
+      "Bash(git diff --output*)", "Bash(git log --output*)", "Bash(git show --output*)",
+      "Bash(git * --ext-diff*)", "Bash(rg --pre*)"],
+    "intel_allow": ["Read", "Glob", "Grep", "WebSearch", "WebFetch",
+      "Bash(git log:*)", "Bash(git show:*)", "Bash(git diff:*)", "Bash(git status:*)",
+      "Bash(git blame:*)", "Bash(git rev-parse:*)", "Bash(rg:*)", "Bash(ls:*)",
+      "Bash(wc:*)", "Bash(head:*)", "Bash(tail:*)"],
+    "code_allow": ["Read", "Glob", "Grep", "Edit", "Write", "MultiEdit", "NotebookEdit",
+      "Bash", "PowerShell", "WebSearch", "WebFetch"]
+  },
+  "codex": {
+    "models": {"sol": "gpt-6.1-sol", "sol-high": "gpt-6.1-sol", "luna": "gpt-6-luna", "astra": "gpt-6-astra"},
+    "efforts": {"sol": "medium", "sol-high": "high", "luna": "low", "astra": "high"},
+    "tier_by_kind": {"parallel": "sol", "sweep": "luna", "integrate": "sol", "verify": "sol-high",
+      "code": "sol-high", "intel": "sol-high", "plan": "astra", "review": "astra"},
+    "write_kinds": ["code", "integrate"], "allow_credits": false, "max_parallel": 4,
+    "timeout_s": 3600, "preflight_max_age_s": 300, "stale_reading_max_age_s": 1800
+  },
+  "routing": {
+    "code": {"primary": "claude", "fallback": "codex"},
+    "intel": {"primary": "claude", "fallback": "codex"},
+    "plan": {"primary": "claude", "fallback": "codex"},
+    "review": {"primary": "claude", "fallback": "codex"},
+    "parallel": {"primary": "codex", "fallback": "claude"},
+    "sweep": {"primary": "codex", "fallback": "claude"},
+    "integrate": {"primary": "codex", "fallback": "claude"},
+    "verify": {"primary": "codex", "fallback": "claude"}
+  }
+}

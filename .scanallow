@@ -1,0 +1,14 @@
+# reason: public GitHub private-advisory reporting URL in SECURITY.md (a URL path, not a secret).
+^SECURITY\.md:high-entropy:com/
+# reason: long descriptive unittest method names (test_...) score as high entropy.
+^tests/test_[a-z_]+\.py:high-entropy:test
+# reason: obviously fake keys, tokens, base64 runs and paths used as inputs to the redaction tests (e.g. the AWS documentation example key).
+^tests/test_(board|baton|meter|sessions)\.py:(anthropic-key|jwt|url-credentials|generic-secret-assignment|high-entropy):
+# reason: Windows API function names (ConvertStringSecurityDescriptor...) in the file ACL helper.
+^twinlane/envhandoff\.py:high-entropy:Conv
+# reason: token-usage accounting names (input_tokens, total_tokens), not credentials.
+^twinlane/(jobs|codex_runner|baton)\.py:generic-secret-assignment:
+# reason: a synthetic Claude transcript fixture and fake env values in the job tests (no real credentials).
+^tests/(fixtures/claude_transcript\.jsonl|test_jobs\.py):generic-secret-assignment:
+# reason: a Windows path written with \x escapes in a guard test (the alice placeholder user), not a secret.
+^tests/test_guard\.py:high-entropy:x2fU

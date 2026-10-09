@@ -1,0 +1,4 @@
+{"timestamp":"2026-10-07T09:00:00.000Z","type":"session_meta","payload":{"id":"fixture-session","cwd":"\u0043:/work/example-repo","originator":"codex_exec"}}
+{"timestamp":"2026-10-07T09:01:00Z","type":"event_msg","payload":{"type":"token_count","rate_limits":null}}
+{"timestamp":"2026-10-07T09:02:00Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":40,"window_minutes":10080,"resets_at":1791096217},"secondary":null,"credits":null}}}
+{"timestamp":"2026-10-07T09:03:00Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":65,"window_minutes":10080,"resets_at":1791096217},"secondary":{"used_percent":20,"window_minutes":300,"resets_at":1760000000},"credits":{"has_credits":false},"plan_type":"pro"}}}

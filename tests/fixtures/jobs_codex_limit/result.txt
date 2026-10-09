@@ -1,0 +1,2 @@
+exit=1 seconds=4 model=gpt-6-sol effort=high sandbox=read-only session=unknown tokens=unknown cli=codex-cli 0.155.0
+NO LAST MESSAGE: read stderr.log (tail -20)

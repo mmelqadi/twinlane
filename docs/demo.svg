@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="936" height="482" viewBox="0 0 936 482" role="img" aria-label="twinlane">
+<title>twinlane</title>
+<rect width="936" height="482" rx="10" ry="10" fill="#1e1e2e"/>
+<path d="M0 36 V10 A10 10 0 0 1 10 0 H926 A10 10 0 0 1 936 10 V36 Z" fill="#2a2a3c"/>
+<rect y="35" width="936" height="1" fill="#383850"/>
+<rect x="0.5" y="0.5" width="935" height="481" rx="9.5" ry="9.5" fill="none" stroke="#45475a"/>
+<circle cx="20" cy="18" r="6" fill="#ff5f56"/>
+<circle cx="40" cy="18" r="6" fill="#ffbd2e"/>
+<circle cx="60" cy="18" r="6" fill="#27c93f"/>
+<text x="468" y="23" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', 'Liberation Mono', 'Courier New', monospace" font-size="13" fill="#a6adc8">twinlane</text>
+<g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', 'Liberation Mono', 'Courier New', monospace" font-size="15" fill="#cdd6f4" style="white-space:pre">
+<text x="18" y="66" xml:space="preserve"><tspan fill="#a6e3a1" font-weight="bold">$</tspan> <tspan font-weight="bold">twinlane board</tspan></text>
+<text x="18" y="88" xml:space="preserve">twinlane board  2026-10-09T16:24:17Z  (read-only; cached meters, 10s old)</text>
+<text x="18" y="110" xml:space="preserve">== METERS</text>
+<text x="18" y="132" xml:space="preserve">claude: caution 5h 77% (resets in 1h59m) | 7d 31% (resets in 2d7h) | extra usage off [fixture, 10s o</text>
+<text x="18" y="154" xml:space="preserve">ld]</text>
+<text x="18" y="176" xml:space="preserve">codex: ok 5h 42% (resets in 2h59m) | 7d 18% (resets in 3d0h) [fixture, 10s old]</text>
+<text x="18" y="198" xml:space="preserve">route now: -&gt;claude code intel plan review; -&gt;codex parallel sweep integrate verify</text>
+<text x="18" y="220" xml:space="preserve">== ATTENTION (2)</text>
+<text x="18" y="242" xml:space="preserve">! claude CAUTION (77%, stop at 85%)</text>
+<text x="18" y="264" xml:space="preserve">! 2 finished, not yet read; newest: twinlane result 20261009-162417-codex-b2</text>
+<text x="18" y="286" xml:space="preserve">== JOBS  running/queued 1</text>
+<text x="18" y="308" xml:space="preserve">  20261009-162417-codex-c3  codex  code      running    1m 2%t  6.1-sol/?  demo-c3  wt=example-repo</text>
+<text x="18" y="330" xml:space="preserve">  last finished (2):</text>
+<text x="18" y="352" xml:space="preserve">  20261009-162417-codex-b2  codex  done        2m ago  6.1-sol/?  demo-b2  (unread)</text>
+<text x="18" y="374" xml:space="preserve">  20261009-162417-claude-a1  claude done        4m ago  sonnet-5-5/sonnet-5-5  demo-a1  (unread)</text>
+<text x="18" y="396" xml:space="preserve">== BATONS (1)</text>
+<text x="18" y="418" xml:space="preserve">  demo  owner=codex  20s  next: Review the latest receipt</text>
+<text x="18" y="440" xml:space="preserve">== WORKTREES (0 linked, 0 checked, 0 merged)</text>
+<text x="18" y="462" xml:space="preserve">  none (batons point at no linked worktree)</text>
+</g>
+</svg>

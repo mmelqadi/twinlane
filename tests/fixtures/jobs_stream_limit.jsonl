@@ -1,0 +1,4 @@
+{"type": "system", "subtype": "init", "session_id": "11111111-2222-3333-4444-555555555555", "model": "claude-opus-5-5", "permissionMode": "acceptEdits", "tools": ["Read"]}
+{"type": "assistant", "session_id": "11111111-2222-3333-4444-555555555555", "message": {"content": [{"type": "text", "text": "Halfway there."}]}}
+{"type": "rate_limit_event", "session_id": "11111111-2222-3333-4444-555555555555", "rate_limit_info": {"status": "rejected", "rateLimitType": "seven_day", "resetsAt": 1791460800}}
+{"type": "result", "subtype": "success", "is_error": true, "num_turns": 4, "session_id": "11111111-2222-3333-4444-555555555555", "modelUsage": {"claude-opus-5-5": {}}, "result": "You've hit your limit · resets 3pm"}

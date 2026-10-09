@@ -1,0 +1,93 @@
+{
+ "id": 2,
+ "result": {
+  "ordinaryUsageAllowed": true,
+  "rateLimits": {
+   "limitId": "codex",
+   "limitName": null,
+   "normalModelSlug": "gpt-6-sol",
+   "primary": {
+    "usedPercent": 34,
+    "windowDurationMins": 10080,
+    "resetsAt": 4102444800
+   },
+   "secondary": null,
+   "credits": {
+    "hasCredits": true,
+    "unlimited": false,
+    "balance": 42.5
+   },
+   "individualLimit": null,
+   "spendControlReached": false,
+   "planType": "pro",
+   "rateLimitReachedType": null
+  },
+  "rateLimitsByLimitId": {
+   "codex": {
+    "limitId": "codex",
+    "limitName": null,
+    "normalModelSlug": "gpt-6-sol",
+    "primary": {
+     "usedPercent": 34,
+     "windowDurationMins": 10080,
+     "resetsAt": 4102444800
+    },
+    "secondary": null,
+    "credits": {
+     "hasCredits": true,
+     "unlimited": false,
+     "balance": 42.5
+    },
+    "individualLimit": null,
+    "spendControlReached": false,
+    "planType": "pro",
+    "rateLimitReachedType": null
+   },
+   "codex_astra": {
+    "limitId": "codex_astra",
+    "limitName": "GPT-6 Astra",
+    "normalModelSlug": "gpt-6-astra",
+    "primary": {
+     "usedPercent": 12,
+     "windowDurationMins": 10080,
+     "resetsAt": 4102444800
+    },
+    "secondary": {
+     "usedPercent": 3,
+     "windowDurationMins": 300,
+     "resetsAt": 4102000000
+    },
+    "credits": null,
+    "individualLimit": null,
+    "spendControlReached": false,
+    "planType": "pro",
+    "rateLimitReachedType": null
+   }
+  },
+  "rateLimitResetCredits": {
+   "availableCount": 2,
+   "credits": [
+    {
+     "id": "RESET-CREDIT-ID-1",
+     "resetType": "codexRateLimits",
+     "status": "available",
+     "grantedAt": "2099-09-01T00:00:00Z",
+     "expiresAt": "2099-11-02T00:00:00Z",
+     "title": "Full reset",
+     "description": "Resets all Codex limits"
+    },
+    {
+     "id": "RESET-CREDIT-ID-2",
+     "resetType": "codexRateLimits",
+     "status": "available",
+     "grantedAt": "2099-09-02T00:00:00Z",
+     "expiresAt": "2099-10-28T00:00:00Z",
+     "title": "Full reset",
+     "description": "Resets all Codex limits"
+    }
+   ]
+  },
+  "accountId": "ACCOUNT-ID-SECRET",
+  "rateLimitUpsell": null
+ }
+}

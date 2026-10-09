@@ -1,0 +1,13 @@
+{"timestamp":"2026-10-08T11:00:00.000Z","type":"session_meta","payload":{"id":"00000000-0000-4000-8000-000000000022","session_id":"00000000-0000-4000-8000-000000000022","cwd":"\u0043:\u005cwork\u005cdemo-repo","originator":"Codex Desktop","cli_version":"0.162.0","source":"vscode","thread_source":"user"}}
+{"timestamp":"2026-10-08T11:00:01.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"00000000-0000-4000-8000-000000000027"}}
+{"timestamp":"2026-10-08T11:00:02.000Z","type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"<permissions>x</permissions>"}]}}
+{"timestamp":"2026-10-08T11:00:03.000Z","type":"response_item","payload":{"type":"message","id":"msg_1","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for \u0043:\u005cwork\u005cdemo-repo\n\n<INSTRUCTIONS>\nbe careful\n</INSTRUCTIONS>"}]}}
+{"timestamp":"2026-10-08T11:00:04.000Z","type":"response_item","payload":{"type":"message","id":"msg_2","role":"user","content":[{"type":"input_text","text":"<environment_context>\n  <cwd>\u0043:\u005cwork\u005cdemo-repo</cwd>\n</environment_context>"}]}}
+{"timestamp":"2026-10-08T11:00:05.000Z","type":"response_item","payload":{"type":"message","id":"msg_3","role":"user","content":[{"type":"input_text","text":"Wire the current-format reader; النسخة الحالية"}]}}
+{"timestamp":"2026-10-08T11:00:06.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Current-format reply one."}]}}
+{"timestamp":"2026-10-08T11:00:07.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"00000000-0000-4000-8000-000000000027","last_agent_message":"Current-format reply one."}}
+{"timestamp":"2026-10-08T11:00:08.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"00000000-0000-4000-8000-000000000028"}}
+{"timestamp":"2026-10-08T11:00:09.000Z","type":"response_item","payload":{"type":"message","id":"msg_4","role":"user","content":[{"type":"input_text","text":"<external_codex_apps_open_page>{\"page_id\":\"p1\"}</external_codex_apps_open_page>"}]}}
+{"timestamp":"2026-10-08T11:00:10.000Z","type":"response_item","payload":{"type":"message","id":"msg_5","role":"user","content":[{"type":"input_text","text":"continue with the tests"}]}}
+{"timestamp":"2026-10-08T11:00:11.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Current-format reply two."}]}}
+{"timestamp":"2026-10-08T11:00:12.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"00000000-0000-4000-8000-000000000028","last_agent_message":"Current-format reply two."}}

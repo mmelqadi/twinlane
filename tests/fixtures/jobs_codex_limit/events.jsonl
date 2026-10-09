@@ -1,0 +1,2 @@
+{"type": "thread.started", "thread_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}
+{"type": "error", "message": "usage_limit_exceeded: You've hit your usage limit. Try again later."}

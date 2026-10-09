@@ -1,0 +1,4 @@
+include LICENSE README.md LIMITS.md DESIGN.md METHODOLOGY.md CITATION.cff
+recursive-include twinlane *.json
+recursive-include tests *.py *.json *.jsonl *.txt
+recursive-include examples *
