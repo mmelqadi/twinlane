@@ -89,7 +89,9 @@ def _entropy(run: str) -> float:
     return -sum(n / len(run) * math.log2(n / len(run)) for n in counts.values())
 
 
-_PATH_ROOT = re.compile(r'/(?:/|[a-zA-Z]/|home/|Users/|tmp/|mnt/|var/|opt/|etc/|usr/|root/|srv/|workspace)')
+_PATH_ROOT = re.compile(r'/(?:/|[a-zA-Z]/|home/|Users/|tmp/|mnt/|var/|private/|opt/|etc/|usr/|root/|srv/|workspace)')
+# macOS per-user temp: /var/folders/<2>/<random>/T/ (and /private/var/..., what /var resolves to)
+_MAC_TEMP = re.compile(r'(?:/private)?/var/folders/[\w+-]{2}/[\w+-]{20,40}/[TCX]/')
 _REF_BEFORE = re.compile(r'(?i)(?:\b(?:branch|ref|refs|origin|checkout|switch)\b[\s:=]*|\[)$')
 _GIT_REF_BEFORE = re.compile(r'(?i)(?:\b(?:commit|sha1?|head|merge|tree|parent|object|rev|revision|tag|'
                              r'checkout|cherry-pick|reset|revert|rebase)\b[\s:=#@(]*|\.\.\.?)$')
@@ -112,15 +114,20 @@ def _blob_slash(m: 're.Match') -> str:
     words; inside one it is kept unless under half of its characters are words. Without a `/` the
     per-component rule in `_blob` applies."""
     run = m.group(0).strip('=')
-    if '/' not in run or len(run) < 32:
+    if '/' not in run:
         return m.group(0)
-    if not (re.search('[a-z]', run) and re.search('[A-Z]', run) and re.search('[0-9]', run)):
-        return m.group(0)
+    temp = _MAC_TEMP.match(run)
+    if temp:  # the OS names this folder at random; only what follows it is judged
+        return '[REDACTED-BLOB]' if _slash_run_is_secret(run[temp.end():], True) else m.group(0)
+    return '[REDACTED-BLOB]' if _slash_run_is_secret(run, _path_context(m)) else m.group(0)
+
+
+def _slash_run_is_secret(run: str, path_context: bool) -> bool:
+    if len(run) < 32 or not (re.search('[a-z]', run) and re.search('[A-Z]', run) and re.search('[0-9]', run)):
+        return False
     if _entropy(run) < 4.0:
-        return m.group(0)
-    if _path_context(m) and _wordish(run) >= 0.5:
-        return m.group(0)
-    return '[REDACTED-BLOB]'
+        return False
+    return not (path_context and _wordish(run) >= 0.5)
 
 
 def _hex(m: 're.Match') -> str:
@@ -196,23 +203,21 @@ def norm_dir(path: str | None) -> str | None:
     m = re.match(r'^/([a-zA-Z])(/|$)(.*)$', p)
     if common.IS_WIN and m:
         p = m.group(1).upper() + ':\\' + m.group(3)
-    p = os.path.abspath(p)
-    if common.IS_WIN and len(p) > 1 and p[1] == ':':
-        p = p[0].upper() + p[1:]
+    p = common.real_path(p)
     return p.rstrip('\\/') if len(p) > 3 else p
 
 
 def same_dir(a, b) -> bool:
     if not a or not b:
         return False
-    return os.path.normcase(os.path.normpath(str(a))) == os.path.normcase(os.path.normpath(str(b)))
+    return common.canon_path(str(a)) == common.canon_path(str(b))
 
 
 def under_dir(child, parent) -> bool:
     if not child or not parent:
         return False
-    c = os.path.normcase(os.path.normpath(str(child)))
-    p = os.path.normcase(os.path.normpath(str(parent)))
+    c = common.canon_path(str(child))
+    p = common.canon_path(str(parent))
     return c == p or c.startswith(p.rstrip('\\/') + os.sep)
 
 

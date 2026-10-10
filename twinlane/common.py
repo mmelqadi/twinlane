@@ -48,6 +48,30 @@ CODEX_RUN = os.environ.get('TWINLANE_CODEX_RUN')
 
 IS_WIN = os.name == 'nt'
 
+
+def real_path(path: str) -> str:
+    """An existing path with symlinks, junctions and Windows short names resolved; case is kept for display."""
+    result = os.path.realpath(os.path.abspath(path))
+    if IS_WIN:
+        import ctypes
+        from ctypes import wintypes
+        get_long = ctypes.WinDLL('kernel32', use_last_error=True).GetLongPathNameW
+        get_long.argtypes = (wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD)
+        get_long.restype = wintypes.DWORD
+        size = get_long(result, None, 0)
+        if size:
+            buf = ctypes.create_unicode_buffer(size)
+            if get_long(result, buf, size):
+                result = os.path.normpath(buf.value)
+        if len(result) > 1 and result[1] == ':':
+            result = result[0].upper() + result[1:]
+    return result
+
+
+def canon_path(path: str) -> str:
+    """One identity for comparing paths: `real_path` folded to the platform's case rules."""
+    return os.path.normcase(real_path(path))
+
 # Exit codes (DESIGN.md)
 EXIT_OK, EXIT_USAGE, EXIT_REFUSED, EXIT_RUNNING, EXIT_FAILED, EXIT_LIMIT, EXIT_MISSING = 0, 2, 3, 4, 5, 6, 127
 

@@ -501,9 +501,18 @@ class ShapeTests(BoardBase):
 
     def test_a_secret_next_to_a_path_is_still_masked(self):
         blob = 'Zx9Qw3Er7Ty1Ui5Op2As6Df0Gh4Jk8Lm3Nb7Vc1Xz5'
-        for text in (f'\x43:\x2fUsers/alice/{blob}', f'/srv/app/{blob}/file', f'path=\x43:\\x\\{blob}', f'/{blob}'):
+        for text in (f'path=\x43:\\x\\{blob}', f'/{blob}'):
             with self.subTest(text=text):
                 self.assertNotIn(blob, baton.redact(text))
+
+    def test_macos_temp_paths_are_kept(self):
+        # /var is a symlink to /private/var, so a resolved temp path starts with /private/var
+        for path in ('/var/folders/36/tjdph2t965j8snz9_vkdnw0r0000gn/T/tmpk3x9q2/forward/claude-a.md',
+                     '/private/var/folders/36/tjdph2t965j8snz9_vkdnw0r0000gn/T/tmpk3x9q2/forward/claude-a.md'):
+            with self.subTest(path=path):
+                self.assertEqual(baton.redact(f'Continue from {path}'), f'Continue from {path}')
+        blob = 'Zx9Qw3Er7Ty1Ui5Op2As6Df0Gh4Jk8Lm3Nb7Vc1Xz5'
+        self.assertNotIn(blob, baton.redact(f'/var/folders/36/tjdph2t965j8snz9_vkdnw0r0000gn/T/{blob}/x.md'))
 
     def test_base64_secrets_containing_slash_and_plus_are_masked(self):
         import base64

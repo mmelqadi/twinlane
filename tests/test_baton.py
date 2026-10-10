@@ -161,7 +161,7 @@ class RoundTripTests(BatonTestBase):
                       accept=['A1: tests pass', 'handoff fits 8 KB'])
         self.assertEqual(b['task']['goal'].count('\n'), 2)
         self.assertEqual([a['id'] for a in b['task']['acceptance']], ['A1', 'A2'])
-        self.assertEqual(b['repo']['worktree'], self.repo)
+        self.assertEqual(b['repo']['worktree'], common.real_path(self.repo))
         with self.assertRaises(baton.BatonError):
             baton.new('demo', 'again')
 

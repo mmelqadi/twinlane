@@ -460,7 +460,7 @@ def _parse_worktrees(text: str) -> list[dict]:
 
 
 def _norm(path) -> str:
-    return os.path.normcase(os.path.normpath(path))
+    return common.canon_path(path)
 
 
 def _gitdir(path: str) -> str | None:

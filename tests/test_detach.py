@@ -461,7 +461,12 @@ class HandoffNeverStaysOnDisk(_Tmp):
         self.assertNotIn(';ID;', sddl)
         self.assertNotIn('ID)', sddl)
         self.assertEqual(sddl.count('('), 1, 'exactly one ACE')
-        self.assertEqual(sddl, f'D:P(A;;FA;;;{envhandoff.user_sid()})')
+        sid = envhandoff.user_sid()
+        expected = f'D:P(A;;FA;;;{sid})'
+        if sid.endswith('-500'):
+            self.assertIn(sddl, (expected, 'D:P(A;;FA;;;LA)'))
+        else:
+            self.assertEqual(sddl, expected)
 
     def test_a_slow_child_never_gets_the_file(self):
         # Real WMI: the child waits 4 s before loading; the launcher gives up after 1 s and deletes the file.

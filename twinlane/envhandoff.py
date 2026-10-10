@@ -170,6 +170,16 @@ def _self_created() -> int | None:
             if not k32.GetProcessTimes(k32.GetCurrentProcess(), *(ctypes.byref(x) for x in t)):
                 return None
             return int(t[0].value)
+        if sys.platform == 'darwin':
+            import datetime
+            import subprocess
+            result = subprocess.run(['ps', '-o', 'lstart=', '-p', str(os.getpid())],
+                                    capture_output=True, text=True, timeout=3,
+                                    env=dict(os.environ, LC_ALL='C'))
+            if result.returncode:
+                return None
+            stamp = datetime.datetime.strptime(result.stdout.strip(), '%a %b %d %H:%M:%S %Y')
+            return int(time.mktime(stamp.timetuple()))
         with open(f'/proc/{os.getpid()}/stat', encoding='ascii', errors='replace') as h:
             return int(h.read().rsplit(')', 1)[1].split()[19])
     except Exception:
