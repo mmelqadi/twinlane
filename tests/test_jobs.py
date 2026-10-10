@@ -2114,7 +2114,7 @@ class UsageReceipts(JobsBase):
 
     # --- the scan budget is a wall-clock bound, whichever step is slow
 
-    SLOW_S, BUDGET_S = 0.25, 0.05
+    SLOW_S, BUDGET_S = 1.0, 0.05  # a wide gap, so a slow CI runner still tells budget from slow step
 
     def slow_scan(self, where, running=False):
         """Run _overlapping_jobs with ONE kind of filesystem step made slow; -> (result, seconds it took)."""

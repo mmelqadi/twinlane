@@ -180,7 +180,9 @@ class EnvHandoffFile(_Tmp):
         self.assertFalse(os.path.exists(path), 'the hand-off file must be deleted once loaded')
         with open(log, encoding='utf-8') as h:
             text = h.read()
-        self.assertIn(f"cwd={cwd} mark=loaded leak=- stdin=''", text)
+        # macOS reports the resolved cwd (/var is a symlink to /private/var)
+        self.assertTrue(any(f"cwd={c} mark=loaded leak=- stdin=''" in text
+                            for c in (cwd, os.path.realpath(cwd))), text)
         self.assertIn('to-stderr', text)
 
     def test_unusable_file_is_deleted_and_raises(self):
