@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.2 - 2026-10-11
+
+### Guard
+- Fail closed where the guard cannot judge: in a code job, any tool it does not know (MCP tools included) is denied, a write or shell call without a known job worktree is denied, and a call whose path or command is missing or not a string is denied.
+- The parser reads what the shell runs: bash `$'...'` quoting (`$'\x2e\x2e/x'`) is decoded as bash decodes it; a command substitution (`$(...)`, backticks, `<(...)`) or an operator parameter expansion (`${X:-..}`, `${PWD%/*}`) in a path of a command that may write is denied, because its value is unknown until it runs.
+- Resource caps deny instead of cutting: a brace expansion over 256 words is denied rather than checked in part.
+
 ## 0.1.1 - 2026-10-11
 
 ### Background workers

@@ -28,7 +28,11 @@ parses the command instead:
     command are resolved against the shell's cwd (following `cd`): every path of mv/rm/Set-Content/...,
     only the destination of cp/copy/xcopy/robocopy, redirect targets, curl/wget/git output options,
     open(..., 'w') literals in inline code and GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE/GIT_CONFIG* values;
-    `..`, `~` and `$VAR`/`%VAR%` count as outside unless they resolve inside.
+    `..`, `~` and `$VAR`/`%VAR%` count as outside unless they resolve inside. The code profile is an
+    allowlist too: any other tool (an MCP tool included), a write or shell call without a known job cwd, and
+    a call without a string path or command are denied. bash `$'...'` quoting is decoded as bash decodes it;
+    a command substitution or an operator parameter expansion in a path of a command that may write, and a
+    brace expansion over BRACE_CAP words, are denied because their value cannot be read.
 A shell command over MAX_COMMAND_CHARS characters, or one whose scan exceeds the MAX_WORK budget, is
 denied unread; so is inline code whose bounded window (CODE_WINDOW words, the open(/urlopen( argument
 window) ends before what decides it. A scan that cannot finish denies; it never allows the unread rest.
@@ -54,6 +58,9 @@ READ_ONLY_TOOLS = {'Read', 'Glob', 'Grep', 'Skill', 'WebSearch', 'WebFetch', 'To
 ALWAYS_READ_ONLY = {'ToolSearch', 'LS', 'NotebookRead', 'TaskOutput', 'BashOutput'}  # harness plumbing
 FILE_WRITE_TOOLS = {'Edit', 'Write', 'MultiEdit', 'NotebookEdit'}
 SHELL_TOOLS = {'Bash', 'PowerShell'}
+# Code-profile tools that neither write a file nor run a command. Every other tool (an MCP server's
+# write_file, a new harness tool) is denied in a code job until it is judged and listed here.
+CODE_PASS_TOOLS = READ_ONLY_TOOLS | ALWAYS_READ_ONLY | {'KillShell', 'KillBash', 'ExitPlanMode', 'EnterPlanMode'}
 # git global options that take a separate value (`git -C dir status`).
 GIT_OPTS_WITH_VALUE = {'-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path', '--super-prefix',
                        '--config-env', '--list-cmds'}
@@ -269,8 +276,36 @@ def words(segment: str) -> list[str]:
     """Shell-ish split that keeps Windows backslashes (shlex would eat them). Quoted pieces next to each
     other or to bare text join into one word, as in a POSIX shell: `-c"code"` is `-ccode` and `g"it"` is
     `git`. A lone unbalanced quote stays part of its word."""
-    return [QUOTED.sub(_unquote, w).strip('"\'') if '"' in w or "'" in w else w
-            for w in WORD.findall(segment or '')]
+    out = []
+    for w in WORD.findall(segment or ''):
+        if "$'" in w:  # bash ANSI-C quoting: $'\x2e\x2e/x' is ../x, so it is decoded as bash decodes it
+            w = ANSI_C.sub(lambda m: _ansi_c(m.group(1)), w)
+        out.append(QUOTED.sub(_unquote, w).strip('"\'') if '"' in w or "'" in w else w)
+    return out
+
+
+ANSI_C = re.compile(r"\$'((?:[^'\\]|\\.)*)'", re.S)
+ANSI_C_SIMPLE = {'n': '\n', 't': '\t', 'r': '\r', 'a': '\a', 'b': '\b', 'f': '\f', 'v': '\v', 'e': '\x1b',
+                 'E': '\x1b', '\\': '\\', "'": "'", '"': '"', '?': '?'}
+
+
+def _ansi_c(body: str) -> str:
+    """The text bash makes of a $'...' body: \\xHH, \\NNN (octal), \\uHHHH, \\UHHHHHHHH, \\cX and the letter escapes."""
+    def one(m: re.Match) -> str:
+        e = m.group(1)
+        try:
+            if e[0] == 'x':
+                return chr(int(e[1:], 16))
+            if e[0] in 'uU':
+                return chr(int(e[1:], 16))
+            if e[0] in '01234567':
+                return chr(int(e, 8) & 0xFF)
+            if e[0] == 'c' and len(e) == 2:
+                return chr(ord(e[1]) & 0x1F)
+        except (ValueError, OverflowError):
+            return '\\' + e
+        return ANSI_C_SIMPLE.get(e, '\\' + e)
+    return re.sub(r'\\(x[0-9A-Fa-f]{1,2}|u[0-9A-Fa-f]{1,4}|U[0-9A-Fa-f]{1,8}|[0-7]{1,3}|c.|.)', one, body, flags=re.S)
 
 
 def _unquote(m: re.Match) -> str:
@@ -719,22 +754,31 @@ def _path_candidates(word: str, head: str = '') -> list:
     forms = [w] if unescaped == w else [w, unescaped]
     out = []
     for form in forms:
-        for expanded in _brace_expand(form):  # `{..,b}/x` is `../x` and `b/x`
-            out += [_glob_dotdot(c) for c in _candidates_of(expanded, head)]
+        expanded = _brace_expand(form)  # `{..,b}/x` is `../x` and `b/x`
+        if expanded is None:
+            return [TOO_MANY_EXPANSIONS]
+        for e in expanded:
+            out += [_glob_dotdot(c) for c in _candidates_of(e, head)]
     return out
 
 
-def _brace_expand(w: str, limit: int = 64) -> list:
-    """bash brace expansion of comma lists (`{..,b}/x` -> `../x`, `b/x`), capped; ranges are left as written."""
+TOO_MANY_EXPANSIONS = '\0brace-expansion-over-cap'  # a candidate no path equals: path_hazard denies it
+BRACE_CAP = 256
+
+
+def _brace_expand(w: str, cap: int = BRACE_CAP) -> list | None:
+    """bash brace expansion of comma lists (`{..,b}/x` -> `../x`, `b/x`); ranges are left as written. None when
+    the word expands to more than `cap` words: an expansion the guard cannot read in full is denied, never cut."""
     m = re.search(r'\{([^{}]*,[^{}]*)(?:\}|$)', w)  # a closing `}` at the end may already be cut as a group close
     if not m:
         return [w]
-    out = []
+    out = [w]
     for part in m.group(1).split(','):
-        out += _brace_expand(w[:m.start()] + part + w[m.end():], limit)
-        if len(out) >= limit:
-            break
-    return [w] + out[:limit]
+        sub = _brace_expand(w[:m.start()] + part + w[m.end():], cap)
+        if sub is None or len(out) + len(sub) > cap:
+            return None
+        out += sub
+    return out
 
 
 def _glob_dotdot(path: str) -> str:
@@ -858,7 +902,13 @@ def path_hazard(ws: list[str], seg: str, root: str, base: str | None, stack: lis
         for w in rest:
             if _cmd_switch(head, w, powershell):  # `del /Q` is a switch, not the root path /Q
                 continue
+            if not text and RUNTIME_PATH.search(w):
+                return base, f'a command that may write names a path built at run time ({common.clip(w, 120)}); ' \
+                             f'compute it first and pass the literal path'
             for cand in _path_candidates(w, head):
+                if cand == TOO_MANY_EXPANSIONS:
+                    return base, f'a brace expansion over {BRACE_CAP} words cannot be checked in full ' \
+                                 f'({common.clip(w, 80)}); denied in a twinlane job'
                 if cand in sources or not (DOTDOT.search(cand) or (not text and HOME_LED.match(cand))
                                            or (writing and not text and ROOTED.match(cand))):
                     continue
@@ -977,6 +1027,10 @@ def _generic_output_targets(ws: list) -> list:
 
 
 TEXT_WORDS = {'echo', 'printf', 'write-output', 'write-host', 'write', 'echo.'}
+# A word whose text the shell computes when it runs: command substitution, or a parameter expansion with an
+# operator (`${X:-..}`, `${PWD%/*}`, `${p/a/..}`). Its value is unknown here, so for a command that may write
+# it is denied rather than assumed to stay inside. A plain `$VAR`/`${VAR}` is resolved like any rooted path.
+RUNTIME_PATH = re.compile(r'\$\(|`|\$\{[^}]*[:%#/^,@]|<\(|>\(')
 ROOTED = re.compile(r'^(~|\$|%|[\\/]|[A-Za-z]:)')  # home, a variable, a root or a drive: resolved, never assumed
 
 
@@ -1066,8 +1120,8 @@ def _dynamic_env_name(seg: str) -> bool:
 
 def _archive_env_hazard(seg: str) -> str | None:
     """An exported option variable outlives the command that sets it, so setting one at all is denied."""
-    plain = _unquoted(seg)
-    if any(r.search(s) for r in (ARCHIVE_ENV, ARCHIVE_ENV_UPPER) for s in (seg, plain)):
+    plain, decoded = _unquoted(seg), ' '.join(words(seg))  # decoded: as the shell reads it ($'TAR\x5fOPTIONS')
+    if any(r.search(s) for r in (ARCHIVE_ENV, ARCHIVE_ENV_UPPER) for s in (seg, plain, decoded)):
         return 'an archive option variable (TAR_OPTIONS, TAR_READER/WRITER_OPTIONS, TAPE, UNZIP, UNZIPOPT, ZIPOPT, ' \
                'ZIP) is set; pass the options on the extractor command line'
     if _dynamic_env_name(seg):
@@ -1544,15 +1598,26 @@ def intel_violation(tool: str, tool_input: dict, allow: list[str]) -> str | None
 # ---------------------------------------------------------------- code-profile confinement
 
 def code_violation(tool: str, tool_input: dict, cwd: str | None, shell_cwd: str | None = None) -> str | None:
-    tool_input = tool_input or {}
+    """Fails closed: a tool the code profile does not know, a write or shell call without a known worktree,
+    and a call whose path or command is missing or not a string are all denied, never waved through."""
+    tool_input = tool_input if isinstance(tool_input, dict) else {}
+    if tool in CODE_PASS_TOOLS:
+        return None
+    if tool not in FILE_WRITE_TOOLS and tool not in SHELL_TOOLS:
+        return f'{common.clip(tool, 60)} is not a tool the twinlane code profile knows; it is denied in a twinlane job'
+    if not isinstance(cwd, str) or not cwd:
+        return f'{tool}: the job worktree is unknown, so the call cannot be confined; denied in a twinlane job'
     if tool in FILE_WRITE_TOOLS:
-        path = tool_input.get('file_path') or tool_input.get('notebook_path') or ''
-        if cwd and path and not _inside(path, cwd):
+        path = tool_input.get('file_path') or tool_input.get('notebook_path')
+        if not isinstance(path, str) or not path:
+            return f'{tool} without a file path cannot be confined; denied in a twinlane job'
+        if not _inside(path, cwd):
             return f'{tool} outside the job worktree ({common.clip(path, 120)})'
         return None
-    if tool in SHELL_TOOLS and cwd:
-        return _scan(str(tool_input.get('command') or ''), _ctx('code', cwd, shell_cwd or cwd))
-    return None
+    command = tool_input.get('command')
+    if not isinstance(command, str):
+        return f'{tool} without a command string cannot be inspected; denied in a twinlane job'
+    return _scan(command, _ctx('code', cwd, shell_cwd if isinstance(shell_cwd, str) and shell_cwd else cwd))
 
 
 # ---------------------------------------------------------------- decision
@@ -1565,7 +1630,9 @@ def evaluate(tool: str, tool_input: dict, profile: str, cwd: str | None, allow: 
     if tool in ('Agent', 'Task'):
         return 'nested agent launch is not allowed in a twinlane job'
     if tool in SHELL_TOOLS:
-        if len(str(tool_input.get('command') or '')) > MAX_COMMAND_CHARS:
+        if not isinstance(tool_input.get('command'), str):
+            return f'{tool} without a command string cannot be inspected; denied in a twinlane job'
+        if len(tool_input['command']) > MAX_COMMAND_CHARS:
             return f'command too long to inspect (over {MAX_COMMAND_CHARS // 1024} KB); not allowed in a twinlane job'
         # The code-profile scan below runs every shell rule too, so a code job with a cwd scans once.
         reason = None if profile == 'code' and cwd else shell_hazard(str(tool_input.get('command') or ''))

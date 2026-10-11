@@ -330,6 +330,33 @@ class RelativePathEscapes(unittest.TestCase):
                     'rm -f .*.swp', 'cp a.? out/', 'ls | % { $_ }'):
             self.assertIsNone(code(cmd), cmd)
 
+    def test_run_time_paths_and_ansi_c_quoting_are_not_read_as_literal_text(self):
+        bs = chr(92)
+        for cmd in ("chmod 777 $'" + bs + "x2e" + bs + "x2e/x'", "chmod 777 $'..'/x",
+                    "chmod 777 $'" + bs + "056" + bs + "056/x'", "cp a $'.'./x", 'chmod 777 `echo ..`/x',
+                    'chmod 777 $(echo ..)/x', 'cp a ${X:-..}/x', 'cp a ${HOME%/*}/x', 'cp a "${PWD%/*}"/x',
+                    'mkdir out/$(echo ../..)', "export $'TAR" + bs + "x5fOPTIONS'=-P"):
+            self.assertIsNotNone(code(cmd), cmd)
+        for cmd in ("printf '%s' $'a" + bs + "tb'", 'echo $(date) > out.txt', 'make $TARGET',
+                    'git log -1 --format=%H'):
+            self.assertIsNone(code(cmd), cmd)
+
+    def test_caps_deny_instead_of_checking_part(self):
+        self.assertIsNotNone(code('cp a ' + '{a,b,c,d,e,f,g,h}' * 3 + '{..,z}/x'))
+        self.assertIsNotNone(code('cp a ' + '{a,b}' * 9 + '/x'))
+        self.assertIsNone(code('cp src/{a,b,c}.py out/'))
+
+    def test_code_profile_denies_what_it_cannot_judge(self):
+        root = os.path.abspath('job-w').replace(os.sep, '/')
+        for tool, ti, cwd in (('mcp__fs__write_file', {'path': 'x'}, root), ('Write', {}, root),
+                              ('Write', {'file_path': ['x']}, root), ('Bash', {'command': ['ls']}, root),
+                              ('Bash', {}, root), ('Write', {'file_path': root + '/x'}, None),
+                              ('Bash', {'command': 'ls'}, None), ('PowerShell', {'command': 'ls'}, '')):
+            self.assertIsNotNone(guard.evaluate(tool, ti, 'code', cwd, []), (tool, ti, cwd))
+        self.assertIsNone(guard.evaluate('Write', {'file_path': root + '/x'}, 'code', root, []))
+        self.assertIsNone(guard.evaluate('Bash', {'command': 'ls'}, 'code', root, []))
+        self.assertIsNone(guard.evaluate('Read', {'file_path': 'x'}, 'code', root, []))
+
     def test_option_channels_outside_the_command_line_are_refused(self):
         # tar reads a -T list's lines as options unless --verbatim-files-from comes first; option variables are
         # refused however the name is spelled; a variable name built at run time cannot be read, so it is refused.
