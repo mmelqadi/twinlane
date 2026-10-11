@@ -598,7 +598,8 @@ def read_claude_raw(refresh: bool = False, creds_path=None, _http=None, _run=Non
         cached['token_expired_at'] = expired
         return cached
     return {'source': 'none', 'token_expired_at': expired,
-            'note': _join(*notes, 'no cached reading; renew the Claude CLI login, then run twinlane meter --fresh, '
+            'note': _join(*notes, 'no cached reading; renew the Claude CLI login if it has expired, '
+                                  'then run twinlane meter --fresh, '
                                   'or record a reading with '
                                   'twinlane meter --record-claude <get_usage json>')}
 
