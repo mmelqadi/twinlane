@@ -91,6 +91,7 @@ WRITE_VERB_NAMES = {'cp', 'mv', 'rm', 'rmdir', 'rd', 'del', 'erase', 'copy', 'mo
 _SLASH_ROOT = r'/[a-zA-Z]/[^\s"\'|;&<>]*' if os.name == 'nt' else r'/[^\s"\'|;&<>]*'
 ABS_PATH = re.compile(r'(?<![\w/.])([A-Za-z]:[\\/][^\s"\'|;&<>]*|' + _SLASH_ROOT + r'|'
                       r'\\' r'\\' r'[^\s"\'|;&<>]+)')
+DOTDOT = re.compile(r'(^|[\\/])\.\.([\\/]|$)')  # a `..` path component
 SEGMENT_SPLIT = re.compile(r'&&|\|\||[;|&\r\n]')  # a lone & (background) starts a new command too
 REDIRECT = re.compile(r'"[^"]*"|\'[^\']*\'|(?:\d|&|\*)?>>?\|?\s*("[^"]*"|\'[^\']*\'|[^\s;&|<>]+)')
 NULL_TARGETS = {'/dev/null', 'nul', 'nul:', '$null', '/dev/stdout', '/dev/stderr'}
@@ -769,10 +770,16 @@ def path_hazard(ws: list[str], seg: str, root: str, base: str | None, stack: lis
     for t in targets:
         if _outside(t, root, base):
             return base, f'a writing command names a path outside the job worktree ({common.clip(t, 120)})'
+    writing = '>' in seg or WRITE_VERBS.search(seg)
     for path in ABS_PATH.findall(seg):
         if not _inside(path, root) and not path.lower().startswith(('/dev/null', 'nul')) \
-                and not any(path in s for s in sources) and ('>' in seg or WRITE_VERBS.search(seg)):
+                and not any(path in s for s in sources) and writing:
             return base, f'a writing command names a path outside the job worktree ({common.clip(path, 120)})'
+    if writing:  # a command it does not model (unzip -d, tar -C) still names `..` paths: resolve each one
+        for w in (words(seg) if raw is None else raw)[1:]:
+            for cand in ([w] if not w.startswith('-') else []) + ([w.split('=', 1)[1]] if '=' in w else []):
+                if DOTDOT.search(cand) and cand not in sources and _outside(cand, root, base):
+                    return base, f'a writing command names a path outside the job worktree ({common.clip(cand, 120)})'
     return base, None
 
 

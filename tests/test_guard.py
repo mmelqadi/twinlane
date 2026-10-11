@@ -224,6 +224,8 @@ class RelativePathEscapes(unittest.TestCase):
         for cmd in ('cp a.txt ../outside.txt', 'echo hi > ../x.txt', 'echo hi >> ..\\x.txt', 'mkdir ~/x',
                     'touch $HOME/x', 'touch %USERPROFILE%\\x', 'touch "$(pwd)/../x"', 'rm -rf ../task-b',
                     'cd .. && touch x', 'cd $UNSET_DIR_X && touch x', 'pushd .. && cp a b',
+                    'unzip a.zip -d ./../x > log.txt', 'tar -xf a.tar -C ./../x > l.txt',
+                    'unzip a.zip -d ../x > log.txt', 'tar -xf a.tar --directory=../x > l.txt',
                     'Copy-Item a.txt -Destination ..\\x.txt', 'Set-Content -Path ..\\x.txt -Value 1',
                     'tee ../log.txt', 'cp --target-directory=../x a', 'curl -o ../x http://127.0.0.1/',
                     'git -C ../task-b checkout .', "python -c \"open('../x.txt','w').write('1')\"",

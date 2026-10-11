@@ -673,6 +673,18 @@ class InlineRuns(JobsBase):
         def poll(self):
             return None if self.stuck > 0 else self.rc
 
+    @staticmethod
+    def _kill_diagnosis(out, real_kill, child, stamp):
+        """What the stop saw, for a failure on a platform the author cannot run."""
+        pgid = None
+        if os.name != 'nt':
+            try:
+                pgid = (os.getpgid(child.pid), os.getpgrp())
+            except OSError as e:
+                pgid = repr(e)
+        return (f'{out}\nkill_tree calls: {real_kill.call_args_list}\nchild poll={child.poll()} stamp={stamp} '
+                f'now={common.process_created(child.pid)} state={common.pid_state(child.pid, stamp)} pgid={pgid}')
+
     def _stuck_engine(self):
         """A real sleeping process standing in for an engine child that outlives its kill: (process, stamp)."""
         child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'])
@@ -723,7 +735,7 @@ class InlineRuns(JobsBase):
         # A stop whose kill works ends the engine and frees the slot; the receipt stays the history
         with mock.patch.object(common, 'kill_tree', side_effect=common.kill_tree) as real_kill:
             rc, out, _ = self.cli('stop', jid, '--json')
-        self.assertEqual(rc, 0, out)
+        self.assertEqual(rc, 0, self._kill_diagnosis(out, real_kill, child, stamp))
         real_kill.assert_called_once_with(child.pid, stamp)
         child.wait(timeout=15)
         self.assertEqual(jobs.job_status(jid), 'timeout')
