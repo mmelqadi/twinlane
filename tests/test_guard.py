@@ -266,26 +266,67 @@ class RelativePathEscapes(unittest.TestCase):
             self.assertIsNotNone(code(cmd), cmd)
 
     def test_every_abbreviation_and_position_of_an_escaping_archive_option_is_denied(self):
-        # getopt accepts any unambiguous prefix (`--absol`), and an option may sit before, between or after.
-        for head, names in (('tar', guard.ARCHIVE_LONG['tar']), ('bsdtar', guard.ARCHIVE_LONG['tar']),
-                            ('cpio', guard.ARCHIVE_LONG['cpio']), ('jar', guard.ARCHIVE_LONG['jar'])):
+        # getopt accepts any unambiguous prefix (`--ab`), and an option may sit before, between or after. This
+        # list is the test's own, not the guard's table: the guard allowlists, so unknown options fail too.
+        dangerous = {'tar': ('--absolute-names', '--absolute-paths', '--insecure', '--transform', '--xform',
+                             '--to-command', '--checkpoint-action', '--info-script', '--new-volume-script',
+                             '--rsh-command', '--use-compress-program', '--keep-directory-symlink', '--options'),
+                     'cpio': ('--extract',), 'jar': ('--extract',)}
+        for head, names in (('tar', dangerous['tar']), ('bsdtar', dangerous['tar']), ('cpio', dangerous['cpio']),
+                            ('jar', dangerous['jar'])):
             for name in names:
-                for cut in range(5, len(name) + 1):
+                for cut in range(3, len(name) + 1):
                     opt = name[:cut]
-                    if opt in guard.ARCHIVE_EXACT_SAFE:  # `--checkpoint` is its own harmless option
-                        continue
+                    if any(s.startswith(opt) for s in guard.TAR_SAFE_LONG) and head in guard.TAR_NAMES:
+                        continue  # also a prefix of a safe option: ambiguous, so tar itself refuses it
                     for cmd in (f'{head} {opt} -f a', f'{head} -v {opt}=x -f a', f'{head} -f a {opt}'):
                         self.assertIsNotNone(code(cmd), cmd)
         for cmd in ('jar -v -x -f a.jar', 'jar -vxf a.jar', 'jar vxf a.jar', 'jar -f a.jar -x', 'cpio -vid < a',
-                    'tar -v -P -xf a.tar', 'tar -xvfP a.tar', 'bsdtar -x -s ,a,b, -f a.tar'):
+                    'tar -v -P -xf a.tar', 'tar -xvPf a.tar', 'bsdtar -x -s ,a,b, -f a.tar', 'tar -xIzstd -f a',
+                    'tar -xF s.sh -f a', 'tar --frobnicate -xf a.tar', 'pax -rf a.pax', 'bsdcpio -i < a',
+                    'python3 -m tarfile -e a.tar out', 'unzip -^ a.zip', '7z x a.7z -snl', '7z x a.7z -SPF'):
             self.assertIsNotNone(code(cmd), cmd)
+
+    def test_any_command_that_is_not_read_only_is_checked_for_outside_paths(self):
+        # The set of commands that can modify a file is open-ended, so the default is inverted: only a known
+        # read-only command may name `..` or home paths unchecked.
+        for cmd in ('sed --in-place s/a/b/ ../x', 'sed -Ei s/a/b/ ../x', 'perl -pi -e s/a/b/ ../x',
+                    'ruby -i -pe 1 ../x', 'awk -i inplace 1 ../x', 'chmod 777 ../x', 'chown me ../x', 'mkfifo ../x',
+                    'shred ../x', 'unlink ../x', 'setfacl -m u:x:rw ../x', 'chattr +i ../x', 'ed -s ../x',
+                    'ex -sc wq ../x', 'vim -es -c wq ../x', 'mktemp ../x.XXXX', 'icacls ../x /grant Everyone:F',
+                    'attrib +r ../x', 'Set-ItemProperty ../x -Name IsReadOnly -Value 1', 'go build -o ../x',
+                    'cargo build --target-dir ../x', 'gcc -o ../x a.c', 'gcc -o/tmp/x a.c', 'python -m venv ../x',
+                    'git apply --directory=../x a.diff', 'npm install --prefix ~/x', 'chmod 600 ~/x',
+                    'find .. -name x -delete', 'find ../x -exec rm {} ;', 'python ../tools/x.py'):
+            self.assertIsNotNone(code(cmd), cmd)
+
+    def test_read_only_commands_and_inside_paths_stay_allowed(self):
+        for cmd in ('cat ../other/file', 'ls ../', 'grep -rn foo ../other', 'find .. -name x', 'diff a ../b',
+                    'git -C ../task-b log -3', 'head -5 ~/notes.txt', 'Get-Content ..\\x.txt', 'chmod +x sub/../run.sh',
+                    'gcc -Iinclude -o build/a a.c', 'go build -o bin/app ./cmd/app', 'cargo build --target-dir target',
+                    'python -m venv .venv', 'npm install --prefix ./tools', 'make $TARGET', 'npm run $SCRIPT',
+                    'sed -i s/a/b/ src/x.py', 'perl -pi -e s/a/b/ src/x', 'python tools/x.py', 'echo $HOME > out.txt'):
+            self.assertIsNone(code(cmd), cmd)
+
+    def test_everyday_archive_commands_are_allowed(self):
+        for cmd in ('tar -xzf a.tgz -C out', 'tar xvf a.tar', 'tar -xvf a.tar --strip-components=1 -C out',
+                    'tar --extract --file=a.tar --directory=out', 'tar --strip=1 -xf a.tar', 'tar -tvf a.tar',
+                    'tar -czf dist/a.tgz --exclude=.git src', 'tar --zstd -xf a.tar.zst', 'tar -xf - < a.tar',
+                    'tar --checkpoint=100 -xf a.tar', 'bsdtar -xf a.tar -C out', 'unzip -oq a.zip -d out',
+                    'unzip -l a.zip', 'zip -r out.zip src', '7z x a.7z -oout -y', 'jar tf a.jar',
+                    'jar cf out.jar -C build .', 'cpio -o < list > out.cpio', 'cpio -t < a.cpio',
+                    'python -m tarfile -l a.tar', 'grep -ri zip src > hits.txt', 'echo $PATH > p.txt'):
+            self.assertIsNone(code(cmd), cmd)
 
     def test_setting_a_variable_an_extractor_reads_as_options_is_denied(self):
         for var in ('TAR_OPTIONS', 'UNZIP', 'UNZIPOPT', 'ZIPOPT', 'ZIP', 'tar_options'):
             for cmd in (f'{var}=-P tar -xf a.tar', f'env {var}=-P tar -xf a.tar', f'export {var}=-P',
                         f'export {var}="--absolute-names"', f'set {var}=-:', f'set "{var}=-:"', f'setx {var} -P',
                         f'$env:{var}="-P"', f'Set-Item env:{var} -Value -P',
-                        f'[Environment]::SetEnvironmentVariable("{var}", "-P", "User")', f'declare -x {var}=-P'):
+                        f'[Environment]::SetEnvironmentVariable("{var}", "-P", "User")', f'declare -x {var}=-P',
+                        f'{var}+=-P', f': ${{{var}:=-P}}', f'printf -v {var} -- -P', f'read {var} <<< -P',
+                        f'typeset -gx {var}=-P', f'setenv {var} -P', f'New-Item env:{chr(92)}{var} -Value -P',
+                        f'python -c "import os; os.environ[\'{var}\']=\'-P\'"', f'export -- {var}'):
                 self.assertIsNotNone(code(cmd), cmd)
 
     def test_archive_defaults_that_strip_member_names_are_allowed(self):

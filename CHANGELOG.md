@@ -24,7 +24,8 @@
 - On Windows, `/X` after `del`, `rd`, `move` or `copy` is read as a switch only when it is one of that verb's cmd switches and no PowerShell parameter is present, so `del /outside` is a path.
 - `claude.extra_usage_allowed` takes effect only when it is the JSON value `true`.
 - Archive, transfer and output tools (`unzip`, `tar`, `7z`, `cpio`, `jar`, `dd`, `rsync`, `scp`, `patch`, `wget`, `sort`, `split`, `sqlite3`, `python -m zipfile`, `Expand-Archive`) count as writes, and every `..`, home, variable or root path a writing command names is resolved, including attached option values (`-d../x`, `-xvC../x`, `of=../x`, `-Destination:..\x`), quoted ones and a POSIX-escaped dot (`.\./x`).
-- Archive options that let member names escape (`unzip -:`, `tar -P`, `--absolute-names`, `--transform`, `bsdtar -s`, `7z -spf`), in any getopt abbreviation and position, extraction by `cpio -i` and `jar x`, and setting `TAR_OPTIONS`/`UNZIP`/`UNZIPOPT`/`ZIPOPT`/`ZIP` are denied.
+- Outside paths fail closed: a `..` or home path named by any command not on a short read-only list is denied, so in-place editors and file-mode tools (`sed --in-place`, `perl -pi`, `chmod`, `icacls`, `ed`, ...) need no listing; output options (`-o`, `--output`, `--target-dir`, `--prefix`, ...) are write targets for every command; `git apply --directory` is checked.
+- Archive extractors are allowlisted (only options known to keep member names inside the destination, in any getopt abbreviation and position); extraction by `cpio`, `jar`, `pax -r` and `python -m tarfile -e` is denied, and so is setting `TAR_OPTIONS`/`UNZIP`/`UNZIPOPT`/`ZIPOPT`/`ZIP`.
 - `twinlane stop` gives a killed survivor its grace period before judging it alive (on Linux, SIGKILL lands after `kill()` returns).
 - Still a heuristic over command text, not a sandbox.
 

@@ -797,6 +797,10 @@ def path_hazard(ws: list[str], seg: str, root: str, base: str | None, stack: lis
                 targets.append(ws[i + 1])
             elif w.startswith(('--git-dir=', '--work-tree=')):
                 targets.append(w.split('=', 1)[1])
+            elif sub == 'apply' and w == '--directory' and i + 1 < len(ws):  # patch paths are rooted there
+                targets.append(ws[i + 1])
+            elif sub == 'apply' and w.startswith('--directory='):
+                targets.append(w.split('=', 1)[1])
     for t in targets:
         if _outside(t, root, base):
             return base, f'a writing command names a path outside the job worktree ({common.clip(t, 120)})'
@@ -808,22 +812,76 @@ def path_hazard(ws: list[str], seg: str, root: str, base: str | None, stack: lis
     why = _archive_hazard(head, ws)
     if why:
         return base, why
-    m = ARCHIVE_ENV.search(seg)  # an exported option variable outlives this command, so setting it is denied
-    if m:
-        name = next(g for g in m.groups() if g)
-        return base, f'{name} feeds options to an extractor; pass the options on its command line'
-    if writing:  # a command it does not model (unzip -d, tar -C) still names paths: resolve each one
+    why = _archive_env_hazard(seg)
+    if why:
+        return base, why
+    reads_only = _reads_only(head, ws)
+    if not reads_only:  # an output option is a write target for any command (gcc -o, cargo --target-dir)
+        for t in _generic_output_targets(ws):
+            if _outside(t, root, base):
+                return base, f'an output option names a path outside the job worktree ({common.clip(t, 120)})'
+    # The set of commands that can modify a file is open-ended (chmod, sed --in-place, perl -pi, ed, icacls, ...),
+    # so `..` and home/temp paths are resolved for EVERY command except a known read-only one; any rooted path
+    # (a variable, a root or a drive path) is resolved for a known writer or a redirect.
+    if writing or not reads_only:
         text = head in TEXT_WORDS  # `echo $HOME > out.txt` prints a variable, it does not write to it
         powershell = any(re.match(r'^-[A-Za-z]{2,}', w) for w in ws[1:])
         for w in (words(seg) if raw is None else raw)[1:]:
             if _cmd_switch(head, w, powershell):  # `del /Q` is a switch, not the root path /Q
                 continue
             for cand in _path_candidates(w, head):
-                if cand in sources or not (DOTDOT.search(cand) or (not text and ROOTED.match(cand))):
+                if cand in sources or not (DOTDOT.search(cand) or (not text and HOME_LED.match(cand))
+                                           or (writing and not text and ROOTED.match(cand))):
                     continue
                 if _outside(cand, root, base):
-                    return base, f'a writing command names a path outside the job worktree ({common.clip(cand, 120)})'
+                    return base, f'a command that may write names a path outside the job worktree ' \
+                                 f'({common.clip(cand, 120)})'
     return base, None
+
+
+# Commands that only read, so a `..` argument is a read (`cat ../other/file`, `ls ../`). git has its own rules.
+READ_ONLY_HEADS = {
+    'cat', 'type', 'less', 'more', 'head', 'tail', 'ls', 'dir', 'tree', 'grep', 'egrep', 'fgrep', 'rg', 'ag', 'ack',
+    'wc', 'stat', 'file', 'du', 'df', 'diff', 'cmp', 'comm', 'md5sum', 'sha1sum', 'sha256sum', 'sha512sum', 'cksum',
+    'readlink', 'realpath', 'basename', 'dirname', 'which', 'where', 'whereis', 'echo', 'printf', 'pwd', 'test', '[',
+    'true', 'false', 'jq', 'xxd', 'od', 'hexdump', 'strings', 'nl', 'column', 'cut', 'findstr', 'git', 'get-content',
+    'gc', 'get-childitem', 'gci', 'get-item', 'gi', 'select-string', 'sls', 'test-path', 'resolve-path',
+    'get-filehash', 'measure-object', 'compare-object', 'write-output', 'write-host', 'find', 'fd',
+}
+FIND_ACTIONS = re.compile(r'^-(delete|exec|execdir|ok|okdir|fprint|fprint0|fprintf|fls)$')
+HOME_LED = re.compile(r'^(~|\$\{?(HOME|TMPDIR|TMP|TEMP|USERPROFILE|APPDATA|LOCALAPPDATA)\b|'
+                      r'%(HOME|TMP|TEMP|USERPROFILE|APPDATA|LOCALAPPDATA)%|\$env:(HOME|TMP|TEMP|USERPROFILE|'
+                      r'APPDATA|LOCALAPPDATA)\b)', re.I)
+OUTPUT_LONG = ('--output', '--out', '--outdir', '--out-dir', '--output-dir', '--output-directory', '--target-dir',
+               '--target', '--prefix', '--dest', '--destination', '--directory', '--install-dir', '--root',
+               '--build-dir', '--outfile', '--out-file', '--log-file', '--logfile')
+
+
+def _reads_only(head: str, ws: list) -> bool:
+    """A command known to only read: its `..` arguments are reads, not writes."""
+    if head not in READ_ONLY_HEADS:
+        return False
+    if head in ('find', 'fd'):
+        return not any(FIND_ACTIONS.match(w) or w in ('-x', '-X', '--exec', '--exec-batch') for w in ws[1:])
+    return True
+
+
+def _generic_output_targets(ws: list) -> list:
+    """Values of `-o` and of output-directory long options, separate or attached, for any command."""
+    out = []
+    for i, w in enumerate(ws[1:], 1):
+        nxt = ws[i + 1] if i + 1 < len(ws) else None
+        name = w.split('=', 1)[0].lower()
+        if name in OUTPUT_LONG:
+            if '=' in w:
+                out.append(w.split('=', 1)[1])
+            elif nxt is not None:
+                out.append(nxt)
+        elif w == '-o' and nxt is not None:
+            out.append(nxt)
+        elif w.startswith('-o') and not w.startswith('--') and len(w) > 2 and not w[2].isalpha():
+            out.append(w[2:])  # -o../x; `-ofoo` stays a flag cluster, its tail is checked as a candidate
+    return out
 
 
 TEXT_WORDS = {'echo', 'printf', 'write-output', 'write-host', 'write', 'echo.'}
@@ -837,54 +895,108 @@ def _flag_letters(w: str) -> str:
 
 
 TAR_NAMES = ('tar', 'gtar', 'bsdtar')
-# Per extractor: long options that let ARCHIVE member names (absolute, `..`, rewritten) choose where files land,
-# or run a command; and short letters with the same effect. cpio and jar extraction never strip.
-ARCHIVE_LONG = {
-    'tar': ('--absolute-names', '--absolute-paths', '--insecure', '--transform', '--xform', '--to-command',
-            '--checkpoint-action', '--info-script', '--new-volume-script', '--rsh-command'),
-    'cpio': ('--extract',),
-    'jar': ('--extract',),
-}
-ARCHIVE_SHORT = {'tar': 'P', 'cpio': 'i', 'jar': 'x'}
-ARCHIVE_EXACT_SAFE = {'--checkpoint'}  # a real option of its own, not an abbreviation of --checkpoint-action
+# Extractors are judged by ALLOWLIST: every option must be one known to keep member names inside the destination.
+# Anything else (an absolute-names switch, a rename rule, a command hook, an option this table does not know) is
+# denied, so a new spelling or an unknown option cannot slip past. getopt resolves a long-option prefix to the one
+# option it names, and an ambiguous prefix is an error, so a prefix of a SAFE name is safe.
+TAR_SAFE_LETTERS = (set('Acdrtux')  # modes
+                    | set('zjJZya')  # compression
+                    | set('vfC')  # verbose, archive file, directory
+                    | set('kmopOwhSU')  # extraction behaviour
+                    | set('TXWlBGiqMRbgKNLVHn'))  # lists, checks, blocking, volumes, format
+# Not P (absolute names), F (runs a script), I (runs a compressor program), s (bsdtar rename rule), Q.
+TAR_VALUE_LETTERS = set('fCTXbgKNLVH')  # the rest of a cluster after one of these is its value
+TAR_SAFE_LONG = (
+    '--extract', '--get', '--list', '--create', '--append', '--update', '--diff', '--compare', '--concatenate',
+    '--catenate', '--file', '--directory', '--gzip', '--gunzip', '--ungzip', '--bzip2', '--xz', '--lzma', '--lzip',
+    '--lzop', '--zstd', '--compress', '--uncompress', '--auto-compress', '--verbose', '--strip-components',
+    '--exclude', '--exclude-from', '--exclude-vcs', '--exclude-vcs-ignores', '--exclude-caches', '--keep-old-files',
+    '--keep-newer-files', '--skip-old-files', '--overwrite', '--overwrite-dir', '--no-overwrite-dir',
+    '--no-same-owner', '--same-owner', '--no-same-permissions', '--same-permissions', '--preserve-permissions',
+    '--touch', '--to-stdout', '--wildcards', '--no-wildcards', '--anchored', '--no-anchored', '--one-file-system',
+    '--checkpoint', '--totals', '--sort', '--owner', '--group', '--mtime', '--numeric-owner', '--format', '--null',
+    '--files-from', '--verbatim-files-from', '--dereference', '--no-recursion', '--recursion', '--ignore-zeros',
+    '--warning', '--quiet', '--blocking-factor', '--record-size', '--sparse', '--hard-dereference', '--force-local',
+    '--mode', '--atime-preserve', '--xattrs', '--no-xattrs', '--acls', '--no-acls', '--selinux', '--no-selinux',
+    '--fast-read', '--unlink-first', '--delay-directory-restore', '--no-delay-directory-restore', '--help',
+    '--version', '--usage', '--show-defaults')
+SEVENZIP_UNSAFE = ('-spf', '-snl', '-snh')  # full paths, symlinks, hard links: 7z switches are exact, not getopt
 # Environment variables an extractor reads as extra options (`TAR_OPTIONS=-P tar -xf a.tar`, `UNZIP=-:`).
-_ARCHIVE_VARS = r'(TAR_OPTIONS|UNZIP|UNZIPOPT|UNZIP_OPTS|ZIPOPT|ZIP)'
-ARCHIVE_ENV = re.compile(  # NAME=..., "NAME=...", env:NAME (PowerShell), setx NAME ..., SetEnvironmentVariable('NAME'
-    r'(?:(?:^|[\s;&|(:])["\']?' + _ARCHIVE_VARS + r'\s*=(?!=)|env:' + _ARCHIVE_VARS + r'\b|\bsetx\s+'
-    + _ARCHIVE_VARS + r'\b|SetEnvironmentVariable\(\s*["\']' + _ARCHIVE_VARS + r'["\'])', re.I)
+# Unambiguous names are denied wherever they appear; UNZIP and ZIP are also command names, so for them only a
+# setting form (assignment, PowerShell env:, a quoted name, an uppercase reference, a declaring builtin) counts.
+ARCHIVE_ENV = re.compile(
+    r'(TAR_OPTIONS|UNZIPOPT|UNZIP_OPTS|ZIPOPT)'
+    r'|\b(?:UNZIP|ZIP)\b\s*\+?=(?!=)'
+    r'|env:(?:\x5c)?(?:UNZIP|ZIP)\b'  # env:NAME, optionally with a backslash after the colon
+    r'|["\'](?:UNZIP|ZIP)["\']'
+    r'|\b(?:UNZIP|ZIP):?[-=?+]'  # ${UNZIP:=-:}, ${ZIP=...}
+    r'|\b(?:export|declare|typeset|local|readonly|setx|setenv|set|read|mapfile|printf\s+-v)\b[^;&|]*?'
+    r'\b(?:UNZIP|ZIP)\b', re.I)
+ARCHIVE_ENV_UPPER = re.compile(r'\b(?:UNZIP|ZIP)\b')  # case-sensitive: the commands are lowercase
 
 
-def _long_option_hits(w: str, names) -> bool:
-    """True when `w` is one of `names` or an abbreviation getopt would accept (at least `--` + 3 letters)."""
-    if not w.startswith('--'):
-        return False
-    opt = w.split('=', 1)[0].lower()
-    return len(opt) >= 5 and opt not in ARCHIVE_EXACT_SAFE and any(n.startswith(opt) for n in names)
+def _archive_env_hazard(seg: str) -> str | None:
+    """An exported option variable outlives the command that sets it, so setting one at all is denied."""
+    if ARCHIVE_ENV.search(seg) or ARCHIVE_ENV_UPPER.search(seg):
+        return 'an archive option variable (TAR_OPTIONS, UNZIP, UNZIPOPT, ZIPOPT, ZIP) is set; pass the ' \
+               'options on the extractor command line'
+    return None
+
+
+def _tar_cluster_ok(letters: str) -> bool:
+    """A short-option cluster's letters up to (and with) its first value-taking letter are all safe."""
+    for c in letters:
+        if c not in TAR_SAFE_LETTERS:
+            return False
+        if c in TAR_VALUE_LETTERS:
+            return True
+    return True
 
 
 def _archive_hazard(head: str, ws: list) -> str | None:
-    """Options that let the ARCHIVE choose where files land (absolute or `..` member names). The defaults of
-    unzip, tar, bsdtar and 7z strip those; these switches turn the stripping off, and cpio/jar never strip.
-    Long options match every getopt abbreviation, short letters match in any cluster or position."""
+    """Options that could let the ARCHIVE choose where files land (absolute, `..` or rewritten member names) or
+    run a command. tar/bsdtar/unzip/7z default to stripping such names, so their options are ALLOWLISTED;
+    cpio, jar, pax and python's tarfile CLI do not reliably strip, so their extraction is denied."""
     args = ws[1:]
-    why = f'{head} with an option that lets archive member names write outside the job worktree'
-    kind = 'tar' if head in TAR_NAMES else head
-    if head == 'unzip' and any(w.startswith('-') and not w.startswith('--') and ':' in w for w in args):
-        return why  # -: keeps `../` members
-    if head in ('7z', '7za', '7zz', '7zr') and any(w.lower().startswith('-spf') for w in args):
-        return why
-    if kind not in ARCHIVE_LONG:
+    why = f'{head} with an option twinlane cannot prove keeps archive member names inside the job worktree'
+    if head in TAR_NAMES:
+        if args and not args[0].startswith('-') and re.fullmatch(r'[A-Za-z]+', args[0]) \
+                and not all(c in TAR_SAFE_LETTERS for c in args[0]):
+            return why  # old-style bundled letters: `tar xPf a.tar`
+        for w in args:
+            if w.startswith('--'):
+                opt = w.split('=', 1)[0].lower()
+                if opt != '--' and not any(s.startswith(opt) for s in TAR_SAFE_LONG):
+                    return why
+            elif w.startswith('-') and len(w) > 1 and not _tar_cluster_ok(re.match(r'-([A-Za-z]*)', w).group(1)):
+                return why
         return None
-    letters = ARCHIVE_SHORT[kind]
-    old_style = args[0] if args and not args[0].startswith('-') and kind in ('tar', 'jar') else ''
-    hit = any(_long_option_hits(w, ARCHIVE_LONG[kind]) for w in args) \
-        or any(c in old_style for c in letters) or any(c in _flag_letters(w) for w in args for c in letters) \
-        or (head == 'bsdtar' and '-s' in args)
-    if not hit:
+    if head == 'unzip':  # single-letter options only; `-:` and `-^` keep `../` and control characters
+        if any(w.startswith('-') and not re.fullmatch(r'-[A-Za-z]+|-[A-Za-z]*[dP].+', w) for w in args):
+            return why
         return None
-    if kind == 'jar':
-        return f'{head} extraction keeps `../` member names; extract with unzip instead'
-    return why
+    if head in ('7z', '7za', '7zz', '7zr'):
+        if any(w.lower().startswith(SEVENZIP_UNSAFE) for w in args):
+            return why
+        return None
+    if head in ('cpio', 'bsdcpio'):
+        if any('i' in _flag_letters(w) for w in args) or any(w.startswith('--e') for w in args):
+            return f'{head} extraction keeps absolute and `../` member names; extract with tar instead'
+        return None
+    if head == 'jar':
+        first = args[0] if args else ''
+        if (first and not first.startswith('-') and 'x' in first) or any('x' in _flag_letters(w) for w in args) \
+                or any(w.startswith('--e') for w in args):
+            return f'{head} extraction keeps `../` member names; extract with unzip instead'
+        return None
+    if head == 'pax':
+        if any('r' in _flag_letters(w) for w in args):
+            return f'{head} extraction keeps absolute member names; extract with tar instead'
+        return None
+    if (head.startswith('python') or head == 'py') and 'tarfile' in args and any(w in ('-e', '--extract') or w.startswith('--ex')
+                                                               for w in args):
+        return 'python -m tarfile extraction does not filter member names on every Python; use tar'
+    return None
 
 
 GIT_ENV_NAMES = r'(GIT_DIR|GIT_WORK_TREE|GIT_INDEX_FILE|GIT_CONFIG\w*)'
