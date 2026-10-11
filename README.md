@@ -1,29 +1,98 @@
 # twinlane
 
-Run Claude Code and Codex together on your included subscriptions: one usage meter, failover before a limit hits, background workers with receipts.
+**Claude Code + Codex. One workflow.**
 
-Works with Anthropic's Claude Code CLI and the OpenAI Codex CLI on Windows, macOS and Linux (Python 3.9+, standard library). Use it when you keep hitting Claude Code usage limits or Codex rate limits mid-task, when you want parallel AI coding agents in separate git worktrees, or when you need a guardrail hook that keeps an autonomous coding agent inside its worktree.
+Run Claude Code and Codex together on your included subscriptions, with usage-aware routing, saved handoff briefs, and background jobs with receipts.
+
+When one engine approaches its usage limit, the other may still have allowance. twinlane brings both readings into one view, helps route the next task, and keeps a local record of the work.
+
+[![CI](https://github.com/mmelqadi/twinlane/actions/workflows/ci.yml/badge.svg)](https://github.com/mmelqadi/twinlane/actions/workflows/ci.yml)
+[MIT license](LICENSE) · [Latest release](https://github.com/mmelqadi/twinlane/releases/latest) · Python 3.9+ · Standard-library runtime
+
+## What you can do
+
+- **See both usage limits.** Check Claude Code and Codex windows together, including the window currently limiting each engine.
+- **Route new work.** Choose an engine by task type, fresh usage readings, and your configured thresholds.
+- **Prepare a handoff.** Save the task's goal, progress, decisions, and recent evidence in a brief for the next engine.
+- **Inspect delegated work.** Background jobs leave event logs, final results, and receipts you can review locally.
+
+If a dispatched worker ends with a recognized usage-limit result, twinlane can make one policy-checked attempt on the other engine, carrying the original brief, available partial output, and worktree changes. This is a new attempt; it does not migrate a running conversation.
+
+### Preview the board
+
+The image and runnable demo below use **simulated usage and job data**. They show the board without contacting a vendor.
 
 ![twinlane board](docs/demo.svg)
 
-## Why
+## Try the demo
 
-Two subscriptions have two independent limit clocks. When one fills mid-task, rebuilding the context in the other can cost hours. twinlane keeps a small local record of the work, routes new work while allowance remains, and writes a handoff brief before a switch.
+With Git and Python 3.9+ installed:
+
+```sh
+git clone https://github.com/mmelqadi/twinlane.git
+cd twinlane
+python examples/demo/run.py
+```
+
+The demo creates disposable fixture data and removes it when finished. You do not need subscriptions, installed agent CLIs, or a pipx installation to preview the board. Use `python3` if that is your Python command.
 
 ## Quickstart
 
-Python 3.9+ and the `claude` and `codex` CLIs are required for live workers. For this source checkout:
+### 1. Install for live work
+
+From the source checkout above, with pipx installed:
 
 ```sh
 pipx install .
-twinlane install              # preview the hook change
-twinlane install --yes        # apply it to your Claude settings file, with backup
-twinlane status
-twinlane route code
-twinlane run --kind code --cd ~/projects/app --brief task.md --write --bg
 ```
 
-Install from Git: `pipx install git+https://github.com/mmelqadi/twinlane`.
+For an installation without a source checkout, use `pipx install git+https://github.com/mmelqadi/twinlane`. The example briefs below are in the source checkout.
+
+Live workers need the installed `claude` and `codex` CLIs, signed into the accounts you intend to use. Check your installed CLI versions and configure model names for your accounts.
+
+Refresh the usage readings and inspect the routing decision:
+
+```sh
+twinlane meter --fresh
+twinlane route intel
+```
+
+If an engine reads `unknown`, follow the displayed reason before starting work. On macOS/Linux, set `TWINLANE_CODEX_BIN` to your Codex binary or use available rollout evidence; automatic Codex desktop discovery is Windows-specific. See [Limits](LIMITS.md) for platform and authentication details.
+
+### 2. Run a first read-only task
+
+From the twinlane source checkout, use the included brief to inspect this repository:
+
+```sh
+twinlane run --kind intel --cd . --brief examples/briefs/first-review.md
+twinlane board
+```
+
+The `intel` profile requests read-only work. Inspect the returned job ID with `twinlane result JOB`, replacing `JOB` with that ID.
+
+To inspect your own repository, change `--cd` to its path and supply a brief file describing your task.
+
+### 3. Try a writing task in a linked worktree
+
+Writing jobs require a **linked Git worktree**. From the twinlane source checkout:
+
+```sh
+git worktree add ../twinlane-first-task -b twinlane-first-task
+twinlane run --kind code --cd ../twinlane-first-task --brief examples/briefs/first-change.md --write --bg
+```
+
+The included brief asks for one small documentation improvement. Use a different branch and directory name if those already exist. After the job starts, inspect its ID with `twinlane wait JOB` and `twinlane result JOB`, then review the worktree diff yourself.
+
+### Optional: interactive usage warnings
+
+The advisory Claude hook is optional for dispatching workers. Preview it before applying it:
+
+```sh
+twinlane install              # preview the hook change
+twinlane install --yes        # apply it to your Claude settings file, with backup
+```
+
+Credits and extra usage are checked only when a job starts. A long Codex job can still reach paid credits if your account allows it. See [Money guard](#money-guard) and [Limits](LIMITS.md) before running live jobs.
 
 ## Usage and routing
 
