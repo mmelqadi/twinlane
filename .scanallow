@@ -18,3 +18,5 @@
 ^twinlane/(common|guard)[.]py:generic-secret-assign(?:)ment:(?:re[.]compile[(]r?|frozenset[(]?[)]?)$
 # reason: slash-joined git subcommand and GIT_* variable lists in guard docs and messages score as high entropy.
 ^twinlane/guard[.]py:high-entropy:(?:commit/push/[a-z/-]+|GIT_[A-Z_]+(?:/GIT_[A-Z_]+)+)$
+# reason: The README CI badge links this repository's own public Actions workflow page.
+^(?:history@99a588e:)?README\.md:high-entropy:c[o]m/mmelqadi/twinlane/act(?:)ions/workflows/ci$

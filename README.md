@@ -6,6 +6,8 @@ Run Claude Code and Codex together on your included subscriptions, with usage-aw
 
 When one engine approaches its usage limit, the other may still have allowance. twinlane brings both readings into one view, helps route the next task, and keeps a local record of the work.
 
+Works with Anthropic's Claude Code CLI and the OpenAI Codex CLI on Windows, macOS and Linux. Use it when you keep hitting Claude Code usage limits or Codex rate limits mid-task, when you want parallel AI coding agents in separate git worktrees, or when you need a guardrail hook that keeps an autonomous coding agent inside its worktree.
+
 [![CI](https://github.com/mmelqadi/twinlane/actions/workflows/ci.yml/badge.svg)](https://github.com/mmelqadi/twinlane/actions/workflows/ci.yml)
 [MIT license](LICENSE) · [Latest release](https://github.com/mmelqadi/twinlane/releases/latest) · Python 3.9+ · Standard-library runtime
 
