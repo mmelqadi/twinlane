@@ -265,10 +265,33 @@ class RelativePathEscapes(unittest.TestCase):
                     'busybox tar -xPf a.tar', 'sudo tar -xPf a.tar', 'nohup unzip -: a.zip', '/usr/bin/tar -xPf a.tar'):
             self.assertIsNotNone(code(cmd), cmd)
 
+    def test_every_abbreviation_and_position_of_an_escaping_archive_option_is_denied(self):
+        # getopt accepts any unambiguous prefix (`--absol`), and an option may sit before, between or after.
+        for head, names in (('tar', guard.ARCHIVE_LONG['tar']), ('bsdtar', guard.ARCHIVE_LONG['tar']),
+                            ('cpio', guard.ARCHIVE_LONG['cpio']), ('jar', guard.ARCHIVE_LONG['jar'])):
+            for name in names:
+                for cut in range(5, len(name) + 1):
+                    opt = name[:cut]
+                    if opt in guard.ARCHIVE_EXACT_SAFE:  # `--checkpoint` is its own harmless option
+                        continue
+                    for cmd in (f'{head} {opt} -f a', f'{head} -v {opt}=x -f a', f'{head} -f a {opt}'):
+                        self.assertIsNotNone(code(cmd), cmd)
+        for cmd in ('jar -v -x -f a.jar', 'jar -vxf a.jar', 'jar vxf a.jar', 'jar -f a.jar -x', 'cpio -vid < a',
+                    'tar -v -P -xf a.tar', 'tar -xvfP a.tar', 'bsdtar -x -s ,a,b, -f a.tar'):
+            self.assertIsNotNone(code(cmd), cmd)
+
+    def test_setting_a_variable_an_extractor_reads_as_options_is_denied(self):
+        for var in ('TAR_OPTIONS', 'UNZIP', 'UNZIPOPT', 'ZIPOPT', 'ZIP', 'tar_options'):
+            for cmd in (f'{var}=-P tar -xf a.tar', f'env {var}=-P tar -xf a.tar', f'export {var}=-P',
+                        f'export {var}="--absolute-names"', f'set {var}=-:', f'set "{var}=-:"', f'setx {var} -P',
+                        f'$env:{var}="-P"', f'Set-Item env:{var} -Value -P',
+                        f'[Environment]::SetEnvironmentVariable("{var}", "-P", "User")', f'declare -x {var}=-P'):
+                self.assertIsNotNone(code(cmd), cmd)
+
     def test_archive_defaults_that_strip_member_names_are_allowed(self):
         for cmd in ('unzip a.zip', 'unzip -o a.zip -d out', 'tar -xf a.tar', 'tar -xzf a.tgz -C out', '7z x a.7z',
-                    'cpio -idm --no-absolute-filenames < a.cpio', 'tar -cf a.tar src', 'echo $HOME > out.txt',
-                    'del /Q build\\x.txt', 'curl -o out.html http://127.0.0.1/x', 'sort a > out.txt'):
+                    'tar -cf a.tar src', 'echo $HOME > out.txt',
+                    'curl -o out.html http://127.0.0.1/x', 'sort a > out.txt', 'tar --checkpoint=100 -xf a.tar'):
             self.assertIsNone(code(cmd), cmd)
 
     def test_every_escape_spelling_in_every_option_shape_is_denied(self):

@@ -808,6 +808,10 @@ def path_hazard(ws: list[str], seg: str, root: str, base: str | None, stack: lis
     why = _archive_hazard(head, ws)
     if why:
         return base, why
+    m = ARCHIVE_ENV.search(seg)  # an exported option variable outlives this command, so setting it is denied
+    if m:
+        name = next(g for g in m.groups() if g)
+        return base, f'{name} feeds options to an extractor; pass the options on its command line'
     if writing:  # a command it does not model (unzip -d, tar -C) still names paths: resolve each one
         text = head in TEXT_WORDS  # `echo $HOME > out.txt` prints a variable, it does not write to it
         powershell = any(re.match(r'^-[A-Za-z]{2,}', w) for w in ws[1:])
@@ -832,26 +836,55 @@ def _flag_letters(w: str) -> str:
     return m.group(1) if m else ''
 
 
+TAR_NAMES = ('tar', 'gtar', 'bsdtar')
+# Per extractor: long options that let ARCHIVE member names (absolute, `..`, rewritten) choose where files land,
+# or run a command; and short letters with the same effect. cpio and jar extraction never strip.
+ARCHIVE_LONG = {
+    'tar': ('--absolute-names', '--absolute-paths', '--insecure', '--transform', '--xform', '--to-command',
+            '--checkpoint-action', '--info-script', '--new-volume-script', '--rsh-command'),
+    'cpio': ('--extract',),
+    'jar': ('--extract',),
+}
+ARCHIVE_SHORT = {'tar': 'P', 'cpio': 'i', 'jar': 'x'}
+ARCHIVE_EXACT_SAFE = {'--checkpoint'}  # a real option of its own, not an abbreviation of --checkpoint-action
+# Environment variables an extractor reads as extra options (`TAR_OPTIONS=-P tar -xf a.tar`, `UNZIP=-:`).
+_ARCHIVE_VARS = r'(TAR_OPTIONS|UNZIP|UNZIPOPT|UNZIP_OPTS|ZIPOPT|ZIP)'
+ARCHIVE_ENV = re.compile(  # NAME=..., "NAME=...", env:NAME (PowerShell), setx NAME ..., SetEnvironmentVariable('NAME'
+    r'(?:(?:^|[\s;&|(:])["\']?' + _ARCHIVE_VARS + r'\s*=(?!=)|env:' + _ARCHIVE_VARS + r'\b|\bsetx\s+'
+    + _ARCHIVE_VARS + r'\b|SetEnvironmentVariable\(\s*["\']' + _ARCHIVE_VARS + r'["\'])', re.I)
+
+
+def _long_option_hits(w: str, names) -> bool:
+    """True when `w` is one of `names` or an abbreviation getopt would accept (at least `--` + 3 letters)."""
+    if not w.startswith('--'):
+        return False
+    opt = w.split('=', 1)[0].lower()
+    return len(opt) >= 5 and opt not in ARCHIVE_EXACT_SAFE and any(n.startswith(opt) for n in names)
+
+
 def _archive_hazard(head: str, ws: list) -> str | None:
     """Options that let the ARCHIVE choose where files land (absolute or `..` member names). The defaults of
-    unzip, tar, bsdtar and 7z strip those; these switches turn the stripping off, and cpio/jar never strip."""
+    unzip, tar, bsdtar and 7z strip those; these switches turn the stripping off, and cpio/jar never strip.
+    Long options match every getopt abbreviation, short letters match in any cluster or position."""
     args = ws[1:]
     why = f'{head} with an option that lets archive member names write outside the job worktree'
+    kind = 'tar' if head in TAR_NAMES else head
     if head == 'unzip' and any(w.startswith('-') and not w.startswith('--') and ':' in w for w in args):
         return why  # -: keeps `../` members
-    if head in ('tar', 'gtar', 'bsdtar'):
-        old_style = args[0] if args and not args[0].startswith('-') else ''
-        if any(w in ('--absolute-names', '-s') or w.startswith(('--transform', '--xform', '--absolute-names'))
-               for w in args) or 'P' in old_style or any('P' in _flag_letters(w) for w in args):
-            return why
-    if head == 'cpio' and (any('i' in _flag_letters(w) for w in args) or '--extract' in args) \
-            and '--no-absolute-filenames' not in args:
-        return why
     if head in ('7z', '7za', '7zz', '7zr') and any(w.lower().startswith('-spf') for w in args):
         return why
-    if head == 'jar' and args and re.match(r'^-?x', args[0]):
+    if kind not in ARCHIVE_LONG:
+        return None
+    letters = ARCHIVE_SHORT[kind]
+    old_style = args[0] if args and not args[0].startswith('-') and kind in ('tar', 'jar') else ''
+    hit = any(_long_option_hits(w, ARCHIVE_LONG[kind]) for w in args) \
+        or any(c in old_style for c in letters) or any(c in _flag_letters(w) for w in args for c in letters) \
+        or (head == 'bsdtar' and '-s' in args)
+    if not hit:
+        return None
+    if kind == 'jar':
         return f'{head} extraction keeps `../` member names; extract with unzip instead'
-    return None
+    return why
 
 
 GIT_ENV_NAMES = r'(GIT_DIR|GIT_WORK_TREE|GIT_INDEX_FILE|GIT_CONFIG\w*)'
