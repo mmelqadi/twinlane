@@ -308,6 +308,46 @@ class RelativePathEscapes(unittest.TestCase):
                     'sed -i s/a/b/ src/x.py', 'perl -pi -e s/a/b/ src/x', 'python tools/x.py', 'echo $HOME > out.txt'):
             self.assertIsNone(code(cmd), cmd)
 
+    def test_read_only_commands_with_a_write_or_run_option_are_checked(self):
+        # A command is read-only per CALL: one write/run option, output operand or writing subcommand makes it a
+        # writer, in every spelling (cluster, attached, `=`).
+        for cmd in ('xxd a ../x', 'xxd -r a ../x', 'xxd a /tmp/x', 'tree -o ../x', 'tree -R -H . ..',
+                    'less -o ../x a', 'less --log-file=../x a', 'file -C -m ../x', 'rg --pre rm foo ..',
+                    'rg --pre=rm foo ../b', 'fd . .. -x rm', 'fd -Hx rm . ..', 'fd -HX rm . ../b',
+                    'git bundle create ../x.bundle HEAD', 'git clone . ../x', 'git init ../x',
+                    'git grep -O../x.sh foo', 'git grep --open-files-in-pager=../x foo', 'git diff --output=../x'):
+            self.assertIsNotNone(code(cmd), cmd)
+        for cmd in ('xxd ../x', 'xxd a | head', 'tree -L 2 ..', 'file ../x', 'fd -tx foo', 'fd -H foo ..',
+                    'rg foo ../sibling', 'git log ../x', 'git diff ../a ../b', 'git -C ../task-b status',
+                    'git -c color.ui=never log -3', 'grep -o foo src/a'):
+            self.assertIsNone(code(cmd), cmd)
+
+    def test_brace_and_glob_expansions_that_reach_dotdot_are_resolved(self):
+        for cmd in ('cp a {..,b}/x', 'cp a -t{..,b}', 'tar -xf a -C{..,b}', 'cp a {.,x}./y', 'cp a .?/x',
+                    'cp a .[.]/x', 'rm -rf .*'):
+            self.assertIsNotNone(code(cmd), cmd)
+        for cmd in ('cp src/{a,b}.py out/', 'mkdir -p out/{x,y}', 'echo {a,b}', 'rm -rf *', 'rm -f *.pyc',
+                    'rm -f .*.swp', 'cp a.? out/', 'ls | % { $_ }'):
+            self.assertIsNone(code(cmd), cmd)
+
+    def test_option_channels_outside_the_command_line_are_refused(self):
+        # tar reads a -T list's lines as options unless --verbatim-files-from comes first; option variables are
+        # refused however the name is spelled; a variable name built at run time cannot be read, so it is refused.
+        for cmd in ('tar -xf a.tar -T list', 'tar -xf a.tar --files-from=list', 'tar -xf a.tar --files-from list',
+                    'tar -xvTlist -f a.tar', 'tar xTf list a.tar', 'tar -x --files=l -f a.tar',
+                    "TAR_''OPTIONS=-P tar -xf a", 'TAPE=../x tar -c src', 'export TAPE=../x',
+                    'TAR_READER_OPTIONS=x bsdtar -xf a', 'TAR_WRITER_OPTIONS=x bsdtar -cf a s',
+                    "export $'TAR\\x5fOPTIONS'=-P", 'export "$n=-P"', 'export $n',
+                    "[Environment]::SetEnvironmentVariable('TAR'+'_OPTIONS','-P')",
+                    '[Environment]::SetEnvironmentVariable("TAR$([char]95)OPTIONS","-P")',
+                    'Set-Item -Path ("env:" + $n) -Value x', 'python -mtarfile -e a.tar out',
+                    'python -I -mtarfile -e a.tar o'):
+            self.assertIsNotNone(code(cmd), cmd)
+        for cmd in ('tar -xf a.tar --verbatim-files-from -T list', 'tar -xvf a.tar -CTarget',
+                    'export PATH="$PATH:bin"', 'export FOO=1', 'declare -A m', 'env -i bash -c true',
+                    '$env:PATH = "$env:USERPROFILE' + chr(92) + 'bin;$env:PATH"'):
+            self.assertIsNone(code(cmd), cmd)
+
     def test_everyday_archive_commands_are_allowed(self):
         for cmd in ('tar -xzf a.tgz -C out', 'tar xvf a.tar', 'tar -xvf a.tar --strip-components=1 -C out',
                     'tar --extract --file=a.tar --directory=out', 'tar --strip=1 -xf a.tar', 'tar -tvf a.tar',

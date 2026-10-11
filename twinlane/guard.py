@@ -40,6 +40,7 @@ Fail-closed inside a twinlane job: any internal error denies the call with the r
 from __future__ import annotations
 
 import bisect
+import fnmatch
 import functools
 import json
 import os
@@ -83,7 +84,7 @@ WRITE_VERBS = re.compile(r'(^|[\s;&|(])(cp|mv|rm|rmdir|del|erase|copy|move|ren|r
                          r'tee|truncate|ln|install|sed\s+-i|perl\s+-i|copy-item|move-item|remove-item|'
                          r'set-content|add-content|out-file|new-item|rename-item|clear-content|'
                          r'dd|unzip|tar|gtar|bsdtar|7z|7za|7zz|cpio|jar|zip|rsync|scp|patch|wget|expand-archive|'
-                         r'sort|split|csplit|sqlite3|python\S*\s+-m\s+(?:zipfile|tarfile|shutil))(?=\s|$)', re.I)
+                         r'sort|split|csplit|sqlite3|python\S*\s+(?:-\S+\s+)*-m\s*(?:zipfile|tarfile|shutil))(?=\s|$)', re.I)
 # Commands whose every path argument is a write target when they lead a command.
 WRITE_VERB_NAMES = {'cp', 'mv', 'rm', 'rmdir', 'rd', 'del', 'erase', 'copy', 'move', 'ren', 'rename', 'robocopy',
                     'xcopy', 'mkdir', 'md', 'touch', 'tee', 'truncate', 'ln', 'install', 'copy-item', 'cpi',
@@ -715,9 +716,34 @@ def _path_candidates(word: str, head: str = '') -> list:
     backslash before an ordinary character (`.\\./x` is `../x`), so that reading is a candidate too."""
     w = (word or '').replace('"', '').replace("'", '')
     unescaped = re.sub(r'\\([^\\/])', r'\1', w)
-    if unescaped != w:
-        return _candidates_of(w, head) + _candidates_of(unescaped, head)
-    return _candidates_of(w, head)
+    forms = [w] if unescaped == w else [w, unescaped]
+    out = []
+    for form in forms:
+        for expanded in _brace_expand(form):  # `{..,b}/x` is `../x` and `b/x`
+            out += [_glob_dotdot(c) for c in _candidates_of(expanded, head)]
+    return out
+
+
+def _brace_expand(w: str, limit: int = 64) -> list:
+    """bash brace expansion of comma lists (`{..,b}/x` -> `../x`, `b/x`), capped; ranges are left as written."""
+    m = re.search(r'\{([^{}]*,[^{}]*)(?:\}|$)', w)  # a closing `}` at the end may already be cut as a group close
+    if not m:
+        return [w]
+    out = []
+    for part in m.group(1).split(','):
+        out += _brace_expand(w[:m.start()] + part + w[m.end():], limit)
+        if len(out) >= limit:
+            break
+    return [w] + out[:limit]
+
+
+def _glob_dotdot(path: str) -> str:
+    """A glob component that can match `..` (`.?`, `.*`, `.[.]`) is read as `..`: some shells expand it so."""
+    if not re.search(r'[?*\[]', path):
+        return path
+    parts = re.split(r'([\\/])', path)
+    return ''.join('..' if p[:1] in '.[' and re.search(r'[?*\[]', p) and fnmatch.fnmatchcase('..', p) else p
+                   for p in parts)
 
 
 def _candidates_of(w: str, head: str = '') -> list:
@@ -786,7 +812,7 @@ def path_hazard(ws: list[str], seg: str, root: str, base: str | None, stack: lis
         if _outside(t, root, base):
             return base, f'a GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE/GIT_CONFIG* value points outside the job ' \
                          f'worktree ({common.clip(t, 120)})'
-    targets, sources = _redirect_targets(seg) + _output_targets(ws), []
+    targets, sources = _redirect_targets(seg) + _output_targets(ws) + _operand_outputs(head, ws), []
     if head in WRITE_VERB_NAMES or (head in ('sed', 'perl') and any(w.startswith('-i') for w in ws[1:])):
         written, sources = _verb_targets(head, ws)
         targets += written
@@ -826,7 +852,10 @@ def path_hazard(ws: list[str], seg: str, root: str, base: str | None, stack: lis
     if writing or not reads_only:
         text = head in TEXT_WORDS  # `echo $HOME > out.txt` prints a variable, it does not write to it
         powershell = any(re.match(r'^-[A-Za-z]{2,}', w) for w in ws[1:])
-        for w in (words(seg) if raw is None else raw)[1:]:
+        every = words(seg) if raw is None else raw
+        # Every word but the command itself: a leading `TAPE=../x` assignment is checked too.
+        rest = every[:every.index(ws[0])] + every[every.index(ws[0]) + 1:] if ws and ws[0] in every else every[1:]
+        for w in rest:
             if _cmd_switch(head, w, powershell):  # `del /Q` is a switch, not the root path /Q
                 continue
             for cand in _path_candidates(w, head):
@@ -839,16 +868,20 @@ def path_hazard(ws: list[str], seg: str, root: str, base: str | None, stack: lis
     return base, None
 
 
-# Commands that only read, so a `..` argument is a read (`cat ../other/file`, `ls ../`). git has its own rules.
+# Commands with NO option that writes a file or runs a program, so a `..` argument is a read (`cat ../other/file`).
+# A command that has even one such option (less -o, tree -o/-R, xxd's output operand, file -C, ack --output,
+# ag --pager, git clone/init/bundle) is not here: it is read-only only when READ_ONLY_IF says so for that call.
 READ_ONLY_HEADS = {
-    'cat', 'type', 'less', 'more', 'head', 'tail', 'ls', 'dir', 'tree', 'grep', 'egrep', 'fgrep', 'rg', 'ag', 'ack',
-    'wc', 'stat', 'file', 'du', 'df', 'diff', 'cmp', 'comm', 'md5sum', 'sha1sum', 'sha256sum', 'sha512sum', 'cksum',
+    'cat', 'type', 'head', 'tail', 'ls', 'dir', 'grep', 'egrep', 'fgrep',
+    'wc', 'stat', 'du', 'df', 'diff', 'cmp', 'comm', 'md5sum', 'sha1sum', 'sha256sum', 'sha512sum', 'cksum',
     'readlink', 'realpath', 'basename', 'dirname', 'which', 'where', 'whereis', 'echo', 'printf', 'pwd', 'test', '[',
-    'true', 'false', 'jq', 'xxd', 'od', 'hexdump', 'strings', 'nl', 'column', 'cut', 'findstr', 'git', 'get-content',
+    'true', 'false', 'jq', 'od', 'hexdump', 'strings', 'nl', 'column', 'cut', 'findstr', 'get-content',
     'gc', 'get-childitem', 'gci', 'get-item', 'gi', 'select-string', 'sls', 'test-path', 'resolve-path',
-    'get-filehash', 'measure-object', 'compare-object', 'write-output', 'write-host', 'find', 'fd',
+    'get-filehash', 'measure-object', 'compare-object', 'write-output', 'write-host',
 }
 FIND_ACTIONS = re.compile(r'^-(delete|exec|execdir|ok|okdir|fprint|fprint0|fprintf|fls)$')
+FD_VALUE_LETTERS = set('dteEjSocg')  # fd short options that take a value: the rest of the cluster is that value
+XXD_VALUE_OPTS = {'-c', '-g', '-l', '-o', '-s', '-n', '-cols', '-groupsize', '-len', '-seek', '-offset', '-name'}
 HOME_LED = re.compile(r'^(~|\$\{?(HOME|TMPDIR|TMP|TEMP|USERPROFILE|APPDATA|LOCALAPPDATA)\b|'
                       r'%(HOME|TMP|TEMP|USERPROFILE|APPDATA|LOCALAPPDATA)%|\$env:(HOME|TMP|TEMP|USERPROFILE|'
                       r'APPDATA|LOCALAPPDATA)\b)', re.I)
@@ -857,13 +890,72 @@ OUTPUT_LONG = ('--output', '--out', '--outdir', '--out-dir', '--output-dir', '--
                '--build-dir', '--outfile', '--out-file', '--log-file', '--logfile')
 
 
-def _reads_only(head: str, ws: list) -> bool:
-    """A command known to only read: its `..` arguments are reads, not writes."""
-    if head not in READ_ONLY_HEADS:
+def _xxd_operands(ws: list) -> list:
+    """xxd's file operands: the second one is the file it WRITES."""
+    out, skip = [], False
+    for w in ws[1:]:
+        if skip:
+            skip = False
+        elif w in XXD_VALUE_OPTS:
+            skip = True
+        elif not w.startswith('-') or w == '-':
+            out.append(w)
+    return out
+
+
+def _fd_runs(ws: list) -> bool:
+    """fd -x/-X (in any cluster position before a value letter) or --exec/--exec-batch runs a command per hit."""
+    for w in ws[1:]:
+        if w.startswith('--exec'):
+            return True
+        for c in _flag_letters(w):
+            if c in 'xX':
+                return True
+            if c in FD_VALUE_LETTERS:
+                break
+    return False
+
+
+def _git_reads_only(ws: list) -> bool:
+    """A git subcommand that only reads (GIT_READ), without an option that writes a file or opens a program."""
+    sub, args = git_subcommand(ws)
+    if sub is not None and sub not in GIT_READ:
         return False
-    if head in ('find', 'fd'):
-        return not any(FIND_ACTIONS.match(w) or w in ('-x', '-X', '--exec', '--exec-batch') for w in ws[1:])
+    for w in args:
+        name = w.split('=', 1)[0]
+        if name == '--output' or (len(name) >= 4 and '--open-files-in-pager'.startswith(name)):
+            return False
+        if sub == 'grep' and 'O' in _flag_letters(w):
+            return False
     return True
+
+
+# Commands that only read unless one of their write/run options is present: head -> is THIS call read-only?
+READ_ONLY_IF = {
+    'git': _git_reads_only,
+    'find': lambda ws: not any(FIND_ACTIONS.match(w) for w in ws[1:]),
+    'fd': lambda ws: not _fd_runs(ws),
+    'rg': lambda ws: not any(w == '--pre' or w.startswith('--pre=') for w in ws[1:]),
+    'xxd': lambda ws: len(_xxd_operands(ws)) < 2,
+    'tree': lambda ws: not any(w.startswith('--o') or set(_flag_letters(w)) & set('oR') for w in ws[1:]),
+    'file': lambda ws: not any(w.startswith('--c') or 'C' in _flag_letters(w) for w in ws[1:]),
+}
+
+
+def _reads_only(head: str, ws: list) -> bool:
+    """A command known to only read: its `..` arguments are reads, not writes. Unknown commands do not read only."""
+    if head in READ_ONLY_HEADS:
+        return True
+    check = READ_ONLY_IF.get(head)
+    return bool(check and check(ws))
+
+
+def _operand_outputs(head: str, ws: list) -> list:
+    """Write targets named by position, not by an option: `xxd in OUT`, `xxd -r in OUT`."""
+    if head == 'xxd':
+        ops = _xxd_operands(ws)
+        return ops[1:2]
+    return []
 
 
 def _generic_output_targets(ws: list) -> list:
@@ -925,21 +1017,61 @@ SEVENZIP_UNSAFE = ('-spf', '-snl', '-snh')  # full paths, symlinks, hard links: 
 # Unambiguous names are denied wherever they appear; UNZIP and ZIP are also command names, so for them only a
 # setting form (assignment, PowerShell env:, a quoted name, an uppercase reference, a declaring builtin) counts.
 ARCHIVE_ENV = re.compile(
-    r'(TAR_OPTIONS|UNZIPOPT|UNZIP_OPTS|ZIPOPT)'
+    r'(TAR_OPTIONS|TAR_READER_OPTIONS|TAR_WRITER_OPTIONS|UNZIPOPT|UNZIP_OPTS|ZIPOPT)'
     r'|\b(?:UNZIP|ZIP)\b\s*\+?=(?!=)'
     r'|env:(?:\x5c)?(?:UNZIP|ZIP)\b'  # env:NAME, optionally with a backslash after the colon
     r'|["\'](?:UNZIP|ZIP)["\']'
     r'|\b(?:UNZIP|ZIP):?[-=?+]'  # ${UNZIP:=-:}, ${ZIP=...}
     r'|\b(?:export|declare|typeset|local|readonly|setx|setenv|set|read|mapfile|printf\s+-v)\b[^;&|]*?'
     r'\b(?:UNZIP|ZIP)\b', re.I)
-ARCHIVE_ENV_UPPER = re.compile(r'\b(?:UNZIP|ZIP)\b')  # case-sensitive: the commands are lowercase
+ARCHIVE_ENV_UPPER = re.compile(r'\b(?:UNZIP|ZIP|TAPE)\b')  # case-sensitive: the commands are lowercase
+# Builtins and cmdlets that set a variable by a NAME they receive as an argument.
+ENV_SETTERS = re.compile(r'(^|[\s;&|(])(export|declare|typeset|local|readonly|setenv|setx|env|set-item|si|new-item|'
+                         r'ni|\[(system\.)?environment\]::setenvironmentvariable)\b', re.I)
+PS_ITEM_SETTERS = {'set-item', 'si', 'new-item', 'ni'}  # only their env: drive operand names a variable
+LITERAL_NAME = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
+
+
+def _unquoted(seg: str) -> str:
+    """The text a shell assembles from quotes, escapes and `+` joins: `TAR_''OPTIONS`, `'TAR'+'_OPTIONS'`."""
+    return re.sub(r'["\'`\\]', '', re.sub(r'["\']\s*\+\s*["\']', '', seg))
+
+
+def _dynamic_env_name(seg: str) -> bool:
+    """A variable-setting builtin whose NAME is built at run time (`export $'TAR\\x5fOPTIONS'=-P`,
+    `export "$n=x"`, `[Environment]::SetEnvironmentVariable($n, ...)`): the name cannot be read, so it is refused."""
+    m = ENV_SETTERS.search(seg)
+    if not m:
+        return False
+    dynamic = re.compile(r'\$|\[char\]|%[A-Za-z_]', re.I)
+    if 'setenvironmentvariable' in m.group(2).lower():
+        first = re.search(r'setenvironmentvariable\s*\(\s*([^,)]*)', seg, re.I)
+        return bool(first and dynamic.search(first.group(1)))
+    if m.group(2).lower() in PS_ITEM_SETTERS:  # Set-Item -Path ("env:" + $n), New-Item "env:$n"
+        return bool(re.search(r'env:[ \t]*["\']?[ \t]*(\+[ \t]*)?(\$|\(|\[char\])|env:[A-Za-z0-9_]*(\$|\[char\])', seg, re.I))
+    first_name = True
+    for w in words(seg[m.end():]):
+        if w.startswith('-'):
+            continue
+        if '=' in w:  # NAME=value: the name must be literal
+            name = re.sub(r'^\$?env:', '', _unquoted(w).split('=', 1)[0], flags=re.I)
+            if not LITERAL_NAME.match(name):
+                return True
+        elif first_name and m.group(2).lower() != 'env':  # `export $n`, `Set-Item env:$n x`: the first operand
+            if dynamic.search(re.sub(r'^\$?env:', '', w, flags=re.I)):
+                return True
+        first_name = False
+    return False
 
 
 def _archive_env_hazard(seg: str) -> str | None:
     """An exported option variable outlives the command that sets it, so setting one at all is denied."""
-    if ARCHIVE_ENV.search(seg) or ARCHIVE_ENV_UPPER.search(seg):
-        return 'an archive option variable (TAR_OPTIONS, UNZIP, UNZIPOPT, ZIPOPT, ZIP) is set; pass the ' \
-               'options on the extractor command line'
+    plain = _unquoted(seg)
+    if any(r.search(s) for r in (ARCHIVE_ENV, ARCHIVE_ENV_UPPER) for s in (seg, plain)):
+        return 'an archive option variable (TAR_OPTIONS, TAR_READER/WRITER_OPTIONS, TAPE, UNZIP, UNZIPOPT, ZIPOPT, ' \
+               'ZIP) is set; pass the options on the extractor command line'
+    if _dynamic_env_name(seg):
+        return 'a variable whose name is built at run time is set; name the variable literally'
     return None
 
 
@@ -963,13 +1095,25 @@ def _archive_hazard(head: str, ws: list) -> str | None:
         if args and not args[0].startswith('-') and re.fullmatch(r'[A-Za-z]+', args[0]) \
                 and not all(c in TAR_SAFE_LETTERS for c in args[0]):
             return why  # old-style bundled letters: `tar xPf a.tar`
+        if args and not args[0].startswith('-') and re.fullmatch(r'[A-Za-z]+', args[0]) and 'T' in args[0]:
+            return f'{why}: a -T name list is read as options unless --verbatim-files-from comes first'
+        verbatim = False
         for w in args:
             if w.startswith('--'):
                 opt = w.split('=', 1)[0].lower()
                 if opt != '--' and not any(s.startswith(opt) for s in TAR_SAFE_LONG):
                     return why
-            elif w.startswith('-') and len(w) > 1 and not _tar_cluster_ok(re.match(r'-([A-Za-z]*)', w).group(1)):
-                return why
+                if len(opt) >= 4 and '--verbatim-files-from'.startswith(opt):
+                    verbatim = True
+                elif len(opt) >= 7 and '--files-from'.startswith(opt) and not verbatim:
+                    return f'{why}: a -T name list is read as options unless --verbatim-files-from comes first'
+            elif w.startswith('-') and len(w) > 1:
+                letters = re.match(r'-([A-Za-z]*)', w).group(1)
+                if not _tar_cluster_ok(letters):
+                    return why
+                first_value = next((c for c in letters if c in TAR_VALUE_LETTERS), '')
+                if first_value == 'T' and not verbatim:  # `-T list`, `-xvTlist`: the cluster's value letter is T
+                    return f'{why}: a -T name list is read as options unless --verbatim-files-from comes first'
         return None
     if head == 'unzip':  # single-letter options only; `-:` and `-^` keep `../` and control characters
         if any(w.startswith('-') and not re.fullmatch(r'-[A-Za-z]+|-[A-Za-z]*[dP].+', w) for w in args):
@@ -993,8 +1137,9 @@ def _archive_hazard(head: str, ws: list) -> str | None:
         if any('r' in _flag_letters(w) for w in args):
             return f'{head} extraction keeps absolute member names; extract with tar instead'
         return None
-    if (head.startswith('python') or head == 'py') and 'tarfile' in args and any(w in ('-e', '--extract') or w.startswith('--ex')
-                                                               for w in args):
+    module = [w[2:] if w.startswith('-m') and len(w) > 2 else w for w in args]  # `-mtarfile` is `-m tarfile`
+    if (head.startswith('python') or head == 'py') and 'tarfile' in module \
+            and any(w in ('-e', '--extract') or w.startswith('--ex') for w in args):
         return 'python -m tarfile extraction does not filter member names on every Python; use tar'
     return None
 
