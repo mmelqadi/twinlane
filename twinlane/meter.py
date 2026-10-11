@@ -542,7 +542,9 @@ def _refresh_token(_run=None) -> str:
     rc, out, _err = (_run or common.run)(argv, cwd=common.ROOT, timeout=180, env=common.clean_claude_env())
     usage = {}
     try:
-        usage = (json.loads(out or '{}') or {}).get('usage') or {}
+        payload = json.loads(out or '{}')
+        if isinstance(payload, dict) and isinstance(payload.get('usage'), dict):
+            usage = payload['usage']
     except ValueError:
         pass
     toks = ', '.join(f'{k}={usage[k]}' for k in ('input_tokens', 'output_tokens', 'cache_read_input_tokens',
@@ -596,7 +598,8 @@ def read_claude_raw(refresh: bool = False, creds_path=None, _http=None, _run=Non
         cached['token_expired_at'] = expired
         return cached
     return {'source': 'none', 'token_expired_at': expired,
-            'note': _join(*notes, 'no cached reading; run twinlane meter --refresh, or '
+            'note': _join(*notes, 'no cached reading; renew the Claude CLI login, then run twinlane meter --fresh, '
+                                  'or record a reading with '
                                   'twinlane meter --record-claude <get_usage json>')}
 
 
@@ -694,7 +697,8 @@ def read_claude_auto(policy: dict | None = None, creds_path=None, _http=None, _r
     marker = _claim_refresh(expired)
     if marker is None:
         raw['note'] = _join(raw.get('note'), 'automatic refresh already tried for this expiry '
-                                             '(or cannot be recorded): run twinlane meter --refresh')
+                                             '(or cannot be recorded): renew the Claude CLI login, '
+                                             'then run twinlane meter --fresh')
         return raw
     out = read_claude_raw(True, creds_path, _http, _run)
     out['refresh'] = {'auto': True, 'at': common.iso(common.now()), 'expired_at': expired,
@@ -1123,7 +1127,8 @@ def refresh_notice(m: dict) -> str | None:
     ok = ((m.get('claude') or {}).get('refresh') or {}).get('ok')
     return ('Claude CLI token had expired: refreshed automatically with one tiny Haiku call'
             if ok else 'Claude CLI token had expired: the automatic refresh (one tiny Haiku call) did not restore '
-                       'a reading; it will not retry for this expiry (twinlane meter --refresh retries)')
+                       'a reading; it will not retry for this expiry. Renew the Claude CLI login, '
+                       'then run twinlane meter --fresh')
 
 
 # ---------------------------------------------------------------- per-job usage (receipt `usage`)

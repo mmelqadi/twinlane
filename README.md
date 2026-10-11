@@ -61,6 +61,8 @@ twinlane route intel
 
 If an engine reads `unknown`, follow the displayed reason before starting work. On macOS/Linux, set `TWINLANE_CODEX_BIN` to your Codex binary or use available rollout evidence; automatic Codex desktop discovery is Windows-specific. See [Limits](LIMITS.md) for platform and authentication details.
 
+If the Claude CLI login has expired, renew that login and run `twinlane meter --fresh` again. `--fresh` rereads usage; it does not renew credentials or make a model call. You can also supply a usage reading with `twinlane meter --record-claude <get_usage json>`.
+
 ### 2. Run a first read-only task
 
 From the twinlane source checkout, use the included brief to inspect this repository:
