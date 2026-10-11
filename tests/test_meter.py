@@ -75,10 +75,15 @@ class TempState(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def write_creds(self, expires_in_s):
-        exp_ms = int((time.time() + expires_in_s) * 1000)
+    def write_creds(self, expires_in_s, exp_ms=None):
+        exp_ms = int((time.time() + expires_in_s) * 1000) if exp_ms is None else exp_ms
         common.write_json(os.path.join(self.claude_dir, '.credentials.json'),
                           {'claudeAiOauth': {'accessToken': FAKE_TOKEN, 'expiresAt': exp_ms}})
+        return exp_ms
+
+    def record_extra_off(self):
+        """The last recorded reading shows extra usage OFF (stale, so the status stays unknown)."""
+        meter.save_claude_cache(claude_raw(20, extra=False, age=3 * 3600, source='desktop'), 'desktop')
 
     def state_text(self):
         out = ''
@@ -131,6 +136,7 @@ class FinishTests(unittest.TestCase):
         s = meter.finish_claude(claude_raw(12, extra=True), self.policy)
         self.assertEqual(s['status'], 'stop')
         self.assertIn('extra usage', s['note'])
+        self.assertEqual(s['hold'], 'extra usage is ON')  # no `wait until` a window reset
 
     def test_claude_extra_usage_does_not_soften_out(self):
         self.assertEqual(meter.finish_claude(claude_raw(100, extra=True), self.policy)['status'], 'out')
@@ -139,6 +145,13 @@ class FinishTests(unittest.TestCase):
         s = meter.finish_claude(claude_raw(12, extra=True), policy(claude__extra_usage_allowed=True))
         self.assertEqual(s['status'], 'ok')
         self.assertIn('WARNING', s['note'])
+
+    def test_only_a_literal_true_allows_extra_usage(self):
+        for value in ('false', 'no', 1, 'true'):
+            s = meter.finish_claude(claude_raw(12, extra=True), policy(claude__extra_usage_allowed=value))
+            self.assertEqual(s['status'], 'stop', value)
+            s = meter.finish_claude(claude_raw(12, extra=None), policy(claude__extra_usage_allowed=value))
+            self.assertEqual(s['status'], 'unknown', value)
 
     def test_stale_reading_is_unknown(self):
         s = meter.finish_claude(claude_raw(12, age=1801), self.policy)
@@ -157,6 +170,27 @@ class FinishTests(unittest.TestCase):
         s = meter.finish_claude(claude_raw(90, extra=None), self.policy)
         self.assertEqual(s['status'], 'stop')
         self.assertIn('extra usage state unknown', s['note'])
+
+    def test_unknown_extra_usage_holds_claude_at_any_usable_level(self):
+        # None at 20 % was `ok` and routed to Claude. Unknown is not OFF.
+        for pct in (20, 76, 82):
+            s = meter.finish_claude(claude_raw(pct, extra=None), self.policy)
+            self.assertEqual(s['status'], 'unknown', pct)
+            self.assertEqual(s['hold'], meter.HOLD_EXTRA_UNKNOWN)
+            self.assertIn('extra usage state unknown', s['note'])
+            self.assertIn('--record-claude', s['note'])  # says how to clear it
+            self.assertEqual(s['max_pct'], pct)  # the numbers stay visible
+        off = meter.finish_claude(claude_raw(20, extra=False), self.policy)
+        self.assertEqual(off['status'], 'ok')
+        self.assertNotIn('hold', off)
+
+    def test_unknown_extra_usage_does_not_hide_stop_or_out(self):
+        for pct, want in ((90, 'stop'), (100, 'out')):
+            self.assertEqual(meter.finish_claude(claude_raw(pct, extra=None), self.policy)['status'], want)
+
+    def test_unknown_extra_usage_is_fine_when_policy_allows_extra_usage(self):
+        s = meter.finish_claude(claude_raw(20, extra=None), policy(claude__extra_usage_allowed=True))
+        self.assertEqual(s['status'], 'ok')
 
     def test_no_reading_is_unknown(self):
         for raw in (None, {}, {'source': 'none', 'note': 'x'}):
@@ -360,6 +394,7 @@ class ClaudeSourceTests(TempState):
     def test_refresh_path_runs_injected_runner_then_retries(self):
         """The refresh command is captured by a fake runner: it is never executed."""
         self.write_creds(-60)
+        self.record_extra_off()
         calls = []
 
         def fake_run(argv, cwd=None, timeout=30, env=None, input_text=None):
@@ -385,6 +420,102 @@ class ClaudeSourceTests(TempState):
         run = mock.Mock()
         meter.read_claude_raw(refresh=False, _http=mock.Mock(), _run=run)
         run.assert_not_called()
+
+
+class RefreshGateTests(TempState):
+    """The token refresh is a real (tiny) model call: it may run only when extra usage is known OFF."""
+
+    def setUp(self):
+        super().setUp()
+        self.calls = []
+        # twinlane ships the automatic refresh OFF; these tests turn it on to exercise its extra-usage gate.
+        self.policy = json.loads(json.dumps(self.policy))
+        self.policy.setdefault('meter', {})['auto_refresh_claude'] = True
+
+    def fake_run(self, argv, cwd=None, timeout=30, env=None, input_text=None):
+        self.calls.append(argv)
+        self.write_creds(3600)  # what the real CLI does on a refresh
+        return 0, json.dumps({'usage': {'input_tokens': 9, 'output_tokens': 2}}), ''
+
+    def seed(self, extra, age=3 * 3600):
+        """The last recorded reading, old enough to be stale (so the status is unknown and an auto refresh looks due)."""
+        meter.save_claude_cache(claude_raw(20, extra=extra, age=age, source='desktop'), 'desktop')
+
+    def auto(self, **kw):
+        return meter.read(fresh=True, policy=self.policy, auto_refresh=True, _codex_reader=lambda: codex_raw(30),
+                          _run=self.fake_run, _http=lambda *a: (200, fixture('oauth_usage.json')), **kw)
+
+    def test_expired_token_with_extra_usage_on_makes_no_model_call(self):
+        self.write_creds(-60)
+        self.seed(True)
+        m = self.auto()
+        self.assertEqual(self.calls, [])
+        self.assertEqual(m['claude']['status'], 'unknown')
+        self.assertIn('automatic refresh not run: extra usage is ON', m['claude']['note'])
+        self.assertNotIn('refreshed_now', m)
+
+    def test_expired_token_with_extra_usage_unknown_makes_no_model_call(self):
+        self.write_creds(-60)
+        self.seed(None)
+        m = self.auto()
+        self.assertEqual(self.calls, [])
+        self.assertIn('automatic refresh not run: extra usage state unknown', m['claude']['note'])
+
+    def test_expired_token_with_no_recorded_reading_makes_no_model_call(self):
+        self.write_creds(-60)
+        self.auto()
+        self.assertEqual(self.calls, [])
+
+    def test_dry_run_never_promises_a_refresh_the_gate_would_block(self):
+        # --dry-run said a real run "would refresh" while extra usage was not known OFF.
+        from twinlane import jobs
+        expired = {'claude': {'status': 'unknown', 'token_expired_at': common.iso(common.now())}}
+        with mock.patch.object(meter, 'auto_refresh_enabled', return_value=True),                 mock.patch.object(meter, 'refresh_pending', return_value=True):
+            for extra in (True, None):
+                self.seed(extra)
+                with self.subTest(extra=extra):
+                    note = jobs._dry_run_refresh_note(expired, self.policy)
+                    self.assertIn('would NOT refresh', note)
+            self.seed(False)
+            self.assertIn('would refresh it once', jobs._dry_run_refresh_note(expired, self.policy))
+
+    def test_known_off_still_refreshes_once(self):
+        self.write_creds(-60)
+        self.seed(False)
+        with mock.patch.object(common, 'claude_bin', return_value='C' + ':/bin/claude.exe'):
+            m = self.auto()
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(m['refreshed_now'], ['claude'])
+        self.assertEqual(m['claude']['source'], 'oauth')
+
+    def test_the_raw_refresh_path_is_gated_too(self):
+        # `twinlane meter --refresh` and the second half of the old read(False) -> read(True) pair.
+        for extra in (True, None):
+            self.write_creds(-60)
+            self.seed(extra)
+            r = meter.read_claude_raw(True, _http=lambda *a: (500, ''), _run=self.fake_run)
+            self.assertEqual(self.calls, [], extra)
+            self.assertIn('refresh not run', r['note'])
+
+    def test_a_blocked_refresh_keeps_the_expiry_claimable(self):
+        self.write_creds(-60)
+        self.seed(None)
+        self.auto()
+        self.assertEqual(self.calls, [])
+        self.assertEqual((common.read_json(meter._claims_path(), {}) or {}).get('claimed', []), [])
+        self.seed(False)  # the user records a reading that shows extra usage OFF
+        with mock.patch.object(common, 'claude_bin', return_value='C' + ':/bin/claude.exe'):
+            self.auto()
+        self.assertEqual(len(self.calls), 1)
+
+    def test_unknown_extra_usage_with_a_valid_token_needs_no_refresh_and_is_held(self):
+        self.write_creds(3600)
+        meter.save_claude_cache(claude_raw(20, extra=None, age=5, source='desktop'), 'desktop')
+        m = meter.read(fresh=True, policy=self.policy, _codex_reader=lambda: codex_raw(30),
+                       _http=lambda *a: (500, ''), _run=self.fake_run)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(m['claude']['status'], 'unknown')
+        self.assertEqual(m['claude']['hold'], meter.HOLD_EXTRA_UNKNOWN)
 
 
 class CodexSourceTests(TempState):
@@ -713,9 +844,80 @@ class FormatTests(unittest.TestCase):
              'codex': {'status': 'ok', 'source': 'app-server', 'age_s': 2,
                        'windows': [{'name': 'weekly', 'pct': 30, 'resets_at': '2099-10-14T05:37:00Z'}],
                        'credits': {'has': True}, 'on_credits': False}}
+        # Every window the router counts is listed (the 0 % one too) and the binding one is marked.
         self.assertEqual(meter.format_line(m),
-                         'claude: ok 5h 12% (resets 15:09Z) · 7d 44% (20:59Z) · extra off [oauth, 3s old] | '
-                         'codex: ok weekly 30% (10-14 05:37Z) · credits yes [app-server, 2s old]')
+                         'claude: ok 5h 12% (resets 15:09Z) · 7d 44% (20:59Z) [binding] · 7d-opus 0% (?) · '
+                         'extra off [oauth, 3s old] | '
+                         'codex: ok weekly 30% (10-14 05:37Z) [binding] · credits yes [app-server, 2s old]')
+
+    def test_an_unrecognised_window_is_listed_with_its_own_name_and_marked_binding(self):
+        # The real cache holds `iguana_necktie`, which sets the maximum.
+        sec = {'status': 'ok', 'source': 'oauth', 'age_s': 3, 'extra_usage_enabled': False,
+               'windows': [{'name': 'five_hour', 'pct': 20.0, 'resets_at': None},
+                           {'name': 'seven_day', 'pct': 18.0, 'resets_at': None},
+                           {'name': 'iguana_necktie', 'pct': 28.728186, 'resets_at': None}]}
+        line = meter.format_line({'claude': sec, 'codex': None})
+        self.assertIn('iguana_necktie (unrecognised window) 28.7% (?) [binding]', line)
+        self.assertEqual(line.count('[binding]'), 1)
+        self.assertNotIn('5h 20% (?) [binding]', line)
+        self.assertIn('7d 18%', line)
+
+    def test_a_seven_day_sonnet_window_that_controls_routing_is_in_the_line(self):
+        sec = {'status': 'stop', 'source': 'oauth', 'age_s': 3,
+               'windows': [{'name': 'five_hour', 'pct': 5.0}, {'name': 'seven_day', 'pct': 15.0},
+                           {'name': 'seven_day_sonnet', 'pct': 90.0}]}
+        line = meter.format_line({'claude': sec, 'codex': None})
+        self.assertIn('7d-sonnet 90% (?) [binding]', line)
+        self.assertNotIn('(unrecognised window)', line)
+
+    def test_an_unprintable_window_name_is_never_printed_and_says_so(self):
+        sec = {'status': 'ok', 'source': 'oauth', 'age_s': 3,
+               'windows': [{'name': 'five_hour', 'pct': 5.0}, {'name': 'x\nINJECT: ok', 'pct': 50.0},
+                           {'name': 'y' * 41, 'pct': 7.0}]}
+        line = meter.format_line({'claude': sec, 'codex': None})
+        self.assertEqual(len(line.splitlines()), 1)
+        self.assertIn('(invalid window name) 50% (?) [binding]', line)
+        self.assertNotIn('INJECT', line)
+        self.assertNotIn('y' * 41, line)
+
+    def test_finish_claude_names_the_binding_window_in_the_section(self):
+        policy = common.load_policy()
+        raw = {'source': 'oauth', 'reading_at': common.iso(common.now()), 'extra_usage_enabled': False,
+               'windows': [{'name': 'five_hour', 'pct': 20.0, 'resets_at': None},
+                           {'name': 'iguana_necktie', 'pct': 28.7, 'resets_at': None}]}
+        sec = meter.finish_claude(raw, policy)
+        self.assertEqual(sec['binding_window'], {'name': 'iguana_necktie', 'pct': 28.7, 'recognised': False})
+        self.assertEqual([(w['name'], w['recognised'], w.get('binding', False)) for w in sec['windows']],
+                         [('five_hour', True, False), ('iguana_necktie', False, True)])
+        self.assertIsNone(meter.finish_claude({'source': 'none'}, policy)['binding_window'])
+
+    def test_binding_ties_take_the_first_window_and_bad_percents_are_skipped(self):
+        wins = [{'name': 'a', 'pct': None}, {'name': 'five_hour', 'pct': 40.0}, {'name': 'seven_day', 'pct': 40.0},
+                {'name': 'b', 'pct': True}, {'name': 'c', 'pct': float('nan')}, 'junk']
+        self.assertEqual(meter.binding_index(wins), 1)
+        self.assertIsNone(meter.binding_index([{'name': 'a', 'pct': 'x'}]))
+        self.assertIsNone(meter.binding_index(None))
+
+    def test_a_codex_limit_window_is_marked_binding_on_its_detail_line(self):
+        r = meter.parse_app_server(json.loads(fixture('app_server_ratelimits_full.json'))['result'])
+        sec = dict(r, status='ok', source='app-server', age_s=1)
+        sec['windows'] = [dict(w, pct=95.0 if w['name'] == 'codex_astra:weekly' else w['pct']) for w in sec['windows']]
+        line = meter.format_line({'claude': None, 'codex': sec})
+        self.assertEqual(line.count('[binding]'), 1)
+        self.assertRegex(line, r'codex limit [^\n]*weekly 95%[^\n]*\[binding\]')
+
+    def test_a_crafted_codex_limit_name_cannot_break_the_meter_text(self):
+        # A newline in a limit window name reached `twinlane meter` text unchanged.
+        r = meter.parse_app_server(json.loads(fixture('app_server_ratelimits_full.json'))['result'])
+        sec = dict(r, status='ok', source='app-server', age_s=1)
+        lid = next(w['limit'] for w in sec['windows'] if w.get('limit'))
+        sec['windows'] = [dict(w, name='x:weekly\nFAKE: claude ok') if w.get('limit') == lid else w
+                          for w in sec['windows']]
+        sec['limits'] = [dict(lim, name='bad\rname') if lim.get('id') == lid else lim for lim in sec['limits'] or []]
+        line = meter.format_line({'claude': None, 'codex': sec})
+        self.assertNotIn('FAKE', line)
+        self.assertNotIn('\r', line)
+        self.assertIn(meter.INVALID_WINDOW, line)
 
     def test_unknown_engine_line_has_note(self):
         m = {'claude': {'status': 'unknown', 'source': 'none', 'windows': [], 'note': 'CLI OAuth token expired'},
@@ -894,6 +1096,7 @@ class AutoRefreshTests(TempState):
         self.policy['meter']['auto_refresh_claude'] = True
         self.calls = []
         self.renew = True
+        self.record_extra_off()  # the refresh is a model call: it needs a recorded reading that shows extra usage OFF
 
     def fake_run(self, argv, cwd=None, timeout=30, env=None, input_text=None):
         self.calls.append(argv)

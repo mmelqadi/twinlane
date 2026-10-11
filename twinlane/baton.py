@@ -31,7 +31,16 @@ REASONS = ('checkpoint', 'limit', 'handoff', 'job', 'user')
 ENGINES = ('claude', 'codex')
 ACCEPT_STATUSES = ('not_run', 'fail', 'pass', 'blocked', 'n/a')
 EVIDENCE_KINDS = ('source', 'test', 'review', 'integration', 'deploy', 'prod')
-LIVE_JOB_STATUSES = ('queued', 'running', 'orphaned')
+LIVE_JOB_STATUSES = ('queued', 'running', 'orphaned', 'unknown')
+# Mirrors jobs.TERMINAL (a test keeps them equal). Only these are history the caps may trim; a job in any
+# other state (queued, running, orphaned, unknown, stop_failed, ...) is unfinished work and is never dropped.
+FINISHED_JOB_STATUSES = ('done', 'failed', 'timeout', 'limit_hit', 'refused', 'stopped', 'lost', 'interrupted')
+# The id jobs.create_job makes: <stamp>-<engine>-<4 hex> (a test builds one with create_job and matches it).
+JOB_ID_RE = re.compile(r'^\d{8}-\d{6}-(?:claude|codex)-[0-9a-f]{4}$')
+# jobs[] is a closed list of small index entries; a pointer in progress.in_flight is the same kind of record.
+JOB_ENTRY_FIELDS = {'id': 40, 'engine': 20, 'status': 20, 'session_id': 100}   # field -> longest string
+JOB_POINTER_FIELDS = ('what', 'job', 'check', 'never_rerun')
+LIVE_EXEMPT_MAX = 200   # unfinished jobs the size check excuses; more than this is not honest work in flight
 
 TAIL_BYTES = 2_000_000
 EXCERPT_CHARS = 1500
@@ -49,7 +58,9 @@ BATON_QUOTE_MAX_CHARS = 600
 RESUME_IDLE_S = 300
 CLAUDE_DIR_NAME_MAX = 200  # Claude Code truncates longer project-dir names and appends a hash
 
-# List caps bound counts; save() clips text and trims the oldest entries to stay within BATON_MAX_BYTES.
+# List caps bound counts of history; save() clips text and trims the oldest entries to stay within
+# BATON_MAX_BYTES. 'jobs' caps FINISHED jobs only and 'in_flight' is only how many full pointers survive size
+# pressure: unfinished jobs are never dropped (see _apply_caps, _fit_size).
 CAPS = {'done': 30, 'then': 10, 'decisions': 30, 'rejected': 20, 'evidence': 30, 'jobs': 20,
         'read_first': 5, 'do_not': 20, 'verify_before_act': 10, 'dirty': 25, 'in_flight': 10}
 
@@ -313,6 +324,16 @@ def validate(baton) -> list[str]:
     for e in baton.get('evidence', []) if isinstance(baton.get('evidence'), list) else []:
         if not isinstance(e, dict) or e.get('kind') not in EVIDENCE_KINDS:
             errs.append(f'bad evidence item {e!r}')
+    if isinstance(baton.get('jobs'), list):
+        seen = set()
+        for j in baton['jobs']:
+            if not _valid_job_entry(j):
+                errs.append(f'bad job entry {common.clip(repr(j), 80)}: needs an id like '
+                            f'YYYYMMDD-HHMMSS-claude|codex-xxxx and only {sorted(JOB_ENTRY_FIELDS)}')
+            elif j['id'] in seen:
+                errs.append(f"job {j['id']} is listed twice")
+            else:
+                seen.add(j['id'])
     if isinstance(baton.get('read_first'), list) and len(baton['read_first']) > CAPS['read_first']:
         errs.append('read_first holds at most 5 paths')
     def check_text(value, path='baton'):
@@ -328,8 +349,8 @@ def validate(baton) -> list[str]:
                 check_text(item, f'{path}[{index}]')
     check_text(baton)
     size = len(json.dumps(baton, ensure_ascii=False, indent=2).encode('utf-8'))
-    if size > BATON_MAX_BYTES:
-        errs.append(f'baton is {size} bytes; maximum is {BATON_MAX_BYTES} bytes')
+    if size > BATON_MAX_BYTES and _baton_bytes(_without_live_work(baton)) > BATON_MAX_BYTES:
+        errs.append(f'baton is {size} bytes; maximum is {BATON_MAX_BYTES} bytes')  # unfinished jobs alone never count
     return errs
 
 
@@ -344,12 +365,57 @@ def _append_history(slug: str, previous: dict) -> None:
     common.write_text(path, '\n'.join(lines[-HISTORY_KEEP:]) + '\n')
 
 
+def _valid_job_entry(entry) -> bool:
+    """A real jobs[] entry: an object with a job id in the format jobs.py creates, only the index fields
+    (JOB_ENTRY_FIELDS) and short string-or-null values."""
+    if not isinstance(entry, dict) or not isinstance(entry.get('id'), str) or not JOB_ID_RE.match(entry['id']):
+        return False
+    return all(k in JOB_ENTRY_FIELDS and (v is None or isinstance(v, str) and len(v) <= JOB_ENTRY_FIELDS[k])
+               for k, v in entry.items())
+
+
+def _is_live_job(entry) -> bool:
+    """Unfinished work: a valid job entry in any state but a finished one (unknown states count as unfinished)."""
+    return _valid_job_entry(entry) and entry.get('status') not in FINISHED_JOB_STATUSES
+
+
+def _is_history_job(entry) -> bool:
+    """A finished job (or junk that is not a job entry): the only kind of job record a cap may drop."""
+    return not _is_live_job(entry)
+
+
+def _job_entry(entry: dict) -> dict:
+    """The entry cut down to the index fields, each a short string or null: a job with a real id is kept
+    (never dropped) however its other fields look."""
+    return {k: (common.clip(v, JOB_ENTRY_FIELDS[k]) if isinstance(v, str) else None)
+            for k, v in entry.items() if k in JOB_ENTRY_FIELDS}
+
+
+def _clean_jobs(baton: dict) -> None:
+    """System writers (record_job, snap, handoff) never refuse on a malformed job list. A dict with a valid job
+    id is kept and cut to the index fields; anything else is not a job and is dropped; a repeated id keeps its
+    first entry. User input (strict saves) is validated instead."""
+    jobs = baton.get('jobs')
+    if isinstance(jobs, list):
+        seen = set()
+        kept = []
+        for j in jobs:
+            if isinstance(j, dict) and isinstance(j.get('id'), str) and JOB_ID_RE.match(j['id'])                     and j['id'] not in seen:
+                seen.add(j['id'])
+                kept.append(_job_entry(j))
+        baton['jobs'] = kept
+
+
 def _apply_caps(baton: dict) -> None:
     prog = baton['progress']
-    for key in ('done', 'then', 'in_flight'):
+    for key in ('done', 'then'):
         prog[key] = prog.get(key, [])[-CAPS[key]:]
-    for key in ('decisions', 'rejected', 'evidence', 'jobs', 'do_not', 'verify_before_act', 'read_first'):
+    for key in ('decisions', 'rejected', 'evidence', 'do_not', 'verify_before_act', 'read_first'):
         baton[key] = baton.get(key, [])[-CAPS[key]:]
+    jobs = baton.get('jobs', [])
+    history = [j for j in jobs if _is_history_job(j)]
+    dropped = {id(j) for j in history[:max(0, len(history) - CAPS['jobs'])]}
+    baton['jobs'] = [j for j in jobs if id(j) not in dropped]  # every unfinished job stays, in order
 
 
 def _clip_strings(value, path='baton'):
@@ -367,16 +433,59 @@ def _baton_bytes(baton: dict) -> int:
     return len(json.dumps(baton, ensure_ascii=False, indent=2).encode('utf-8'))
 
 
+def _is_live_pointer(f, live: set) -> bool:
+    """An in-flight pointer of exactly the shape record_job writes, for a live job."""
+    return (isinstance(f, dict) and f.get('job') in live and set(f) <= set(JOB_POINTER_FIELDS)
+            and all(isinstance(v, (str, bool)) for v in f.values()))
+
+
+def _without_live_work(baton: dict) -> dict:
+    """The baton minus its unfinished job entries and their in-flight pointers: what is left is the part the
+    writer's own text is responsible for. Only a valid job entry (real id, index fields only) counts as live
+    work, at most LIVE_EXEMPT_MAX of them; anything else stays in the size. Tolerates a hand-edited baton."""
+    jobs = baton.get('jobs') if isinstance(baton.get('jobs'), list) else []
+    prog = baton.get('progress') if isinstance(baton.get('progress'), dict) else {}
+    flights = prog.get('in_flight') if isinstance(prog.get('in_flight'), list) else []
+    exempt, ids = set(), set()   # entries by identity, and their ids (a repeated id is not excused twice)
+    for j in jobs:
+        if _is_live_job(j) and len(exempt) < LIVE_EXEMPT_MAX and j['id'] not in ids:
+            exempt.add(id(j))
+            ids.add(j['id'])
+    rest, pointed = [], set()
+    for f in flights:
+        if _is_live_pointer(f, ids) and f['job'] not in pointed:   # one pointer per live job is excused
+            pointed.add(f['job'])
+        else:
+            rest.append(f)
+    return dict(baton, jobs=[j for j in jobs if id(j) not in exempt], progress=dict(prog, in_flight=rest))
+
+
+def _drop_in_flight_pointer(baton: dict) -> bool:
+    """Drop the oldest full in-flight pointer beyond the newest CAPS['in_flight'], but only one whose job is
+    still listed in jobs[]: the entry there (id, engine, status) is the durable index, and the pointer's
+    `check` is always `twinlane result <id>`."""
+    flights = baton['progress'].get('in_flight', [])
+    listed = [j.get('id') for j in baton.get('jobs', []) if isinstance(j, dict)]
+    for f in flights[:-CAPS['in_flight']]:
+        if isinstance(f, dict) and f.get('job') in listed:
+            flights.remove(f)
+            return True
+    return False
+
+
 def _fit_size(baton: dict) -> None:
-    """Drop the oldest history-like entries until the baton fits BATON_MAX_BYTES.
-    Never drops live jobs, in-flight items, holds, do_not, verify_before_act or the task."""
+    """Drop the oldest history-like entries until the baton fits BATON_MAX_BYTES: finished jobs first, then
+    full in-flight pointers past the newest CAPS['in_flight'] (their jobs stay listed in jobs[]), then done,
+    evidence, rejected and decisions. Never drops unfinished jobs, holds, do_not, verify_before_act or the
+    task; if unfinished work alone is over the budget the baton stays over it rather than lose a job."""
     pools = [baton['progress'].get('done', []), baton.get('evidence', []), baton.get('rejected', []),
              baton.get('decisions', [])]
     while _baton_bytes(baton) > BATON_MAX_BYTES:
-        done_jobs = [j for j in baton.get('jobs', [])
-                     if not (isinstance(j, dict) and j.get('status') in LIVE_JOB_STATUSES)]
+        done_jobs = [j for j in baton.get('jobs', []) if _is_history_job(j)]
         if done_jobs:
             baton['jobs'].remove(done_jobs[0])
+            continue
+        if _drop_in_flight_pointer(baton):
             continue
         pool = next((p for p in pools if p), None)
         if pool is None:
@@ -391,6 +500,8 @@ def save(baton: dict, reason: str = 'user', strict: bool = False) -> dict:
         raise BatonError(f'reason must be one of {REASONS}')
     slug = require_slug(baton.get('slug'))
     common.ensure_dirs()
+    if not strict:
+        _clean_jobs(baton)
     _apply_caps(baton)
     baton['reason'] = reason
     baton['updated_at'] = common.iso(common.now())
@@ -519,6 +630,26 @@ def refresh_repo(baton: dict) -> bool:
     return True
 
 
+WINDOW_NAME = re.compile(r'[\w.:-]{1,40}')
+
+
+def _window_name(name) -> str | None:
+    """A meter window name safe to print on one line, or None."""
+    return name if isinstance(name, str) and WINDOW_NAME.fullmatch(name) else None
+
+
+def _max_window(section: dict) -> str | None:
+    """Name of the window that set the section's max_pct (the first one on a tie), if the cache names it."""
+    top = section.get('max_pct')
+    windows = section.get('windows')
+    if not isinstance(top, (int, float)) or isinstance(top, bool) or not isinstance(windows, list):
+        return None
+    for w in windows:
+        if isinstance(w, dict) and w.get('pct') == top and _window_name(w.get('name')):
+            return w['name']
+    return None
+
+
 def cached_meter() -> dict:
     """Meter numbers from the cache only: snap and handoff must stay fast and offline."""
     m = common.read_json(os.path.join(common.STATE, 'meter.json'))
@@ -526,6 +657,7 @@ def cached_meter() -> dict:
         return {'claude_max_pct': None, 'codex_max_pct': None, 'note': 'no cached meter; run twinlane meter'}
     claude, codex = m.get('claude') or {}, m.get('codex') or {}
     return {'claude_max_pct': claude.get('max_pct'), 'codex_max_pct': codex.get('max_pct'),
+            'claude_max_window': _max_window(claude), 'codex_max_window': _max_window(codex),
             'claude_status': claude.get('status'), 'codex_status': codex.get('status'),
             'claude_next_reset': claude.get('next_reset'), 'codex_next_reset': codex.get('next_reset'),
             'read_at': m.get('read_at')}
@@ -568,6 +700,7 @@ def live_jobs_for(cwd: str | None) -> list[dict]:
 
 
 def _merge_live_jobs(baton: dict, live: list[dict]) -> None:
+    live = [j for j in live if isinstance(j.get('id'), str) and JOB_ID_RE.match(j['id'])]
     by_id = {j.get('id'): j for j in baton['jobs'] if isinstance(j, dict)}
     for j in live:
         entry = by_id.setdefault(j['id'], {'id': j['id']})
@@ -821,9 +954,10 @@ def _receipt_id(receipt: dict) -> str | None:
 
 
 def record_job(slug: str, receipt: dict) -> None:
-    """Upsert one job into the baton; a running job makes its engine the owner."""
+    """Upsert one job into the baton. The owner is the lead, and a worker is never the lead: this never
+    touches `owner` (only `twinlane baton set --owner` does), so a baton with no owner stays without one."""
     jid = _receipt_id(receipt or {})
-    if not jid:
+    if not isinstance(jid, str) or not JOB_ID_RE.match(jid):   # not a job the runner made: nothing to index
         return
     with baton_lock(require_slug(slug)):
         _record_job_locked(slug, jid, receipt)
@@ -832,8 +966,6 @@ def record_job(slug: str, receipt: dict) -> None:
 def _record_job_locked(slug: str, jid: str, receipt: dict) -> None:
     baton = load_for_update(slug) or empty_baton(slug)
     status = receipt.get('status') or 'running'
-    served = receipt.get('served_models') or []
-    model = served[0] if served else (receipt.get('requested') or {}).get('model') or receipt.get('model')
     reconcile_jobs(baton)
     entry = next((j for j in baton['jobs'] if isinstance(j, dict) and j.get('id') == jid), None)
     if entry is None:
@@ -844,7 +976,6 @@ def _record_job_locked(slug: str, jid: str, receipt: dict) -> None:
     flights = baton['progress']['in_flight']
     flights[:] = [f for f in flights if not (isinstance(f, dict) and f.get('job') == jid)]
     if status in LIVE_JOB_STATUSES:
-        baton['owner'] = {'engine': entry['engine'], 'session_id': entry.get('session_id'), 'model': model}
         flights.append({'what': receipt.get('name') or f"{entry['engine']} job", 'job': jid,
                         'check': f'twinlane result {jid}', 'never_rerun': True})
     save(baton, 'job')
@@ -1264,7 +1395,62 @@ def _bullets(items, limit: int = 8, width: int = 220, newest: bool = True) -> li
     return lines
 
 
-def render_baton_section(b: dict) -> list[str]:
+IN_FLIGHT_SHOWN = 5  # full pointers rendered; any further unfinished job is still named, on one compact line
+LIVE_JOBS_SHOWN = 8
+
+
+def _compact_job_refs(refs: list[str], label: str, where: str, ref_chars: int | None = None) -> str:
+    """ONE line that accounts for every job past a display limit: each id is listed, or (when `ref_chars` caps the
+    ids' length) the ones that do not fit are counted exactly and `where` says how to list them."""
+    shown = list(refs)
+    if ref_chars is not None:
+        shown, used = [], 0
+        for r in refs:
+            used += len(r) + 2
+            if used > ref_chars:
+                break
+            shown.append(r)
+    more = len(refs) - len(shown)
+    return (f"- {label} ({len(refs)}): " + ', '.join(shown)
+            + (f"{'; ' if shown else ''}+{more} more unfinished jobs: `{where}`" if more else '')
+            + '; check each with `twinlane result <id>`, never rerun')
+
+
+def _job_ref(f: dict) -> str | None:
+    """The job a pointer names, as a short string (None for a pointer that names no job)."""
+    job = f.get('job')
+    return common.clip(redact(job), 80) if isinstance(job, str) and job else None
+
+
+def _in_flight_line(f: dict) -> str:
+    """One pointer. The job id and its check come FIRST and are never clipped; only the description is."""
+    job = _job_ref(f)
+    if job is None:
+        return '  - ' + common.clip(redact(f"{f.get('what')}: `{f.get('check')}`"), 220)
+    return f"  - {job}: {common.clip(redact(f.get('what')), 140)} (`twinlane result {job}`)"
+
+
+def _in_flight_lines(b: dict, ref_chars: int | None = None) -> list[str]:
+    """Unfinished work for a brief: full pointers for the newest few, then every other unfinished job by id
+    (or, under `ref_chars`, as many ids as fit and an exact count of the rest).
+    The ids come from the in-flight pointers AND the unfinished entries of jobs[], so a pointer dropped for
+    size (see `_drop_in_flight_pointer`) is still named."""
+    flights = [f for f in b['progress'].get('in_flight') or [] if isinstance(f, dict)]
+    listed = {j['id']: j for j in b.get('jobs') or [] if isinstance(j, dict) and isinstance(j.get('id'), str)}
+
+    def tag(jid):
+        j = listed.get(jid)
+        return f"{jid} ({j.get('engine')} {j.get('status')})" if j else str(jid)
+    shown = flights[-IN_FLIGHT_SHOWN:]
+    pointed = {f.get('job') for f in flights}
+    rest = [tag(f['job']) if f.get('job') else str(f.get('what')) for f in flights[:-IN_FLIGHT_SHOWN]]
+    rest += [tag(jid) for jid, j in listed.items() if _is_live_job(j) and jid not in pointed]
+    lines = [_in_flight_line(f) for f in shown]
+    return lines + (['  ' + redact(_compact_job_refs(rest, 'also in flight', f"twinlane baton show {b['slug']}",
+                                                     ref_chars))] if rest else [])
+
+
+def render_baton_section(b: dict, ref_chars: int | None = None) -> list[str]:
     task, prog, holds = b['task'], b['progress'], b['holds']
     owner = b.get('owner') or {}
     out = [f"## Task (baton `{b['slug']}`, updated {b.get('updated_at') or '?'}, reason {b.get('reason')}, "
@@ -1282,8 +1468,7 @@ def render_baton_section(b: dict) -> list[str]:
                 + (f" (evidence: {common.clip(a.get('evidence'), 100)})" if a.get('evidence') else '')
                 for a in task['acceptance'][:10]]
     sections = [('Done', prog.get('done'), 8),
-                ('In flight (never rerun; check first)',
-                 [f"{f.get('what')}: `{f.get('check')}`" for f in prog.get('in_flight') or []], 5),
+                ('In flight (never rerun; check first)', None, 0),
                 ('Decisions', [_fmt_decision(d) for d in b.get('decisions') or []], 6),
                 ('Rejected', b.get('rejected'), 5),
                 ('Approvals pending', [_hold_label(h) for h in holds.get('approvals_pending') or []], 5),
@@ -1293,7 +1478,11 @@ def render_baton_section(b: dict) -> list[str]:
                               for e in b.get('evidence') or []], 6),
                 ('Read first', b.get('read_first'), 5)]
     for title, items, limit in sections:
-        if items:
+        if items is None:  # unfinished jobs: past the display limit they are still named
+            lines = _in_flight_lines(b, ref_chars)
+            if lines:
+                out += [f'- {title}:'] + lines
+        elif items:
             out += [f'- {title}:'] + ['  ' + x for x in _bullets(items, limit)]
     return out
 
@@ -1322,12 +1511,16 @@ def render_repo_section(st: dict, cwd: str | None, title: str = 'Repo state (fre
     return out
 
 
-def render_jobs_section(jobs: list[dict]) -> list[str]:
+def render_jobs_section(jobs: list[dict], ref_chars: int | None = None) -> list[str]:
     if not jobs:
         return ['## Live twinlane jobs for this cwd', '- none']
-    return ['## Live twinlane jobs for this cwd'] + [
-        f"- `{j.get('id')}` {j.get('engine')} {j.get('status')} {j.get('name') or ''}: check `twinlane result "
-        f"{j.get('id')}`; never rerun" for j in jobs[:8]]
+    out = ['## Live twinlane jobs for this cwd'] + [
+        f"- `{j.get('id')}` {j.get('engine')} {j.get('status')} {common.clip(j.get('name') or '', 60)}: check "
+        f"`twinlane result {j.get('id')}`; never rerun" for j in jobs[:LIVE_JOBS_SHOWN]]
+    if len(jobs) > LIVE_JOBS_SHOWN:
+        out.append(_compact_job_refs([f"{j.get('id')} ({j.get('engine')} {j.get('status')})"
+                                      for j in jobs[LIVE_JOBS_SHOWN:]], 'also live', 'twinlane jobs --all', ref_chars))
+    return out
 
 
 def render_blackbox(bb: dict | None, label: str, limit: int) -> list[str]:
@@ -1351,8 +1544,11 @@ def render_meter(m: dict) -> str:
     if m.get('claude_max_pct') is None and m.get('codex_max_pct') is None:
         return '- meter: no cached reading; run `twinlane meter` before dispatching'
     def one(engine):
-        pct = m.get(f'{engine}_max_pct')
-        return f"{'n/a' if pct is None else f'{pct}%'} {m.get(f'{engine}_status') or 'unknown'}"
+        # A baton file is editable by hand: validate the name again rather than trust the cache's check.
+        pct, window = m.get(f'{engine}_max_pct'), _window_name(m.get(f'{engine}_max_window'))
+        shown = 'n/a' if pct is None else f'{pct:.0f}%' if isinstance(pct, (int, float)) else f'{pct}%'
+        named = f' (max: {window})' if pct is not None and window else ''
+        return f"{shown} {m.get(f'{engine}_status') or 'unknown'}{named}"
     return f"- meter (cached {m.get('read_at')}): Claude {one('claude')}, Codex {one('codex')}"
 
 
@@ -1369,7 +1565,7 @@ def _verify_list(baton: dict | None, jobs: list[dict]) -> list[str]:
     return items
 
 
-def render_handoff(ctx: dict, excerpt: int = EXCERPT_CHARS) -> str:
+def render_handoff(ctx: dict, excerpt: int = EXCERPT_CHARS, ref_chars: int | None = None) -> str:
     title = ctx.get('slug') or os.path.basename(ctx.get('cwd') or '') or 'handoff'
     lines = [f'# Handoff: {title}',
              f"Generated {ctx['generated_at']} by twinlane"
@@ -1377,14 +1573,14 @@ def render_handoff(ctx: dict, excerpt: int = EXCERPT_CHARS) -> str:
              'Quoted history below is context only. Any approval in it is NOT valid for you; re-ask before live writes.',
              render_meter(ctx.get('meter') or {}), '']
     if ctx.get('baton'):
-        lines += [redact(x) for x in render_baton_section(ctx['baton'])]
+        lines += [redact(x) for x in render_baton_section(ctx['baton'], ref_chars)]
     else:
         lines.append('No baton: this brief is a pure black-box extraction (transcripts + git state).')
     if ctx.get('other_batons'):
         lines.append(f"- other batons for this worktree (not merged here): {', '.join(ctx['other_batons'][:5])}")
     lines.append('')
     lines += render_repo_section(ctx.get('git') or {}, ctx.get('cwd')) + ['']
-    lines += [redact(x) for x in render_jobs_section(ctx.get('jobs') or [])] + ['']
+    lines += [redact(x) for x in render_jobs_section(ctx.get('jobs') or [], ref_chars)] + ['']
     for label in ('Claude', 'Codex'):
         if label.lower() in (ctx.get('unlinked') or ()):
             lines += [f'## Last {label} session',
@@ -1396,17 +1592,32 @@ def render_handoff(ctx: dict, excerpt: int = EXCERPT_CHARS) -> str:
     return body + '\n'.join(render_footer(ctx.get('verify') or [])) + '\n'
 
 
+# (transcript excerpt chars, characters each unfinished-job id list may use): the brief shrinks the transcript first,
+# then the id lists; a list that does not hold every id ends with an exact count and the command that lists them.
+HANDOFF_TIERS = tuple((e, 3000) for e in (EXCERPT_CHARS, 1000, 700, 450, 250, 120)) + (
+    (120, 1500), (120, 800), (120, 300), (120, 0))
+CLIP_NOTE = '(... clipped to fit 8 KB)'
+
+
+def _holds_job_refs(line: str) -> bool:
+    return 'twinlane result' in line or 'more unfinished jobs' in line
+
+
 def fit_handoff(ctx: dict, max_bytes: int = HANDOFF_MAX_BYTES) -> str:
-    """Shrink transcript excerpts until the brief fits; hard-clip the body as a last resort."""
+    """Shrink transcript excerpts, then the unfinished-job id lists, until the brief fits. Last resort: drop whole
+    lines, the ones that name jobs last, so a clip never cuts an id list (every id, or a count and where)."""
     text = ''
-    for excerpt in (EXCERPT_CHARS, 1000, 700, 450, 250, 120):
-        text = render_handoff(ctx, excerpt)
+    for excerpt, ref_chars in HANDOFF_TIERS:
+        text = render_handoff(ctx, excerpt, ref_chars)
         if len(text.encode('utf-8')) <= max_bytes:
             return text
     footer = '\n'.join(render_footer(ctx.get('verify') or [])) + '\n'
-    room = max_bytes - len(footer.encode('utf-8')) - 40
-    body = text[: text.rfind('\n---\n')].encode('utf-8')[:max(room, 0)].decode('utf-8', errors='ignore')
-    return body.rstrip() + '\n\n(... clipped to fit 8 KB)\n\n' + footer
+    room = max_bytes - len(footer.encode('utf-8')) - len(CLIP_NOTE) - 8
+    lines = text[: text.rfind('\n---\n')].rstrip().split('\n')
+    while lines and len('\n'.join(lines).encode('utf-8')) > room:
+        plain = [i for i, ln in enumerate(lines) if not _holds_job_refs(ln)]
+        del lines[plain[-1] if plain else -1]
+    return '\n'.join(lines).rstrip() + f'\n\n{CLIP_NOTE}\n\n' + footer
 
 
 # ---------------------------------------------------------------- handoff orchestration

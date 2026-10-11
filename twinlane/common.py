@@ -149,24 +149,31 @@ def stamp() -> str:
 READ_RETRIES = 8
 
 
-def read_json(path: str, default=None):
+def read_json(path: str, default=None, deadline: float | None = None):
     """Parsed JSON, or default when the file is missing or invalid.
 
     On Windows, opening a file while another process os.replace()s it raises PermissionError for a
-    moment; that is a busy file, not a missing one, so it is retried before giving up."""
+    moment; that is a busy file, not a missing one, so it is retried before giving up. With `deadline`
+    (a time.monotonic() value) no retry sleeps past it: a busy file then reads as `default`."""
     for i in range(READ_RETRIES):
         try:
             with open(path, encoding='utf-8') as h:
                 return json.load(h)
         except PermissionError:
-            time.sleep(0.01 * (i + 1))
+            time.sleep(0.01 * (i + 1) if deadline is None else max(0.0, min(0.01 * (i + 1), deadline - time.monotonic())))
+            if deadline is not None and time.monotonic() >= deadline:
+                return default
         except (OSError, ValueError):
             return default
     return default
 
 
-def _atomic_write(path: str, write) -> None:
-    """Temp file in the same directory, then os.replace (retried while a reader holds the target)."""
+def _atomic_write(path: str, write, deadline: float | None = None) -> None:
+    """Temp file in the same directory, then os.replace (retried while a reader holds the target).
+
+    With `deadline` (a time.monotonic() value) the retries are bounded by it: no replace is attempted and no
+    sleep runs past it, TimeoutError is raised, the temp file is removed and `path` keeps its old content
+    (the replace is atomic, so `path` is only ever the old file or the complete new one)."""
     d = os.path.dirname(os.path.abspath(path))
     os.makedirs(d, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix='.tmp-', dir=d)
@@ -174,11 +181,16 @@ def _atomic_write(path: str, write) -> None:
         with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as h:
             write(h)
         for i in range(20):
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError(f'write deadline passed: {path}')
             try:
                 os.replace(tmp, path)
                 return
             except PermissionError:  # reader holds the file on Windows
-                time.sleep(0.05 * (i + 1))
+                nap = 0.05 * (i + 1)
+                time.sleep(nap if deadline is None else max(0.0, min(nap, deadline - time.monotonic())))
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError(f'write deadline passed: {path}')
         os.replace(tmp, path)
     finally:
         if os.path.exists(tmp):
@@ -188,8 +200,8 @@ def _atomic_write(path: str, write) -> None:
                 pass
 
 
-def write_json(path: str, data) -> None:
-    _atomic_write(path, lambda h: json.dump(data, h, ensure_ascii=False, indent=2))
+def write_json(path: str, data, deadline: float | None = None) -> None:
+    _atomic_write(path, lambda h: json.dump(data, h, ensure_ascii=False, indent=2), deadline)
 
 
 def write_text(path: str, text: str) -> None:
@@ -914,6 +926,23 @@ def clean_claude_env(extra: dict | None = None) -> dict:
     return env
 
 
+# Environment variable NAMES that look like a secret: a code-profile worker never receives them, so a
+# script it runs (python send.py) has no API key, token or password to send with.
+SECRET_ENV_NAME = re.compile(r'TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|API_?KEY|PRIVATE_?KEY|CREDENTIAL|_KEY$|'
+                             r'_PAT$|_DSN$|CONNECTION_?STRING|DATABASE_URL|^AWS_|^AZURE_|^GH_|^GITHUB_TOKEN$|'
+                             r'^OPENAI_|^ANTHROPIC_|^SSH_AUTH_SOCK$', re.I)
+# Secret-looking names an engine needs to log in. Empty: the Claude CLI logs in from
+# ~/.claude/.credentials.json (twinlane already drops every ANTHROPIC_* variable, see clean_claude_env) and
+# The Codex runner reads only CODEX_HOME and TWINLANE_CODEX_BIN, which are not secret-looking.
+SECRET_ENV_KEEP: frozenset = frozenset()
+
+
+def strip_secret_env(env: dict) -> tuple[dict, list[str]]:
+    """(env without secret-named variables, the stripped NAMES sorted). Values are never returned."""
+    names = sorted(k for k in env if SECRET_ENV_NAME.search(k) and k.upper() not in SECRET_ENV_KEEP)
+    return {k: v for k, v in env.items() if k not in names}, names
+
+
 # ---------------------------------------------------------------- processes
 
 # Windows process-creation and job-object constants.
@@ -1040,15 +1069,21 @@ def process_created(pid) -> int | None:
     return _posix_start_time(pid)
 
 
-def pid_alive(pid, created=None) -> bool:
-    """True if the process exists and, when `created` is given, is that same process (not a reused
-    pid). NEVER uses os.kill on Windows (signal 0 would TerminateProcess)."""
+ALIVE, DEAD, UNKNOWN = 'alive', 'dead', 'unknown'
+
+
+def pid_state(pid, created=None) -> str:
+    """ALIVE, DEAD or UNKNOWN for a pid. With `created`, ALIVE means it is that same process (not a reused
+    pid) and a readable creation time that differs is DEAD. UNKNOWN is a process that exists but whose
+    creation time cannot be read (a restricted-token sandbox cannot open its host's runners): it is neither
+    provably ours nor provably gone, so callers must not call it dead and must not kill it. NEVER uses
+    os.kill on Windows (signal 0 would TerminateProcess)."""
     try:
         pid = int(pid)
     except (TypeError, ValueError):
-        return False
+        return DEAD
     if pid <= 0:
-        return False
+        return DEAD
     if IS_WIN:
         alive, actual = _win_process_info(pid)
     else:
@@ -1060,16 +1095,28 @@ def pid_alive(pid, created=None) -> bool:
         except PermissionError:
             alive = True
         actual = _posix_start_time(pid) if alive else None
-    if not alive or created in (None, ''):
-        return alive
+    if not alive:
+        return DEAD
+    if created in (None, ''):
+        return ALIVE
     if actual is None:
-        # It exists but its identity cannot be read. Our runners are always readable on Windows, so
-        # an unreadable process is someone else's.
-        return False
+        return UNKNOWN
     try:
-        return int(created) == actual
+        return ALIVE if int(created) == actual else DEAD
     except (TypeError, ValueError):
-        return False
+        return DEAD
+
+
+def pid_alive(pid, created=None) -> bool:
+    """True only when the process is PROVABLY alive (and, with `created`, is that same process). An unreadable
+    identity is False here: use pid_maybe_alive when "could still be running" is the safe answer."""
+    return pid_state(pid, created) == ALIVE
+
+
+def pid_maybe_alive(pid, created=None) -> bool:
+    """False only when the process is provably gone or provably another process; an unreadable identity
+    counts as possibly alive. For slot counts, continuation guards and kill-failure checks."""
+    return pid_state(pid, created) != DEAD
 
 
 def kill_tree(pid, created=None) -> bool:
@@ -1080,7 +1127,7 @@ def kill_tree(pid, created=None) -> bool:
     except (TypeError, ValueError):
         return False
     if created not in (None, '') and not pid_alive(pid, created):
-        return False
+        return False  # a reused pid, or an identity that cannot be read: never kill what is not provably it
     if IS_WIN:
         r = subprocess.run(['taskkill', '/PID', str(pid), '/T', '/F'], capture_output=True,
                            creationflags=no_window_flags())
@@ -1127,7 +1174,9 @@ def job_info() -> dict:
     try:
         k32 = _k32()
         inj = wintypes.BOOL()
-        if not k32.IsProcessInJob(k32.GetCurrentProcess(), None, ctypes.byref(inj)) or not inj.value:
+        if not k32.IsProcessInJob(k32.GetCurrentProcess(), None, ctypes.byref(inj)):
+            return {'in_job': None, 'kill_on_close': None, 'breakaway_ok': None}
+        if not inj.value:
             return {'in_job': False, 'kill_on_close': False, 'breakaway_ok': True}
         ext, n = _job_limits_struct(), wintypes.DWORD()
         if not k32.QueryInformationJobObject(None, _JOB_EXTENDED_LIMITS, ctypes.byref(ext), ctypes.sizeof(ext),
@@ -1314,15 +1363,21 @@ def spawn_detached_ex(argv: list[str], cwd: str | None = None, env: dict | None 
                       handoff: str | None = None) -> dict:
     """Start a process that outlives the caller. Returns {pid, created, mode, job}.
 
-    mode: 'breakaway' (left the caller's job object), 'wmi' (created by WMI outside it, because the
-    job forbids breakaway), 'in-job' (could not leave it; it survives the caller only because that
-    job does not kill on close), 'no-job' or 'posix'. Order on Windows: breakaway, then wmi, then
-    in-job. wmi needs `handoff` (a file path in the job folder) and a child that loads it
-    (envhandoff.load; cli.py does for `_job`), since WMI passes neither env nor stdio; without
-    it wmi is skipped. A wmi attempt that may have created a process raises DetachAmbiguous and
-    is never followed by another mode. With require_survival, a caller inside a kill-on-close job
-    where neither breakaway nor wmi worked gets DetachError instead of a process that would
-    silently die with it.
+    mode: 'wmi' (created by WMI: parent WmiPrvSE, outside every job of the caller), 'breakaway'
+    (CREATE_BREAKAWAY_FROM_JOB), 'in-job' (still in the caller's job), 'no-job' (the caller is in
+    no job object) or 'posix'. wmi needs `handoff` (a file path in the job folder) and a child that
+    loads it (envhandoff.load; cli.py does for `_job`), since WMI passes neither env nor stdio. A
+    wmi attempt that may have created a process raises DetachAmbiguous and is never followed by
+    another mode.
+
+    With require_survival (`--bg`), every Windows caller gets wmi or DetachError, regardless of
+    job membership. job_info sees only the innermost job, and breakaway may leave an enclosing
+    job attached. A later probe reproduced that hazard after a real app quit killed breakaway runners;
+    that quit's exact termination mechanism was not traced. Direct starts also keep
+    the caller as parent even outside all jobs, so a tree kill while the caller lives reaches them.
+
+    Without require_survival (the hook's best-effort refresh) the order is breakaway, then wmi
+    (only with a hand-off), then in-job.
     On Windows the child gets its own hidden console (CREATE_NO_WINDOW), which its console children
     share, so no window ever appears."""
     info = job_info()
@@ -1330,12 +1385,23 @@ def spawn_detached_ex(argv: list[str], cwd: str | None = None, env: dict | None 
     try:
         if IS_WIN:
             base = CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
-            doomed = bool(info.get('in_job') and info.get('kill_on_close'))
+            if require_survival:
+                if not handoff:
+                    raise DetachError('Windows background survival requires a WMI start outside the caller\'s '
+                                      'job and process tree, and it needs an env hand-off')
+                try:
+                    return {**_spawn_wmi(argv, cwd, env, log_path, handoff), 'mode': 'wmi', 'job': info}
+                except DetachAmbiguous:
+                    raise  # a process may exist: a fallback could run the job twice
+                except DetachError as e:
+                    raise DetachError(f'the WMI start failed ({e}); direct starts can die with the caller\'s '
+                                      'job or process tree, so none was tried') from None
             wmi_error = None
-            for flags, mode in [(base | CREATE_BREAKAWAY_FROM_JOB, 'breakaway'), (None, 'wmi'),
-                                (base, 'in-job' if info.get('in_job') else 'no-job')]:
+            order = [(base | CREATE_BREAKAWAY_FROM_JOB, 'breakaway'), (None, 'wmi'), (base, 'in-job')] \
+                if info.get('in_job') is not False else [(base, 'no-job')]
+            for flags, mode in order:
                 if mode == 'wmi':
-                    if not handoff or info.get('in_job') is False:
+                    if not handoff:
                         continue
                     try:
                         return {**_spawn_wmi(argv, cwd, env, log_path, handoff), 'mode': mode, 'job': info}
@@ -1344,19 +1410,14 @@ def spawn_detached_ex(argv: list[str], cwd: str | None = None, env: dict | None 
                     except DetachError as e:
                         wmi_error = str(e)
                         continue
-                if mode != 'breakaway' and doomed and require_survival:
-                    continue
                 try:
                     p = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=out,
                                          stderr=subprocess.STDOUT, creationflags=flags, close_fds=True)
                 except OSError:
                     continue
                 return {'pid': p.pid, 'created': process_created(p.pid), 'mode': mode, 'job': info}
-            if doomed:
-                raise DetachError('this shell runs inside a kill-on-close job object that forbids breakaway, '
-                                  'so a background process would die with it'
-                                  + (f' (WMI start failed: {wmi_error})' if wmi_error else ''))
-            raise DetachError('could not start a detached process')
+            raise DetachError('could not start a detached process'
+                              + (f' (WMI start failed: {wmi_error})' if wmi_error else ''))
         p = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=out,
                              stderr=subprocess.STDOUT, start_new_session=True, close_fds=True)
         return {'pid': p.pid, 'created': process_created(p.pid), 'mode': 'posix', 'job': info}

@@ -1,6 +1,6 @@
 """Coordinate Claude Code and Codex CLI on local included subscriptions."""
 
-__version__ = '0.1.0'
+__version__ = '0.1.1'
 
 
 def main(argv=None):

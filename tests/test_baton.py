@@ -3,12 +3,14 @@ import contextlib
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import types
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -42,6 +44,11 @@ def _raw(path):
 def _read_fixture(name):
     with open(os.path.join(FIX, name), encoding='utf-8') as h:
         return h.read().splitlines()
+
+
+def jid(n, engine='claude'):
+    """A job id in the format jobs.create_job makes (baton only indexes real ones)."""
+    return f'20261009-143941-{engine}-{n:04x}'
 
 
 class BatonTestBase(unittest.TestCase):
@@ -251,20 +258,26 @@ class RoundTripTests(BatonTestBase):
         b['progress']['done'] = ['d' * 299 for _ in range(30)]
         baton.save(b, 'job')
         for i in range(25):
-            baton.record_job('full', {'id': f'j{i}', 'engine': 'codex', 'status': 'running', 'name': 'n' * 400})
+            baton.record_job('full', {'id': jid(i, 'codex'), 'engine': 'codex', 'status': 'running', 'name': 'n' * 400})
         b = baton.load('full')
-        self.assertEqual(b['owner']['engine'], 'codex')
-        self.assertIn('j24', [f['job'] for f in b['progress']['in_flight']])
-        self.assertLessEqual(os.path.getsize(baton.baton_path('full')), baton.BATON_MAX_BYTES)
+        # Changed with the finding-7 fix: a worker job no longer becomes the baton's owner (was 'codex').
+        self.assertIsNone(b['owner']['engine'])
+        self.assertIn(jid(24, 'codex'), [f['job'] for f in b['progress']['in_flight']])
+        # All 25 live jobs stay listed even though the baton is full of finished history.
+        self.assertEqual({jid(i, 'codex') for i in range(25)}, {j['id'] for j in b['jobs']})
+        # With real 28-character ids the 25 live entries alone take more than the budget; they are the exempt part.
+        self.assertLessEqual(baton._baton_bytes(baton._without_live_work(b)), baton.BATON_MAX_BYTES)
+        self.assertEqual(baton.validate(b), [])
 
-    def test_record_job_owner_and_in_flight(self):
-        baton.record_job('jobbed', {'id': 'j1', 'engine': 'codex', 'status': 'running', 'name': 'sweep',
+    def test_record_job_in_flight_and_owner_untouched(self):
+        baton.record_job('jobbed', {'id': jid(1, 'codex'), 'engine': 'codex', 'status': 'running', 'name': 'sweep',
                                     'requested': {'model': 'gpt-6.1-sol'}})
         b = baton.load('jobbed')
-        self.assertEqual(b['owner']['engine'], 'codex')
-        self.assertEqual(b['progress']['in_flight'][0]['check'], 'twinlane result j1')
+        # Changed with the finding-7 fix: registering a worker no longer sets the owner (was 'codex').
+        self.assertIsNone(b['owner']['engine'])
+        self.assertEqual(b['progress']['in_flight'][0]['check'], f"twinlane result {jid(1, 'codex')}")
         self.assertTrue(b['progress']['in_flight'][0]['never_rerun'])
-        baton.record_job('jobbed', {'id': 'j1', 'engine': 'codex', 'status': 'done', 'session_id': 's1'})
+        baton.record_job('jobbed', {'id': jid(1, 'codex'), 'engine': 'codex', 'status': 'done', 'session_id': 's1'})
         b = baton.load('jobbed')
         self.assertEqual(len(b['jobs']), 1)
         self.assertEqual(b['jobs'][0]['status'], 'done')
@@ -475,6 +488,333 @@ class RepoSnapshotTests(BatonTestBase):
         self.assertEqual(baton.snap('pushed')['repo']['pushed'], b['repo']['pushed'])
 
 
+def OLD(i):
+    return jid(0x1000 + i)   # finished-history ids sort apart from the live ones below
+
+
+def LIVE(i):
+    return jid(0x2000 + i, 'codex')
+
+
+LIVE_STATUSES = ('queued', 'running', 'orphaned', 'unknown', 'stop_failed')  # every one must survive the caps
+
+
+class LiveWorkCapTests(BatonTestBase):
+    """The list caps trim finished history only; unfinished jobs are never dropped."""
+
+    def live_baton(self, n_live, n_finished):
+        b = baton.empty_baton('caps')
+        b['jobs'] = [{'id': OLD(i), 'engine': 'claude', 'status': 'done'} for i in range(n_finished)]
+        live = [LIVE(i) for i in range(n_live)]
+        b['jobs'] += [{'id': jid, 'engine': 'codex', 'status': LIVE_STATUSES[i % len(LIVE_STATUSES)]}
+                      for i, jid in enumerate(live)]
+        b['progress']['in_flight'] = [{'what': 'w', 'job': jid, 'check': f'twinlane result {jid}', 'never_rerun': True}
+                                      for jid in live]
+        return b, live
+
+    def test_apply_caps_keeps_every_unfinished_job_and_trims_finished_history(self):
+        b, live = self.live_baton(21, 30)
+        baton._apply_caps(b)
+        ids = [j['id'] for j in b['jobs']]
+        self.assertEqual([i for i in ids if i in live], live)
+        self.assertEqual([i for i in ids if i not in live], [OLD(i) for i in range(10, 30)])
+        self.assertEqual([f['job'] for f in b['progress']['in_flight']], live)
+
+    def test_save_keeps_every_live_job_and_the_size_budget(self):
+        b, live = self.live_baton(21, 30)
+        b['progress']['done'] = [f'{i:02d}' + 'x' * 100 for i in range(30)]
+        baton.save(b, 'job')
+        saved = baton.load('caps')
+        self.assertTrue(set(live) <= {j['id'] for j in saved['jobs']})
+        self.assertLessEqual(os.path.getsize(baton.baton_path('caps')), baton.BATON_MAX_BYTES)
+        self.assertLess(len([j for j in saved['jobs'] if j['id'] not in live]), 30)  # history went first
+
+    def test_record_job_25_live_jobs_all_discoverable(self):
+        for i in range(25):
+            baton.record_job('many', {'id': jid(i), 'engine': 'claude' if i % 2 else 'codex',
+                                      'status': 'running', 'name': f'worker {i}'})
+        b = baton.load('many')
+        want = {jid(i) for i in range(25)}
+        self.assertEqual(want, {j['id'] for j in b['jobs']})
+        self.assertEqual(want, {f['job'] for f in b['progress']['in_flight']} | {j['id'] for j in b['jobs']})
+        text = '\n'.join(baton.render_baton_section(b))
+        for want_id in want:
+            self.assertIn(want_id, text)  # `baton show` and the handoff list every one, not the newest 5
+
+    def test_live_jobs_alone_over_budget_are_kept_and_set_still_works(self):
+        b, live = self.live_baton(90, 0)  # 90 live jobs do not fit in 8 KB
+        baton.save(b, 'job')
+        saved = baton.load('caps')
+        self.assertTrue(set(live) <= {j['id'] for j in saved['jobs']})
+        self.assertGreater(os.path.getsize(baton.baton_path('caps')), baton.BATON_MAX_BYTES)
+        rc, _, err = self.run_cli('baton', ['set', 'caps', '--next', 'still settable'])
+        self.assertEqual((rc, err), (0, ''))
+        saved = baton.load('caps')
+        self.assertEqual(saved['progress']['next_action'], 'still settable')
+        self.assertTrue(set(live) <= {j['id'] for j in saved['jobs']})
+
+    def test_live_exemption_does_not_excuse_other_oversize(self):
+        b, _ = self.live_baton(25, 0)
+        b['holds']['prohibitions'] = ['p' * 299 for _ in range(30)]  # untrimmable, not live work
+        with self.assertRaisesRegex(baton.BatonError, 'bytes; maximum'):
+            baton.save(b, 'user', strict=True)
+
+    def test_baton_finished_statuses_match_the_job_runner(self):
+        from twinlane import jobs
+        self.assertEqual(set(baton.FINISHED_JOB_STATUSES), set(jobs.TERMINAL))
+
+
+class LeadOwnerTests(BatonTestBase):
+    """The owner is the lead; registering or finishing a worker job never changes it."""
+    LEAD = {'engine': 'codex', 'session_id': 'lead-session', 'model': 'gpt-6.1-sol'}
+
+    def lead_baton(self, slug='lead'):
+        b = baton.new(slug, 'goal')
+        b['owner'] = dict(self.LEAD)
+        baton.save(b, 'user')
+
+    def test_worker_starts_and_completions_leave_the_lead_alone(self):
+        self.lead_baton()
+        c1, x1, c2, x2 = jid(1), jid(1, 'codex'), jid(2), jid(2, 'codex')
+        steps = [(c1, 'claude', 'running'), (x1, 'codex', 'running'), (c2, 'claude', 'running'),
+                 (c1, 'claude', 'done'), (x2, 'codex', 'running'), (x1, 'codex', 'limit_hit'),
+                 (c2, 'claude', 'failed'), (x2, 'codex', 'done')]
+        for job, engine, status in steps:
+            baton.record_job('lead', {'id': job, 'engine': engine, 'status': status, 'name': job,
+                                      'session_id': f'sess-{job}', 'served_models': [f'model-{engine}']})
+            self.assertEqual(baton.load('lead')['owner'], self.LEAD, (job, status))
+        self.assertEqual(len(baton.load('lead')['jobs']), 4)
+
+    def test_snap_and_handoff_leave_the_lead_alone(self):
+        self.lead_baton()
+        baton.record_job('lead', {'id': jid(1), 'engine': 'claude', 'status': 'running', 'session_id': 's'})
+        baton.snap('lead', self.repo)
+        self.assertEqual(baton.load('lead')['owner'], self.LEAD)
+        baton.handoff('lead', cwd=self.repo, to='claude')
+        self.assertEqual(baton.load('lead')['owner'], self.LEAD)
+
+    def test_explicit_owner_change_still_works_with_workers_running(self):
+        self.lead_baton()
+        baton.record_job('lead', {'id': jid(1), 'engine': 'claude', 'status': 'running', 'session_id': 'w'})
+        rc, _, err = self.run_cli('baton', ['set', 'lead', '--owner', 'claude'])
+        self.assertEqual((rc, err), (0, ''))
+        self.assertEqual(baton.load('lead')['owner']['engine'], 'claude')
+        baton.record_job('lead', {'id': jid(1, 'codex'), 'engine': 'codex', 'status': 'running'})
+        self.assertEqual(baton.load('lead')['owner']['engine'], 'claude')  # and the new lead stays put too
+        rc, _, _ = self.run_cli('baton', ['set', 'lead', '--owner', 'codex'])
+        self.assertEqual(baton.load('lead')['owner']['engine'], 'codex')
+
+    def test_a_first_job_does_not_set_an_unset_owner(self):
+        baton.record_job('nolead', {'id': jid(1), 'engine': 'claude', 'status': 'running', 'session_id': 'w'})
+        baton.record_job('nolead', {'id': jid(1), 'engine': 'claude', 'status': 'done'})
+        self.assertEqual(baton.load('nolead')['owner'], {'engine': None, 'session_id': None, 'model': None})
+        self.assertEqual(baton.list_batons()[0]['owner'], None)
+
+    def test_concurrent_worker_registration_leaves_the_lead_alone(self):
+        self.lead_baton('race-lead')
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        code = ('import sys; sys.path.insert(0, sys.argv[1]); from twinlane import baton, common\n'
+                'common.BATONS = sys.argv[2]\n'
+                'engine = sys.argv[3]\n'
+                'for i in range(4):\n'
+                '    jid = f"20261009-143941-{engine}-{i:04x}"\n'
+                '    baton.record_job("race-lead", {"id": jid, "engine": engine, "status": "running", "session_id": jid})\n'
+                '    baton.record_job("race-lead", {"id": jid, "engine": engine, "status": "done"})')
+        env = dict(os.environ, TWINLANE_HOME=os.path.join(self.tmp, 'sub-home'))
+        procs = [subprocess.Popen([sys.executable, '-c', code, root, common.BATONS, engine], env=env)
+                 for engine in ('claude', 'codex', 'claude', 'codex')]
+        for p in procs:
+            self.assertEqual(p.wait(timeout=120), 0)
+        b = baton.load('race-lead')
+        self.assertEqual(b['owner'], self.LEAD)
+        self.assertEqual(len(b['jobs']), 8)  # claude 0..3 and codex 0..3, each registered twice
+
+
+def _ids_in(text):
+    return set(re.findall(r'\d{8}-\d{6}-(?:claude|codex)-[0-9a-f]{4}', text))
+
+
+class JobIdVisibilityTests(BatonTestBase):
+    """A handoff names every unfinished job id, or counts the ones it cannot list
+    and says where to find them. A long description or a long list never hides one silently."""
+
+    def ctx_for(self, b, jobs=()):
+        return {'slug': b['slug'], 'generated_at': 'now', 'baton': b, 'jobs': list(jobs), 'cwd': self.repo,
+                'git': {}, 'verify': ['x']}
+
+    def many_live(self, slug, n):
+        b = baton.empty_baton(slug)
+        ids = [jid(i, 'codex' if i % 2 else 'claude') for i in range(n)]
+        b['jobs'] = [{'id': i, 'engine': 'codex', 'status': 'running'} for i in ids]
+        b['progress']['in_flight'] = [{'what': 'worker', 'job': i, 'check': f'twinlane result {i}', 'never_rerun': True}
+                                      for i in ids]
+        return b, ids
+
+    def test_job_id_regex_is_the_one_the_runner_makes(self):
+        from twinlane import jobs
+        for engine in baton.ENGINES:
+            made = jobs.create_job({'engine': engine, 'profile': 'intel', 'brief_text': 'x'})
+            self.assertRegex(made, baton.JOB_ID_RE)
+        for bad in ('j1', 'live-00', '20261009-143941-gemini-abcd', '20261009-143941-codex-abcde',
+                    '20261009-143941-codex-ABCD', ''):
+            self.assertIsNone(baton.JOB_ID_RE.match(bad), bad)
+
+    def test_long_description_never_hides_the_job_id(self):
+        baton.new('longdesc', 'goal', cwd=self.repo)
+        baton.record_job('longdesc', {'id': jid(1), 'engine': 'claude', 'status': 'running', 'name': 'w' * 300})
+        b = baton.load('longdesc')
+        self.assertIn(jid(1), '\n'.join(baton.render_baton_section(b)))
+        self.assertIn(f'twinlane result {jid(1)}', '\n'.join(baton.render_baton_section(b)))
+        r = baton.handoff('longdesc', cwd=self.repo, to='codex')
+        self.assertIn(jid(1), r['markdown'])
+        self.assertIn(f'twinlane result {jid(1)}', r['markdown'])
+        # A description of any length, in every pointer shown
+        b, ids = self.many_live('longmany', 5)
+        for f in b['progress']['in_flight']:
+            f['what'] = 'x' * 300
+        text = '\n'.join(baton.render_baton_section(b))
+        for i in ids:
+            self.assertIn(f'{i}: ', text)
+            self.assertIn(f'twinlane result {i}', text)
+
+    def test_300_unfinished_jobs_every_id_listed_or_counted_with_where_to_find_them(self):
+        b, ids = self.many_live('crowd', 300)
+        baton.save(b, 'job')
+        b = baton.load('crowd')
+        self.assertEqual({j['id'] for j in b['jobs']}, set(ids))      # the baton itself keeps all 300
+        text = baton.fit_handoff(self.ctx_for(b))
+        self.assertLessEqual(len(text.encode('utf-8')), baton.HANDOFF_MAX_BYTES)
+        missing = set(ids) - _ids_in(text)
+        counts = [int(n) for n in re.findall(r'\+(\d+) more unfinished jobs: `twinlane baton show crowd`', text)]
+        self.assertTrue(missing)                                     # 300 ids cannot all fit in 8 KB ...
+        self.assertEqual(counts, [len(missing)])                     # ... so the count of those left out is exact
+        self.assertNotIn('clipped to fit', text)
+        rc, shown, _ = self.run_cli('baton', ['show', 'crowd'])      # and `twinlane baton show` really lists them all
+        self.assertEqual((rc, _ids_in(shown)), (0, set(ids)))
+
+    def test_every_id_is_listed_when_they_fit(self):
+        b, ids = self.many_live('few', 12)
+        text = baton.fit_handoff(self.ctx_for(b))
+        self.assertEqual(_ids_in(text), set(ids))
+        self.assertNotIn('more unfinished jobs', text)
+
+    def test_also_live_list_is_bounded_with_its_own_overflow(self):
+        live = [{'id': jid(i), 'engine': 'claude', 'status': 'running', 'name': 'n'} for i in range(120)]
+        ctx = self.ctx_for(baton.empty_baton('livelist'), live)
+        ctx['baton'] = None
+        text = baton.fit_handoff(ctx)
+        self.assertLessEqual(len(text.encode('utf-8')), baton.HANDOFF_MAX_BYTES)
+        counts = [int(n) for n in re.findall(r'\+(\d+) more unfinished jobs: `twinlane jobs --all`', text)]
+        self.assertEqual(counts, [len(set(jid(i) for i in range(120)) - _ids_in(text))])
+        self.assertGreater(counts[0], 0)
+
+    def test_the_last_resort_clip_never_cuts_inside_an_id_list(self):
+        b, ids = self.many_live('tiny', 300)
+        for budget in (4000, 2500, 1800):
+            text = baton.fit_handoff(self.ctx_for(b), max_bytes=budget)
+            self.assertLessEqual(len(text.encode('utf-8')), budget)
+            missing = set(ids) - _ids_in(text)
+            counts = [int(n) for n in re.findall(r'\+(\d+) more unfinished jobs', text)]
+            self.assertEqual(counts, [len(missing)], budget)
+            for line in text.splitlines():                           # no id is cut in half
+                for part in re.findall(r'\d{8}-\d{6}-(?:claude|codex)-\w*', line):
+                    self.assertRegex(part, baton.JOB_ID_RE)
+
+    def test_overflow_line_is_present_when_even_zero_ids_must_go(self):
+        b, ids = self.many_live('zero', 300)
+        old = baton.HANDOFF_TIERS
+        try:
+            baton.HANDOFF_TIERS = ((120, 0),)
+            text = baton.fit_handoff(self.ctx_for(b))
+        finally:
+            baton.HANDOFF_TIERS = old
+        self.assertIn('+295 more unfinished jobs: `twinlane baton show zero`', text)   # 300 minus the 5 pointers shown
+
+
+class JobEntrySchemaTests(BatonTestBase):
+    """Only a real, unfinished job counts as live work for the size exemption."""
+
+    def junk(self, n):
+        b = baton.empty_baton('junk')
+        b['jobs'] = [{'blob': 'x' * 290} for _ in range(n)]
+        return b
+
+    def test_entries_that_are_not_jobs_are_refused_and_get_no_exemption(self):
+        for n in (30, 100):
+            b = self.junk(n)
+            self.assertGreater(baton._baton_bytes(b), baton.BATON_MAX_BYTES)
+            errs = baton.validate(b)
+            self.assertTrue(any('bad job entry' in e for e in errs), (n, errs[:2]))
+            self.assertTrue(any('bytes; maximum' in e for e in errs), (n, errs[-1]))
+            with self.assertRaisesRegex(baton.BatonError, 'invalid baton'):
+                baton.save(b, 'user', strict=True)
+            self.assertFalse(os.path.exists(baton.baton_path('junk')))
+        self.assertEqual(baton._without_live_work(self.junk(30))['jobs'], self.junk(30)['jobs'])
+
+    def test_each_kind_of_bad_entry_is_refused(self):
+        good = {'id': jid(1), 'engine': 'codex', 'status': 'running'}
+        bad = [{'id': 'j1', 'status': 'running'}, {'status': 'running'}, {'id': None}, 'job', 7,
+               dict(good, blob='x'), dict(good, session_id='s' * 101), dict(good, session_id=['a']),
+               dict(good, status={'a': 1}), {'id': jid(2).upper(), 'status': 'running'}]
+        for entry in bad:
+            b = baton.empty_baton('bad')
+            b['jobs'] = [entry]
+            self.assertTrue(any('bad job entry' in e for e in baton.validate(b)), entry)
+        b = baton.empty_baton('bad')
+        b['jobs'] = [good, dict(good)]
+        self.assertTrue(any('listed twice' in e for e in baton.validate(b)))
+        b['jobs'] = [good]
+        self.assertEqual(baton.validate(b), [])
+
+    def test_90_real_live_jobs_still_pass_and_a_blob_cannot_hide_among_them(self):
+        b = baton.empty_baton('real')
+        ids = [jid(i, 'codex') for i in range(90)]
+        b['jobs'] = [{'id': i, 'engine': 'codex', 'status': 'running', 'session_id': 's' * 100} for i in ids]
+        b['progress']['in_flight'] = [{'what': 'w', 'job': i, 'check': f'twinlane result {i}', 'never_rerun': True}
+                                      for i in ids]
+        self.assertGreater(baton._baton_bytes(b), baton.BATON_MAX_BYTES)
+        self.assertEqual(baton.validate(b), [])
+        baton.save(b, 'user', strict=True)
+        self.assertEqual({j['id'] for j in baton.load('real')['jobs']}, set(ids))
+        # An entry with an extra field is not excused, however many real jobs sit beside it
+        b['jobs'].append({'id': jid(500), 'engine': 'codex', 'status': 'running', 'blob': 'x' * 290})
+        self.assertTrue(any('bad job entry' in e for e in baton.validate(b)))
+        # extra fields on an in-flight pointer are counted too (not excused as live work)
+        c = baton.load('real')
+        c['progress']['in_flight'][0]['blob'] = ['y' * 290] * 40
+        self.assertTrue(any('bytes; maximum' in e for e in baton.validate(c)))
+        # one pointer per live job is excused: a pointer repeated 100 times is not
+        d = baton.load('real')
+        d['progress']['in_flight'] = d['progress']['in_flight'][:1] * 100
+        self.assertEqual(len(baton._without_live_work(d)['progress']['in_flight']), 99)
+
+    def test_the_exemption_has_a_ceiling(self):
+        b = baton.empty_baton('ceiling')
+        b['jobs'] = [{'id': jid(i, 'codex'), 'engine': 'codex', 'status': 'running', 'session_id': 's' * 100}
+                     for i in range(baton.LIVE_EXEMPT_MAX + 50)]
+        self.assertEqual(len(baton._without_live_work(b)['jobs']), 50)
+        self.assertTrue(any('bytes; maximum' in e for e in baton.validate(b)))
+
+    def test_finished_and_unknown_statuses(self):
+        done, odd = {'id': jid(1), 'status': 'done'}, {'id': jid(2), 'status': 'weird'}
+        self.assertFalse(baton._is_live_job(done))
+        self.assertTrue(baton._is_live_job(odd))                   # unknown states are unfinished work
+        self.assertFalse(baton._is_live_job({'status': 'running'}))
+
+    def test_system_writers_drop_non_jobs_and_keep_real_ones(self):
+        b = baton.empty_baton('sys')
+        b['jobs'] = [{'blob': 'x'}, 'junk', {'id': jid(3), 'status': 'running', 'blob': 'z', 'session_id': 's' * 500},
+                     {'id': jid(3), 'status': 'done'}]
+        baton.save(b, 'job')                                       # a system write never refuses
+        saved = baton.load('sys')['jobs']
+        self.assertEqual([j['id'] for j in saved], [jid(3)])
+        self.assertEqual(saved[0]['status'], 'running')             # first entry of a repeated id wins
+        self.assertNotIn('blob', saved[0])
+        self.assertEqual(len(saved[0]['session_id']), 100)          # cut to the field bound, job kept
+        baton.record_job('sys', {'id': 'not-a-job-id', 'engine': 'codex', 'status': 'running'})
+        self.assertEqual([j['id'] for j in baton.load('sys')['jobs']], [jid(3)])
+
+
 class JobReconcileTests(BatonTestBase):
     def job(self, jid, status, pid=None):
         d = os.path.join(common.JOBS, jid)
@@ -503,36 +843,48 @@ class JobReconcileTests(BatonTestBase):
 
     def test_snap_reconciles_finished_stopped_and_lost_jobs(self):
         baton.new('rec', 'goal', cwd=self.repo)
-        self.running_in_baton('rec', 'j-done', 'j-stopped', 'j-lost', 'j-alive')
-        self.job('j-done', 'done')
-        self.job('j-stopped', 'stopped')
-        self.job('j-lost', None, pid=self.dead_pid())
-        self.job('j-alive', None, pid=os.getpid())
+        done, stopped, lost, alive = jid(1), jid(2), jid(3), jid(4)
+        self.running_in_baton('rec', done, stopped, lost, alive)
+        self.job(done, 'done')
+        self.job(stopped, 'stopped')
+        self.job(lost, None, pid=self.dead_pid())
+        self.job(alive, None, pid=os.getpid())
         baton.snap('rec')
-        self.check('rec', 'j-done', 'done')
-        self.check('rec', 'j-stopped', 'stopped')
-        self.check('rec', 'j-lost', 'lost')
+        self.check('rec', done, 'done')
+        self.check('rec', stopped, 'stopped')
+        self.check('rec', lost, 'lost')
         b = baton.load('rec')
-        self.assertEqual([f['job'] for f in b['progress']['in_flight']], ['j-alive'])
-        self.assertEqual({j['id']: j['status'] for j in b['jobs']}['j-alive'], 'running')
+        self.assertEqual([f['job'] for f in b['progress']['in_flight']], [alive])
+        self.assertEqual({j['id']: j['status'] for j in b['jobs']}[alive], 'running')
+
+    def test_snap_keeps_an_unknown_job_live_in_flight(self):
+        # A runner whose identity cannot be read is not lost, so its baton item stays in flight.
+        baton.new('unk', 'goal', cwd=self.repo)
+        self.running_in_baton('unk', jid(9))
+        self.job(jid(9), None, pid=os.getpid())
+        with mock.patch.object(common, 'pid_state', return_value=common.UNKNOWN):
+            baton.snap('unk')
+        b = baton.load('unk')
+        self.assertEqual({j['id']: j['status'] for j in b['jobs']}[jid(9)], 'unknown')
+        self.assertEqual([f['job'] for f in b['progress']['in_flight']], [jid(9)])
 
     def test_set_and_record_job_reconcile_too(self):
         baton.new('rec2', 'goal')
-        self.running_in_baton('rec2', 'j1', 'j2')
-        self.job('j1', 'stopped')
-        self.job('j2', 'done')
+        self.running_in_baton('rec2', jid(1), jid(2))
+        self.job(jid(1), 'stopped')
+        self.job(jid(2), 'done')
         self.assertEqual(self.run_cli('baton', ['set', 'rec2', '--next', 'n'])[0], 0)
-        self.check('rec2', 'j1', 'stopped')
-        self.check('rec2', 'j2', 'done')
-        self.running_in_baton('rec2', 'j3')
-        self.job('j3', 'failed')
-        baton.record_job('rec2', {'id': 'j4', 'engine': 'codex', 'status': 'running'})
-        self.check('rec2', 'j3', 'failed')
+        self.check('rec2', jid(1), 'stopped')
+        self.check('rec2', jid(2), 'done')
+        self.running_in_baton('rec2', jid(3))
+        self.job(jid(3), 'failed')
+        baton.record_job('rec2', {'id': jid(4, 'codex'), 'engine': 'codex', 'status': 'running'})
+        self.check('rec2', jid(3), 'failed')
 
     def test_show_reconciles_the_view_without_writing(self):
         baton.new('rec3', 'goal')
-        self.running_in_baton('rec3', 'j1')
-        self.job('j1', 'stopped')
+        self.running_in_baton('rec3', jid(1))
+        self.job(jid(1), 'stopped')
         raw = _raw(baton.baton_path('rec3'))
         rc, out, _ = self.run_cli('baton', ['show', 'rec3', '--json'])
         shown = json.loads(out)
@@ -545,21 +897,45 @@ class JobReconcileTests(BatonTestBase):
     def test_unknown_jobs_and_manual_in_flight_items_are_left_alone(self):
         baton.new('rec4', 'goal')
         b = baton.load('rec4')
-        b['jobs'] = [{'id': 'elsewhere', 'engine': 'codex', 'status': 'running'}]
+        elsewhere = jid(77, 'codex')   # a valid id with no job folder on this host
+        b['jobs'] = [{'id': elsewhere, 'engine': 'codex', 'status': 'running'}]
         b['progress']['in_flight'] = [{'what': 'manual', 'check': 'ask the user'},
-                                      {'what': 'x', 'job': 'elsewhere', 'check': 'c'}]
+                                      {'what': 'x', 'job': elsewhere, 'check': 'c'}]
         baton.save(b, 'user')
         baton.snap('rec4')
         b = baton.load('rec4')
         self.assertEqual(b['jobs'][0]['status'], 'running')
         self.assertEqual(len(b['progress']['in_flight']), 2)
 
+    def test_handoff_and_snap_keep_every_live_job_of_the_cwd(self):
+        # 22 live jobs in the jobs dir + finished history in the baton.
+        baton.new('busy', 'goal', cwd=self.repo)
+        b = baton.load('busy')
+        b['jobs'] = [{'id': OLD(i), 'engine': 'claude', 'status': 'done'} for i in range(25)]
+        baton.save(b, 'user')
+        live = [f'20261009-1200{i:02d}-claude-ab{i:02d}' for i in range(22)]
+        for jid in live:
+            self.job(jid, None, pid=os.getpid())
+        baton.snap('busy')
+        saved = baton.load('busy')
+        self.assertTrue(set(live) <= {j['id'] for j in saved['jobs']})
+        r = baton.handoff('busy', cwd=self.repo, to='codex')
+        for jid in live:
+            self.assertIn(jid, r['markdown'])  # the brief names every one, not the first 5 / 8
+        self.assertLessEqual(r['bytes'], baton.HANDOFF_MAX_BYTES)
+        saved = baton.load('busy')
+        self.assertTrue(set(live) <= {j['id'] for j in saved['jobs']})
+        self.assertEqual(saved['reason'], 'handoff')
+        finished = [j['id'] for j in saved['jobs'] if j['id'] not in live]
+        self.assertLess(len(finished), 25)
+        self.assertNotIn(OLD(0), finished)  # the oldest finished entries were what got trimmed
+
     def test_in_flight_item_for_a_job_missing_from_jobs_list_is_dropped_when_finished(self):
         baton.new('rec5', 'goal')
         b = baton.load('rec5')
-        b['progress']['in_flight'] = [{'what': 'x', 'job': 'j9', 'check': 'twinlane result j9'}]
+        b['progress']['in_flight'] = [{'what': 'x', 'job': jid(9), 'check': f'twinlane result {jid(9)}'}]
         baton.save(b, 'user')
-        self.job('j9', 'done')
+        self.job(jid(9), 'done')
         baton.snap('rec5')
         self.assertEqual(baton.load('rec5')['progress']['in_flight'], [])
 
@@ -679,7 +1055,8 @@ class ConcurrencyTests(BatonTestBase):
         code = ('import sys; sys.path.insert(0, sys.argv[1]); from twinlane import baton, common\n'
                 'common.BATONS = sys.argv[2]\n'
                 'for i in range(5):\n'
-                '    baton.record_job("race", {"id": f"job-{sys.argv[3]}-{i}", "engine": "codex", "status": "done"})')
+                '    baton.record_job("race", {"id": f"20261009-143941-codex-{int(sys.argv[3]) * 16 + i:04x}", '
+                '"engine": "codex", "status": "done"})')
         env = dict(os.environ, TWINLANE_HOME=os.path.join(self.tmp, 'sub-home'))
         procs = [subprocess.Popen([sys.executable, '-c', code, root, common.BATONS, str(n)], env=env)
                  for n in range(4)]
@@ -693,9 +1070,69 @@ class ConcurrencyTests(BatonTestBase):
         with open(baton.baton_path('broken'), 'w', encoding='utf-8') as h:
             h.write('{"slug": "broken", "task": {"goal": "keep me"')  # torn write
         with self.assertRaises(baton.BatonError):
-            baton.record_job('broken', {'id': 'j1', 'engine': 'claude', 'status': 'done'})
+            baton.record_job('broken', {'id': jid(1), 'engine': 'claude', 'status': 'done'})
         with open(baton.baton_path('broken'), encoding='utf-8') as h:
             self.assertIn('keep me', h.read())
+
+
+class MeterLineTests(BatonTestBase):
+    """The handoff meter line: whole-number percents, naming the window that set the max."""
+
+    def write_cached_meter(self, claude=None, codex=None):
+        common.write_json(os.path.join(common.STATE, 'meter.json'),
+                          {'read_at': '2026-10-09T12:00:00Z', 'claude': claude or {}, 'codex': codex or {}})
+
+    def test_percent_is_rounded_and_the_max_window_is_named(self):
+        self.write_cached_meter(
+            claude={'status': 'ok', 'max_pct': 28.728186, 'windows': [
+                {'name': '5h', 'pct': 4.0}, {'name': '7d', 'pct': 12.5}, {'name': 'iguana_necktie', 'pct': 28.728186}]},
+            codex={'status': 'ok', 'max_pct': 36.0, 'windows': [{'name': 'weekly', 'pct': 36.0}]})
+        m = baton.cached_meter()
+        self.assertEqual(m['claude_max_window'], 'iguana_necktie')
+        self.assertEqual(m['claude_max_pct'], 28.728186)  # the stored number keeps its precision
+        line = baton.render_meter(m)
+        self.assertIn('Claude 29% ok (max: iguana_necktie)', line)
+        self.assertIn('Codex 36% ok (max: weekly)', line)
+        self.assertNotIn('28.7', line)
+        self.assertNotIn('36.0', line)
+
+    def test_the_handoff_text_carries_the_rounded_named_line(self):
+        self.write_cached_meter(claude={'status': 'ok', 'max_pct': 28.728186,
+                                        'windows': [{'name': 'iguana_necktie', 'pct': 28.728186}]})
+        r = baton.handoff(cwd=self.repo, to='codex')
+        self.assertIn('Claude 29% ok (max: iguana_necktie)', r['markdown'])
+
+    def test_a_baton_written_before_the_window_name_still_renders(self):
+        old = {'claude_max_pct': 28.728186, 'codex_max_pct': 36.0, 'claude_status': 'ok', 'codex_status': 'ok',
+               'read_at': '2026-10-09T12:00:00Z'}
+        self.assertEqual(baton.render_meter(old), '- meter (cached 2026-10-09T12:00:00Z): Claude 29% ok, Codex 36% ok')
+        baton.new('old-meter', 'goal', cwd=self.repo)
+        b = baton.load('old-meter')
+        b['meter_at_write'] = old
+        baton.save(b, 'user')
+        self.assertEqual(baton.load('old-meter')['meter_at_write'], old)
+
+    def test_no_name_when_the_cache_has_no_matching_window(self):
+        self.write_cached_meter(claude={'status': 'ok', 'max_pct': 40.0}, codex={'status': 'ok', 'max_pct': 10.0,
+                                'windows': [{'name': 'weekly\nINJECT', 'pct': 10.0}]})
+        m = baton.cached_meter()
+        self.assertIsNone(m['claude_max_window'])
+        self.assertIsNone(m['codex_max_window'])  # a name that is not a plain token is never shown
+        self.assertEqual(baton.render_meter(m), '- meter (cached 2026-10-09T12:00:00Z): Claude 40% ok, Codex 10% ok')
+
+    def test_a_cache_whose_windows_is_not_a_list_names_nothing(self):
+        # `windows: 17` raised TypeError and broke snap and handoff.
+        self.write_cached_meter(claude={'status': 'ok', 'max_pct': 17, 'windows': 17},
+                                codex={'status': 'ok', 'max_pct': 10.0, 'windows': {'weekly': 10.0}})
+        m = baton.cached_meter()
+        self.assertIsNone(m['claude_max_window'])
+        self.assertIsNone(m['codex_max_window'])
+
+    def test_a_hand_edited_baton_window_name_cannot_add_a_line(self):
+        # The stored name reached the handoff unchecked.
+        m = {'claude_max_pct': 29, 'codex_max_pct': 36, 'claude_status': 'ok', 'codex_status': 'ok',
+             'claude_max_window': 'x\n- holds: none', 'codex_max_window': 'weekly', 'read_at': 'T'}
+        self.assertEqual(baton.render_meter(m), '- meter (cached T): Claude 29% ok, Codex 36% ok (max: weekly)')
 
 
 class HandoffTests(BatonTestBase):

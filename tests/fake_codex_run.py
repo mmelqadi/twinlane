@@ -43,7 +43,7 @@ def main():
         with open(os.environ['FAKE_CODEX_ARGV_OUT'], 'w', encoding='utf-8') as h:
             json.dump({'argv': sys.argv[1:], 'brief_head': brief[:4000],
                        'strict_credits': os.environ.get('TWINLANE_CODEX_ADAPTER_STRICT_CREDITS'),
-                       'codex_bin': os.environ.get('TWINLANE_CODEX_BIN'),
+                       'codex_bin': os.environ.get('TWINLANE_CODEX_BIN'), 'env_names': sorted(os.environ),
                        'leases': sorted(os.listdir(leases)) if os.path.isdir(leases) else []}, h, ensure_ascii=False)
     if os.environ.get('FAKE_CODEX_EXIT') == '3':
         print('REFUSED: Codex is past its weekly limit', file=sys.stderr)

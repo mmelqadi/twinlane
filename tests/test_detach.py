@@ -1,6 +1,7 @@
-"""--bg survival: spawn_detached_ex order (breakaway -> wmi -> in-job), the WMI env hand-off, and a
-real WMI start that outlives a kill-on-close job. Every process started here is a python sleeper,
-killed before the test ends. No network, no model calls."""
+"""--bg survival: spawn_detached_ex modes (Windows require_survival: wmi or refuse), the WMI env
+hand-off, and real WMI starts that outlive a kill-on-close job, a desktop app's nested job chain and a
+tree kill (simulations: no real desktop app restart has been run). Every process started here is a
+python sleeper or a fake engine, killed before the test ends. No network, no model calls."""
 import ctypes
 import json
 import os
@@ -56,7 +57,8 @@ class _Tmp(unittest.TestCase):
 @unittest.skipUnless(common.IS_WIN, 'Windows job objects and WMI')
 class WmiSurvivesAKillOnCloseJob(_Tmp):
     """A1: from inside a kill-on-close job that forbids breakaway, the wmi start is outside that job
-    and survives the job being closed (what a desktop app restart does to its shells)."""
+    and survives the job being closed. This SIMULATES the job-object close an app exit may cause; it is not
+    a real Claude or Codex desktop app restart, which has not been run (see README, `--bg` restart note)."""
 
     def test_child_outlives_the_closed_job(self):
         mark, log, handoff = (os.path.join(self.tmp, n) for n in ('mark.txt', 'runner.log', 'runner.env.json'))
@@ -149,6 +151,159 @@ class TwinlaneStopKillsAWmiRunner(_Tmp):
         self.assertTrue(_wait(lambda: not common.pid_alive(d['pid'], d['created'])))
 
 
+# A launcher that rebuilds a desktop app's nested job chain around itself, then starts a child. Under the Codex desktop
+# app (read-only probe, 2026-10-11) a `--bg` runner recorded as detach=breakaway was still a member of
+# An app-held kill-on-close job that forbids breakaway; the innermost job allowed breakaway, and
+# job_info sees only that one. Here: outer = kill-on-close (breakaway forbidden, or allowed with
+# "allow"), inner = kill-on-close + breakaway allowed.
+CHAIN_LAUNCHER = (
+    'import ctypes, json, os, subprocess, sys, time; from ctypes import wintypes\n'
+    'root, what, outer_mode, tmp = sys.argv[1:5]; sys.path.insert(0, root); from twinlane import common\n'
+    'k = common._k32()\n'
+    'def job(flags):\n'
+    '    j = k.CreateJobObjectW(None, None); e = common._job_limits_struct(); e.Basic.LimitFlags = flags\n'
+    '    assert k.SetInformationJobObject(j, 9, ctypes.byref(e), ctypes.sizeof(e))\n'
+    '    assert k.AssignProcessToJobObject(j, k.GetCurrentProcess()), ctypes.get_last_error()\n'
+    '    return j\n'
+    'kill, ok = common.JOB_LIMIT_KILL_ON_JOB_CLOSE, common.JOB_LIMIT_BREAKAWAY_OK\n'
+    'outer = job(kill | (ok if outer_mode == "allow" else 0)); inner = job(kill | ok)\n'
+    'def member(pid, j):\n'
+    '    h = k.OpenProcess(0x1000, False, pid); b = wintypes.BOOL(); r = k.IsProcessInJob(h, j, ctypes.byref(b))\n'
+    '    k.CloseHandle(h); return bool(b.value) if r else None\n'
+    'out = {"info": common.job_info(), "launcher": os.getpid(), "launcher_created": common.process_created(os.getpid())}\n'
+    'if what == "raw":  # the old --bg start: CREATE_BREAKAWAY_FROM_JOB, its parent is this launcher\n'
+    '    p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"], stdout=subprocess.DEVNULL,\n'
+    '        stderr=subprocess.DEVNULL, creationflags=common.CREATE_NEW_PROCESS_GROUP | common.CREATE_NO_WINDOW\n'
+    '        | common.CREATE_BREAKAWAY_FROM_JOB)\n'
+    '    out.update(pid=p.pid, created=common.process_created(p.pid), mode="raw-breakaway")\n'
+    'elif what == "twinlane":\n'
+    '    d = common.spawn_detached_ex([sys.executable, "-c", sys.argv[5], root, os.path.join(tmp, "mark.txt")],\n'
+    '        cwd=tmp, env=dict(os.environ, TWINLANE_TEST_MARK="from-caller"), log_path=os.path.join(tmp, "runner.log"),\n'
+    '        require_survival=True, handoff=os.path.join(tmp, "runner.env.json"))\n'
+    '    out.update(pid=d["pid"], created=d["created"], mode=d["mode"])\n'
+    'else:  # bg: the real `twinlane run`, fake engines from the inherited env\n'
+    '    r = subprocess.run([sys.executable, os.path.join(root, "twinlane/cli.py"), "run"] + sys.argv[5:],\n'
+    '        capture_output=True, text=True, encoding="utf-8", errors="replace")\n'
+    '    out.update(rc=r.returncode, stdout=r.stdout, stderr=r.stderr[-2000:])\n'
+    'if "pid" in out' ':\n'
+    '    out.update(in_outer=member(out["pid"], outer), in_inner=member(out["pid"], inner))\n'
+    'c = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"], stdout=subprocess.DEVNULL)\n'
+    'out.update(control=c.pid, control_created=common.process_created(c.pid))\n'
+    'print(json.dumps(out), flush=True)\n'
+    'time.sleep(120)\n')
+
+# The app's shell: starts the launcher (which writes to this stdout pipe) and waits, so a tree kill
+# of the shell reaches the launcher and everything still linked to it by parent pid.
+SHELL = 'import subprocess, sys; subprocess.Popen(sys.argv[1:]).wait()'
+
+
+def _launch_chain(test, what, outer_mode, *extra):
+    """(shell, launcher report). Every pid it reports is registered for identity-checked cleanup."""
+    shell = subprocess.Popen([sys.executable, '-c', SHELL, sys.executable, '-c', CHAIN_LAUNCHER, ROOT, what,
+                              outer_mode, test.tmp, *extra],
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8')
+    shell_created = common.process_created(shell.pid)
+    shell.twinlane_created = shell_created
+
+    def stop_shell():
+        if shell.poll() is None and common.pid_alive(shell.pid, shell_created):
+            common.kill_tree(shell.pid, shell_created)
+        shell.wait(timeout=30)
+        shell.stdout.close()
+        shell.stderr.close()
+    test.addCleanup(stop_shell)
+    line = shell.stdout.readline()
+    if not line:
+        shell.wait(timeout=30)
+        test.fail('launcher failed: ' + shell.stderr.read()[-2000:])
+    r = json.loads(line)
+    test.pids += [(r['control'], r['control_created']), (r['launcher'], r['launcher_created'])]
+    if r.get('pid'):
+        test.pids.append((r['pid'], r['created']))
+    return shell, r
+
+
+def _tree_kill(shell):
+    """What an app exit can do: terminate its shell's process tree (taskkill /T), launcher still alive.
+    The launcher's death then closes its job handles, so the chain's kill-on-close jobs fire too."""
+    assert shell.twinlane_created is not None, 'the owned shell has no recorded creation stamp'
+    assert common.kill_tree(shell.pid, shell.twinlane_created), 'identity-checked shell tree kill failed'
+    shell.wait(timeout=30)
+
+
+def _job_close_only(r):
+    """Terminate only the identity-proven launcher's exact handle; its job handles close (no /T)."""
+    from ctypes import wintypes
+    assert r['launcher_created'] is not None, 'the owned launcher has no recorded creation stamp'
+    k = common._k32()
+    h = k.OpenProcess(0x1000 | 0x0001, False, r['launcher'])  # QUERY_LIMITED_INFORMATION | TERMINATE
+    assert h, 'cannot open the owned launcher for identity verification and termination'
+    try:
+        code = wintypes.DWORD()
+        assert k.GetExitCodeProcess(h, ctypes.byref(code)) and code.value == 259, 'launcher is not alive'
+        times = [ctypes.c_uint64() for _ in range(4)]
+        assert k.GetProcessTimes(h, *(ctypes.byref(t) for t in times)), 'launcher identity is unreadable'
+        assert times[0].value == r['launcher_created'], 'launcher pid was reused'
+        k.TerminateProcess.argtypes = (wintypes.HANDLE, wintypes.UINT)
+        k.TerminateProcess.restype = wintypes.BOOL
+        assert k.TerminateProcess(h, 1), 'exact-handle launcher termination failed'
+    finally:
+        k.CloseHandle(h)
+    assert _wait(lambda: not common.pid_alive(r['launcher'], r['launcher_created'])), 'launcher did not exit'
+
+
+@unittest.skipUnless(common.IS_WIN, 'Windows job objects and WMI')
+class NestedJobChain(_Tmp):
+    """Nested-job-chain hazards reproduced with python sleepers only (a SIMULATION, not a real app exit):
+    the original quit's exact termination trigger remains unknown.
+    breakaway from a nested chain leaves only the jobs up to the first that forbids it, and keeps
+    the launcher as parent. The --bg start (wmi) must survive both a job close and a tree kill."""
+
+    def test_old_breakaway_stays_in_the_outer_job_and_dies_with_it(self):
+        shell, r = _launch_chain(self, 'raw', 'forbid')
+        self.assertEqual(r['info'], {'in_job': True, 'kill_on_close': True, 'breakaway_ok': True},
+                         'job_info must see what a real app quit recorded: only the innermost job')
+        self.assertEqual((r['in_inner'], r['in_outer']), (False, True), 'breakaway left the outer job')
+        _job_close_only(r)
+        self.assertTrue(_wait(lambda: not common.pid_alive(r['control'], r['control_created'])))
+        self.assertTrue(_wait(lambda: not common.pid_alive(r['pid'], r['created'])),
+                        'a breakaway child outlived the outer kill-on-close job')
+
+    def test_old_breakaway_dies_with_a_tree_kill_even_outside_every_job(self):
+        shell, r = _launch_chain(self, 'raw', 'allow')
+        self.assertEqual((r['in_inner'], r['in_outer']), (False, False))
+        _tree_kill(shell)
+        self.assertTrue(_wait(lambda: not common.pid_alive(r['pid'], r['created'])),
+                        'a tree kill with the launcher alive did not reach its breakaway child')
+
+    def test_old_breakaway_orphan_outside_every_job_survives_a_job_close(self):
+        # Contrast: with no enclosing kill-on-close job, an orphan (launcher gone) is not killed.
+        shell, r = _launch_chain(self, 'raw', 'allow')
+        _job_close_only(r)
+        self.assertTrue(_wait(lambda: not common.pid_alive(r['control'], r['control_created'])))
+        time.sleep(1.0)
+        self.assertTrue(common.pid_alive(r['pid'], r['created']))
+
+    def test_bg_start_survives_tree_kill_and_job_close(self):
+        shell, r = _launch_chain(self, 'twinlane', 'forbid', SLEEPER)
+        self.assertEqual(r['mode'], 'wmi', 'require_survival trusted breakaway inside a job chain')
+        self.assertIsNotNone(r['created'])
+        self.assertEqual((r['in_inner'], r['in_outer']), (False, False))
+        _tree_kill(shell)
+        self.assertTrue(_wait(lambda: not common.pid_alive(r['launcher'], r['launcher_created'])))
+        self.assertTrue(_wait(lambda: not common.pid_alive(r['control'], r['control_created'])),
+                        'the control child outlived the tree kill and job close, so the test proves nothing')
+        time.sleep(1.0)
+        self.assertTrue(common.pid_alive(r['pid'], r['created']), 'the --bg child died with the app tree')
+        mark = os.path.join(self.tmp, 'mark.txt')
+        self.assertTrue(_wait(lambda: os.path.exists(mark)))
+        with open(mark, encoding='utf-8') as h:
+            self.assertEqual(h.read(), 'from-caller')
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, 'runner.env.json')))
+        self.assertTrue(common.kill_tree(r['pid'], r['created']))
+        self.assertTrue(_wait(lambda: not common.pid_alive(r['pid'], r['created'])))
+
+
 class EnvHandoffFile(_Tmp):
     """The hand-off: written, loaded (env, cwd, stdio applied), deleted; never left behind on failure."""
 
@@ -209,9 +364,11 @@ class _FakeProc:
 
 @unittest.skipUnless(common.IS_WIN, 'Windows creation flags')
 class DetachOrder(unittest.TestCase):
-    """The detach order: breakaway -> wmi (only inside a job, only with a hand-off) -> in-job (not when it would die)."""
+    """The detach order: with require_survival every Windows caller gets wmi or a refusal; best effort tries
+    breakaway -> wmi (only with a hand-off) -> in-job; best effort outside a job starts directly."""
 
     DOOMED = {'in_job': True, 'kill_on_close': True, 'breakaway_ok': False}
+    NESTED_CHAIN = {'in_job': True, 'kill_on_close': True, 'breakaway_ok': True}  # what runners lost in a real app quit recorded
 
     def run_spawn(self, info, breakaway_ok=False, wmi=None, **kw):
         calls = []
@@ -238,21 +395,49 @@ class DetachOrder(unittest.TestCase):
             except common.DetachError as e:
                 return e, calls
 
-    def test_breakaway_first(self):
-        d, calls = self.run_spawn(self.DOOMED, breakaway_ok=True, wmi={'pid': 1, 'created': 2},
-                                  require_survival=True, handoff='h')
+    def test_best_effort_tries_breakaway_first(self):
+        d, calls = self.run_spawn(self.DOOMED, breakaway_ok=True, wmi={'pid': 1, 'created': 2}, handoff='h')
         self.assertEqual((d['mode'], calls), ('breakaway', ['breakaway']))
+
+    def test_survival_never_trusts_breakaway(self):
+        # A real app quit: the innermost job allowed breakaway, an outer app job did not; 'breakaway' died with the app.
+        d, calls = self.run_spawn(self.NESTED_CHAIN, breakaway_ok=True, wmi={'pid': 7, 'created': 8},
+                                  require_survival=True, handoff='h')
+        self.assertEqual((d['mode'], d['pid'], d['created'], calls), ('wmi', 7, 8, ['wmi']))
 
     def test_wmi_when_the_job_forbids_breakaway(self):
         d, calls = self.run_spawn(self.DOOMED, wmi={'pid': 7, 'created': 8}, require_survival=True, handoff='h')
-        self.assertEqual((d['mode'], d['pid'], d['created'], calls), ('wmi', 7, 8, ['breakaway', 'wmi']))
+        self.assertEqual((d['mode'], d['pid'], d['created'], calls), ('wmi', 7, 8, ['wmi']))
+
+    def test_survival_with_unknown_job_state_uses_wmi(self):
+        d, calls = self.run_spawn({'in_job': None, 'kill_on_close': None, 'breakaway_ok': None}, breakaway_ok=True,
+                                  wmi={'pid': 7, 'created': 8}, require_survival=True, handoff='h')
+        self.assertEqual((d['mode'], calls), ('wmi', ['wmi']))
 
     def test_wmi_failure_refuses_when_survival_is_required(self):
         e, calls = self.run_spawn(self.DOOMED, wmi=common.DetachError('Win32_Process.Create returned 2'),
                                   require_survival=True, handoff='h')
         self.assertIsInstance(e, common.DetachError)
         self.assertIn('returned 2', str(e))
-        self.assertEqual(calls, ['breakaway', 'wmi'])
+        self.assertEqual(calls, ['wmi'])
+
+    def test_wmi_unavailable_refuses_even_in_a_job_that_does_not_kill(self):
+        # The innermost job not killing on close says nothing about the jobs above it.
+        for info in ({'in_job': True, 'kill_on_close': False, 'breakaway_ok': True},
+                     {'in_job': True, 'kill_on_close': False, 'breakaway_ok': False}):
+            e, calls = self.run_spawn(info, breakaway_ok=True, require_survival=True, handoff='h',
+                                      wmi=common.DetachError(f'WMI unavailable before Create: {common.WMI_PRECREATE}'))
+            self.assertIsInstance(e, common.DetachError)
+            self.assertNotIsInstance(e, common.DetachAmbiguous)
+            self.assertIn('WMI unavailable', str(e))
+            self.assertEqual(calls, ['wmi'], 'an ancestry-linked start was tried')
+
+    def test_ambiguous_wmi_start_is_raised_without_fallback(self):
+        e, calls = self.run_spawn(self.NESTED_CHAIN, breakaway_ok=True, require_survival=True, handoff='h',
+                                  wmi=common.DetachAmbiguous('no ProcessId from WMI', runner_may_run=True))
+        self.assertIsInstance(e, common.DetachAmbiguous)
+        self.assertTrue(e.runner_may_run)
+        self.assertEqual(calls, ['wmi'])
 
     def test_wmi_failure_falls_back_to_in_job(self):
         d, calls = self.run_spawn(self.DOOMED, wmi=common.DetachError('x'), handoff='h')
@@ -262,14 +447,37 @@ class DetachOrder(unittest.TestCase):
         # The hook's best-effort refresh has no hand-off: unchanged behaviour, no PowerShell.
         d, calls = self.run_spawn(self.DOOMED)
         self.assertEqual((d['mode'], calls), ('in-job', ['breakaway', 'plain']))
-        e, calls = self.run_spawn(self.DOOMED, require_survival=True)
+        e, calls = self.run_spawn(self.NESTED_CHAIN, breakaway_ok=True, require_survival=True)
         self.assertIsInstance(e, common.DetachError)
-        self.assertEqual(calls, ['breakaway'])
+        self.assertIn('hand-off', str(e))
+        self.assertEqual(calls, [], 'nothing may start without the WMI broker')
 
-    def test_not_in_a_job_never_uses_wmi(self):
+    def test_best_effort_outside_a_job_starts_directly(self):
         d, calls = self.run_spawn({'in_job': False, 'kill_on_close': False, 'breakaway_ok': True},
-                                  wmi={'pid': 1, 'created': 2}, require_survival=True, handoff='h')
-        self.assertEqual((d['mode'], calls), ('no-job', ['breakaway', 'plain']))
+                                  wmi={'pid': 1, 'created': 2}, handoff='h')
+        self.assertEqual((d['mode'], calls), ('no-job', ['plain']))
+
+
+class PosixDetach(unittest.TestCase):
+    """Non-Windows: no job objects; the child gets its own session, so a signal to the caller's
+    process group or session does not reach it."""
+
+    def test_posix_new_session(self):
+        seen = {}
+
+        def popen(argv, **kw):
+            seen.update(kw)
+            return _FakeProc()
+        with mock.patch.object(common, 'IS_WIN', False), \
+                mock.patch.object(common, 'job_info', return_value={'in_job': False}), \
+                mock.patch.object(common.subprocess, 'Popen', side_effect=popen), \
+                mock.patch.object(common, '_spawn_wmi') as wmi, \
+                mock.patch.object(common, 'process_created', return_value=99):
+            d = common.spawn_detached_ex(['x'], require_survival=True, handoff='h')
+        wmi.assert_not_called()
+        self.assertEqual((d['mode'], d['pid'], d['created']), ('posix', 4242, 99))
+        self.assertTrue(seen['start_new_session'])
+        self.assertNotIn('creationflags', seen)
 
 
 @unittest.skipUnless(common.IS_WIN, 'Windows WMI')
@@ -312,7 +520,7 @@ class WmiNeverFallsBackOnceCreateMayHaveRun(_Tmp):
     DetachAmbiguous that spawn_detached_ex does not fall back from. Only a proven pre-Create failure
     falls back."""
 
-    def spawn(self, run_effect):
+    def spawn(self, run_effect, **spawn_kw):
         handoff = os.path.join(self.tmp, 'runner.env.json')
         plain = []
 
@@ -330,7 +538,7 @@ class WmiNeverFallsBackOnceCreateMayHaveRun(_Tmp):
                 mock.patch.object(common.subprocess, 'run', side_effect=run):
             try:
                 out = common.spawn_detached_ex(['py', '-c', 'pass'], cwd=self.tmp, env={'A': '1'},
-                                               handoff=handoff)
+                                               handoff=handoff, **spawn_kw)
             except common.DetachError as e:
                 out = e
         self.assertFalse(os.path.exists(handoff), 'the hand-off must be gone when the launcher returns')
@@ -399,6 +607,22 @@ class WmiNeverFallsBackOnceCreateMayHaveRun(_Tmp):
             raise FileNotFoundError(2, 'powershell.exe')
         out, plain = self.spawn(effect)
         self.assertEqual((out['mode'], len(plain)), ('in-job', 1))
+
+    def test_with_survival_a_pre_create_failure_refuses(self):
+        # --bg: WMI unavailable is a refusal, never an ancestry-linked start; nothing ran, so no ambiguity.
+        for effect in (lambda h, kw: subprocess.CompletedProcess([], 3, f'{common.WMI_PRECREATE} Access denied\n', ''),
+                       lambda h, kw: (_ for _ in ()).throw(FileNotFoundError(2, 'powershell.exe'))):
+            out, plain = self.spawn(effect, require_survival=True)
+            self.assertIsInstance(out, common.DetachError)
+            self.assertNotIsInstance(out, common.DetachAmbiguous)
+            self.assertEqual(plain, [], 'fell back to a start that can die with an enclosing job')
+
+    def test_with_survival_a_timeout_stays_ambiguous(self):
+        def effect(handoff, kw):
+            raise subprocess.TimeoutExpired('powershell', 60)
+        out, plain = self.spawn(effect, require_survival=True)
+        self.assertIsInstance(out, common.DetachAmbiguous)
+        self.assertEqual(plain, [])
 
 
 class StartBackgroundReportsAmbiguity(_Tmp):
@@ -532,6 +756,46 @@ class _JobHelpers(test_jobs.JobsBase):
         return self.cli('_job', jid)[0], jobs
 
 
+@unittest.skipUnless(common.IS_WIN, 'Windows job objects and WMI')
+class NestedJobChainBackgroundRun(test_jobs.JobsBase):
+    """The fake-engine `twinlane run --bg` workflow from inside a nested app job chain: the app's tree is
+    killed and its jobs close right after the launch, and the job still finishes (a simulation)."""
+
+    def test_bg_job_finishes_after_tree_kill_and_job_close(self):
+        self.pids = []
+        os.environ['FAKE_SLEEP'] = '3'  # still running when the app tree goes
+        common.write_json(os.path.join(common.STATE, 'meter.json'), test_jobs.meter_with())
+
+        def cleanup():
+            for pid, created in self.pids:
+                if common.pid_alive(pid, created):
+                    common.kill_tree(pid, created)
+        self.addCleanup(cleanup)
+        shell, r = _launch_chain(self, 'bg', 'forbid', '--brief', self.brief, '--cd', self.work, '--bg', '--json')
+        self.assertEqual(r['rc'], 0, r['stdout'] + r['stderr'])
+        launch = json.loads(r['stdout'])
+        jid = launch['id']
+        runner = jobs_read_runner(jid)
+        self.pids.append(runner)  # before any assertion, so a failure still cleans it up
+        self.assertEqual(launch['detach'], 'wmi')
+        _tree_kill(shell)
+        self.assertTrue(_wait(lambda: not common.pid_alive(r['control'], r['control_created'])),
+                        'the control child outlived the tree kill and job close, so the test proves nothing')
+        self.assertTrue(common.pid_alive(*runner), 'the runner died with the app tree')
+        rc, out, _ = self.cli('wait', jid, '--timeout', '90')
+        self.assertEqual(rc, 0, out)
+        receipt = self.receipt(jid)
+        self.assertEqual((receipt['status'], len(receipt['attempts'])), ('done', 1))
+        self.assertEqual(common.read_json(os.path.join(common.JOBS, jid, 'job.json'))['detach']['mode'], 'wmi')
+        self.assertFalse(os.path.exists(os.path.join(common.JOBS, jid, 'runner.env.json')))
+
+
+def jobs_read_runner(jid):
+    with open(os.path.join(common.JOBS, jid, 'runner.pid'), encoding='ascii') as h:
+        pid, created = h.read().split()
+    return int(pid), int(created)
+
+
 class OneRunnerPerJob(_JobHelpers):
     """The runner lock: runner.lock makes a second runner for the same job exit without touching anything."""
     def test_live_lock_holder_means_exit_untouched(self):
@@ -549,6 +813,20 @@ class OneRunnerPerJob(_JobHelpers):
         self.assertFalse(os.path.exists(os.path.join(jd, 'result.json')))
         self.assertFalse(os.path.exists(self.argv_out), 'the engine ran')
         self.assertTrue(os.path.exists(os.path.join(jd, 'runner.lock')), 'the live holder lost its lock')
+
+    def test_lock_holder_with_an_unreadable_identity_is_not_taken_over(self):
+        # access denied is not "dead". A second runner must not take the lock from it.
+        jid = self.make_job()
+        holder = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+        self.addCleanup(lambda: (holder.kill(), holder.wait(10)))
+        jd = os.path.join(common.JOBS, jid)
+        common.write_text(os.path.join(jd, 'runner.lock'), f'{holder.pid} {common.process_created(holder.pid)}')
+        with test_jobs.unreadable_identity(holder.pid):
+            rc, jobs = self.run_job_cli(jid)
+        self.assertEqual(rc, common.EXIT_REFUSED)
+        self.assertFalse(os.path.exists(self.argv_out), 'the engine ran')
+        self.assertFalse(os.path.exists(os.path.join(jd, 'result.json')))
+        self.assertTrue(os.path.exists(os.path.join(jd, 'runner.lock')), 'the holder lost its lock')
 
     def test_stale_lock_is_taken_over(self):
         jid = self.make_job()

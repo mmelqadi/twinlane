@@ -78,12 +78,25 @@ def add_worktree(repo, base):
     return wt
 
 
+def unreadable_identity(*pids):
+    """These pids exist but their creation time cannot be read (a restricted-token sandbox);
+    other pids are probed for real. No pids = every pid."""
+    if common.IS_WIN:
+        real = common._win_process_info
+        return mock.patch.object(common, '_win_process_info',
+                                 side_effect=lambda pid: (True, None) if not pids or pid in pids else real(pid))
+    real = common._posix_start_time
+    return mock.patch.object(common, '_posix_start_time',
+                             side_effect=lambda pid: None if not pids or pid in pids else real(pid))
+
+
 class JobsBase(unittest.TestCase):
     ENV_KEYS = ('TWINLANE_HOME', 'TWINLANE_CLAUDE_BIN', 'TWINLANE_CODEX_RUN', 'ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL',
                 'FAKE_LIMIT', 'FAKE_SERVED_MODEL', 'FAKE_SESSION_ID', 'FAKE_SLEEP', 'FAKE_TOUCH', 'FAKE_ARGV_OUT',
                 'FAKE_CODEX_LIMIT', 'FAKE_CODEX_EXIT', 'FAKE_CODEX_ARGV_OUT', 'FAKE_TOUCH_NO_TOOL_USE',
                 'FAKE_TOOL_USE', 'FAKE_BAD_EVENTS', 'FAKE_CODEX_FINAL', 'TWINLANE_CODEX_ADAPTER_STRICT_CREDITS',
-                'TWINLANE_CODEX_BIN', 'LOCALAPPDATA', 'TWINLANE_TEST_ISOLATION', 'FAKE_CODEX_USAGE', 'FAKE_CODEX_ROLLOUT_ROOT')
+                'TWINLANE_CODEX_BIN', 'LOCALAPPDATA', 'TWINLANE_TEST_ISOLATION', 'FAKE_CODEX_USAGE', 'FAKE_CODEX_ROLLOUT_ROOT',
+                'TWINLANE_FAKE_API_TOKEN')
 
     def fresh_jobs(self):
         """A new empty jobs dir per subtest. Deleting and recreating one dir raced Windows' delayed
@@ -349,6 +362,23 @@ class RunPlanning(JobsBase):
         self.assertIn('route: claude profile=intel', out)
         self.assertIn('argv: ', out)
 
+    def test_the_exit_3_refusal_names_the_window_that_caused_it(self):
+        # With the real route.decide: seven_day_sonnet alone refuses Claude.
+        jobs._decide = None
+        m = meter_with(claude='stop', codex='out')
+        m['claude'].update(max_pct=90.0, windows=[{'name': 'five_hour', 'pct': 5.0}, {'name': 'seven_day', 'pct': 15.0},
+                                                  {'name': 'seven_day_sonnet', 'pct': 90.0}])
+        self.meter = m
+        rc, _, err = self.cli('run', '--brief', self.brief, '--cd', self.work, '--engine', 'claude')
+        self.assertEqual(rc, common.EXIT_REFUSED)
+        self.assertIn('claude stop (90% in 7d-sonnet)', err)
+        rc, out, _ = self.cli('run', '--brief', self.brief, '--cd', self.work, '--json')
+        self.assertEqual(rc, common.EXIT_REFUSED)
+        view = json.loads(out)
+        self.assertIn('claude stop (90% in 7d-sonnet)', view['reason'])
+        self.assertEqual(view['decision']['blockers'][0]['window'], 'seven_day_sonnet')
+        self.assertEqual(os.listdir(common.JOBS), [])
+
     def test_refused_route_exits_3_and_creates_nothing(self):
         self.meter = meter_with(claude='out', codex='unknown')
         rc, out, _ = self.cli('run', '--brief', self.brief, '--cd', self.work, '--json')
@@ -378,6 +408,60 @@ class RunPlanning(JobsBase):
         # A folder that is not a repo at all stays a legitimate place to run from.
         rc, out, _ = self.cli('run', '--brief', self.brief, '--cd', self.work, '--dry-run')
         self.assertEqual(rc, 0, out)
+
+    def test_a_codex_tier_name_passed_as_model_is_refused(self):
+        for tier in ('luna', 'sol', 'sol-high', 'astra'):
+            rc, out, err = self.cli('run', '--brief', self.brief, '--cd', self.work, '--engine', 'codex',
+                                    '--model', tier, '--dry-run')
+            self.assertEqual(rc, common.EXIT_USAGE, tier)
+            self.assertIn(f'--model {tier} is a Codex tier; use --tier {tier}', err)
+            self.assertEqual(out, '')
+        rc, out, _ = self.cli('run', '--brief', self.brief, '--cd', self.work, '--engine', 'codex', '--model', 'Astra',
+                              '--dry-run', '--json')
+        self.assertEqual(rc, common.EXIT_USAGE)
+        refusal = json.loads(out)
+        self.assertTrue(refusal['refused'])
+        self.assertEqual(refusal['reason'], '--model Astra is a Codex tier; use --tier astra')
+        self.assertEqual(jobs._job_ids(), [])  # a real run is refused the same way, before anything is created
+        rc, _, err = self.cli('run', '--brief', self.brief, '--cd', self.work, '--engine', 'codex', '--model', 'astra')
+        self.assertEqual(rc, common.EXIT_USAGE)
+        self.assertEqual(jobs._job_ids(), [])
+
+    def test_a_codex_model_id_is_still_accepted_and_the_tier_goes_by_tier(self):
+        rc, out, err = self.cli('run', '--brief', self.brief, '--cd', self.work, '--engine', 'codex',
+                                '--model', 'gpt-6-astra', '--dry-run', '--json')
+        self.assertEqual(rc, 0, err)
+        argv = json.loads(out)['argv']
+        self.assertEqual(argv[argv.index('--model') + 1], 'gpt-6-astra')
+        rc, out, err = self.cli('run', '--brief', self.brief, '--cd', self.work, '--engine', 'codex',
+                                '--tier', 'astra', '--dry-run', '--json')
+        self.assertEqual(rc, 0, err)
+        argv = json.loads(out)['argv']
+        self.assertEqual(argv[argv.index('--tier') + 1], 'astra')
+        # twinlane resolves a tier to the policy's model for it, so the runner gets that model too.
+        self.assertEqual(argv[argv.index('--model') + 1], POLICY['codex']['models']['astra'])
+
+    def test_the_tier_name_check_covers_a_route_that_lands_on_codex(self):
+        self.meter = meter_with(claude='out')
+        rc, _, err = self.cli('run', '--brief', self.brief, '--cd', self.work, '--kind', 'intel', '--model', 'sol',
+                              '--dry-run')
+        self.assertEqual(rc, common.EXIT_USAGE)
+        self.assertIn('--model sol is a Codex tier; use --tier sol', err)
+        # Failover during a run never carries the caller's --model to the other engine.
+        spec = {'kind': 'intel', 'urgent': False, 'profile': 'intel'}
+        params, why = jobs.plan_failover(spec, {'engine': 'claude'}, POLICY)
+        self.assertEqual(why, '')
+        self.assertEqual(params['model'], POLICY['codex']['models'][params['tier']])  # the tier's model, not --model
+
+    def test_the_claude_engine_is_unaffected_by_the_tier_name_check(self):
+        rc, out, err = self.cli('run', '--brief', self.brief, '--cd', self.work, '--engine', 'claude',
+                                '--model', 'sol', '--dry-run', '--json')
+        self.assertEqual(rc, 0, err)
+        argv = json.loads(out)['argv']
+        self.assertEqual(argv[argv.index('--model') + 1], 'sol')
+        rc, out, err = self.cli('run', '--brief', self.brief, '--cd', self.work, '--engine', 'claude',
+                                '--model', 'claude-opus-5-5', '--dry-run', '--json')
+        self.assertEqual(rc, 0, err)
 
     def test_bad_usage(self):
         rc, _, _ = self.cli('run', '--brief', self.brief, '--cd', os.path.join(self.tmp, 'nope'))
@@ -550,6 +634,10 @@ class InlineRuns(JobsBase):
         # A timed-out process that survives termination must not be described as complete.
         class Unkillable:
             pid = os.getpid()
+
+            def poll(self):
+                return None
+
             def wait(self, timeout=None):
                 raise subprocess.TimeoutExpired('runner', timeout)
         real_popen = subprocess.Popen
@@ -564,6 +652,171 @@ class InlineRuns(JobsBase):
         r = self.receipt(self.only_job())
         self.assertEqual(r['status'], 'timeout')
         self.assertIn('survived its kill', json.dumps(r))
+
+    # ---- a timeout receipt must not hide an engine whose kill failed
+
+    class EngineProc:
+        """Popen stand-in: wait() raises TimeoutExpired for the first `stuck` calls, then returns rc."""
+
+        def __init__(self, pid, stuck, rc=-9, raises=None):
+            self.pid, self.stuck, self.rc, self.raises, self.stdout = pid, stuck, rc, raises, io.BytesIO(b'')
+
+        def wait(self, timeout=None):
+            if self.raises:  # Ctrl+C while the runner waits (once; the grace wait after the kill is a fresh call)
+                exc, self.raises = self.raises, None
+                raise exc()
+            if self.stuck > 0:
+                self.stuck -= 1
+                raise subprocess.TimeoutExpired('engine', timeout)
+            return self.rc
+
+        def poll(self):
+            return None if self.stuck > 0 else self.rc
+
+    def _stuck_engine(self):
+        """A real sleeping process standing in for an engine child that outlives its kill: (process, stamp)."""
+        child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'])
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        return child, common.process_created(child.pid)
+
+    def _run_timing_out(self, engine, proc, kill_result):
+        """One inline job whose engine process is `proc`, timed out, with kill_tree answering `kill_result`."""
+        real_popen = subprocess.Popen
+
+        def popen(argv, *a, **kw):  # git and friends run for real; only the engine is faked
+            is_claude = isinstance(argv, list) and any(os.path.basename(str(x)) == 'fake_claude.py' for x in argv)
+            if (engine == 'claude' and is_claude) or (engine == 'codex' and isinstance(argv, list) and any(os.path.basename(str(x)) == 'fake_codex_run.py' for x in argv)):
+                return proc
+            return real_popen(argv, *a, **kw)
+
+        args = ['run', '--brief', self.brief, '--cd', self.work, '--timeout', '2']
+        if engine == 'codex':
+            args += ['--kind', 'parallel', '--engine', 'codex']
+        with mock.patch.object(common, '_read_codex_version', return_value=None), \
+                mock.patch.object(jobs.subprocess, 'Popen', side_effect=popen), \
+                mock.patch.object(common, 'kill_tree', return_value=kill_result) as kill:
+            self.cli(*args)
+        return self.only_job(), kill
+
+    def _check_a_surviving_engine_stays_visible_and_stoppable(self, engine):
+        child, stamp = self._stuck_engine()
+        other = 'codex' if engine == 'claude' else 'claude'
+        jid, kill = self._run_timing_out(engine, self.EngineProc(child.pid, stuck=99), False)
+        kill.assert_any_call(child.pid)  # the timeout path did try to kill it
+        r = self.receipt(jid)
+        self.assertEqual(r['status'], 'timeout')  # the receipt keeps saying what happened ...
+        self.assertEqual((r['survivor']['pid'], r['survivor']['created']), (child.pid, stamp))
+        self.assertIn('survived its kill', json.dumps(r['notes']))
+        # ... but the job is not finished: it stays visible, holds its engine's slot and can be stopped.
+        self.assertEqual(jobs.job_status(jid), 'orphaned')
+        self.assertEqual(jobs.running_count(engine), 1)
+        self.assertEqual(jobs.running_count(other), 0)
+        self.assertEqual([j['status'] for j in jobs.list_jobs()], ['orphaned'])
+        # A stop whose kill fails again reports it and leaves the job orphaned
+        with mock.patch.object(common, 'kill_tree', return_value=False):
+            rc, out, _ = self.cli('stop', jid, '--json')
+        self.assertEqual(rc, common.EXIT_FAILED)
+        data = json.loads(out)
+        self.assertEqual((data['status'], data['alive_pids']), ('stop_failed', [child.pid]))
+        self.assertEqual(jobs.job_status(jid), 'orphaned')
+        # A stop whose kill works ends the engine and frees the slot; the receipt stays the history
+        with mock.patch.object(common, 'kill_tree', side_effect=common.kill_tree) as real_kill:
+            rc, out, _ = self.cli('stop', jid, '--json')
+        self.assertEqual(rc, 0, out)
+        real_kill.assert_called_once_with(child.pid, stamp)
+        child.wait(timeout=15)
+        self.assertEqual(jobs.job_status(jid), 'timeout')
+        self.assertEqual(jobs.running_count(engine), 0)
+        self.assertEqual(self.receipt(jid)['status'], 'timeout')
+        with mock.patch.object(common, 'kill_tree') as again:  # nothing left to kill
+            self.assertIn('already finished', self.cli('stop', jid)[1])
+        again.assert_not_called()
+
+    def test_a_claude_engine_that_survives_the_timeout_kill_stays_visible_and_stoppable(self):
+        self._check_a_surviving_engine_stays_visible_and_stoppable('claude')
+
+    def test_a_codex_engine_that_survives_the_timeout_kill_stays_visible_and_stoppable(self):
+        self._check_a_surviving_engine_stays_visible_and_stoppable('codex')
+
+    def test_an_engine_that_survives_the_kill_after_an_interrupt_stays_visible(self):
+        for engine in ('claude', 'codex'):
+            with self.subTest(engine=engine):
+                self.fresh_jobs()
+                child, stamp = self._stuck_engine()
+                jid, kill = self._run_timing_out(engine, self.EngineProc(child.pid, stuck=99, raises=KeyboardInterrupt),
+                                                 False)
+                kill.assert_any_call(child.pid)
+                r = self.receipt(jid)
+                self.assertEqual(r['status'], 'interrupted')
+                self.assertEqual((r['survivor']['pid'], r['survivor']['created']), (child.pid, stamp))
+                self.assertEqual((jobs.job_status(jid), jobs.running_count(engine)), ('orphaned', 1))
+                self.assertEqual(self.cli('stop', jid)[0], 0)
+                child.wait(timeout=15)
+                self.assertEqual((jobs.job_status(jid), jobs.running_count(engine)), ('interrupted', 0))
+
+    def test_an_interrupt_whose_kill_worked_leaves_no_survivor(self):
+        for engine in ('claude', 'codex'):
+            with self.subTest(engine=engine):
+                self.fresh_jobs()
+                # The kill worked and the engine is reaped by the time the grace wait asks (stuck=0)
+                jid, _ = self._run_timing_out(engine, self.EngineProc(os.getpid(), stuck=0, raises=KeyboardInterrupt),
+                                              True)
+                r = self.receipt(jid)
+                self.assertEqual(r['status'], 'interrupted')
+                self.assertNotIn('survivor', r)
+                self.assertFalse(os.path.exists(os.path.join(common.JOBS, jid, jobs.SURVIVOR)))
+
+    # ---- a kill that reports success proves nothing: the process is checked afterwards
+
+    def test_a_kill_that_reported_success_but_left_the_engine_running_is_a_survivor(self):
+        for engine in ('claude', 'codex'):
+            for how, raises in (('timeout', None), ('interrupt', KeyboardInterrupt)):
+                with self.subTest(engine=engine, path=how):
+                    self.fresh_jobs()
+                    child, stamp = self._stuck_engine()
+                    jid, kill = self._run_timing_out(engine, self.EngineProc(child.pid, stuck=99, raises=raises), True)
+                    kill.assert_any_call(child.pid)
+                    r = self.receipt(jid)
+                    self.assertEqual(r['status'], 'timeout' if how == 'timeout' else 'interrupted')
+                    self.assertEqual((r['survivor']['pid'], r['survivor']['created']), (child.pid, stamp))
+                    self.assertIn('survived its kill', json.dumps(r['notes']))
+                    self.assertEqual((jobs.job_status(jid), jobs.running_count(engine)), ('orphaned', 1))
+
+    def test_a_survivor_is_recorded_with_its_pid_even_when_no_creation_stamp_can_be_read(self):
+        for engine in ('claude', 'codex'):
+            with self.subTest(engine=engine):
+                self.fresh_jobs()
+                child, _ = self._stuck_engine()
+                with mock.patch.object(common, 'process_created', return_value=None):
+                    jid, _ = self._run_timing_out(engine, self.EngineProc(child.pid, stuck=99), True)
+                saved = common.read_json(os.path.join(common.JOBS, jid, jobs.SURVIVOR))
+                self.assertEqual((saved['pid'], saved['created']), (child.pid, None))
+                # without a stamp the identity is unknown: held and visible, never killed by twinlane stop
+                self.assertEqual((jobs.job_status(jid), jobs.running_count(engine)), ('unknown', 1))
+                with mock.patch.object(common, 'kill_tree') as kill:
+                    self.assertEqual(self.cli('stop', jid)[0], common.EXIT_FAILED)
+                kill.assert_not_called()
+
+    def test_a_clean_timeout_is_unchanged_and_needs_no_process_probe(self):
+        for engine in ('claude', 'codex'):
+            for kill_result in (True, False):  # a failed kill of a child that exits anyway is still clean
+                with self.subTest(engine=engine, kill=kill_result):
+                    self.fresh_jobs()
+                    jid, _ = self._run_timing_out(engine, self.EngineProc(os.getpid(), stuck=1), kill_result)
+                    r = self.receipt(jid)
+                    self.assertEqual(r['status'], 'timeout')
+                    self.assertNotIn('survivor', r)
+                    self.assertNotIn('survived', json.dumps(r['notes']))
+                    self.assertFalse(os.path.exists(os.path.join(common.JOBS, jid, jobs.SURVIVOR)))
+                    # A receipt that ended cleanly is trusted without looking at any process
+                    with mock.patch.object(common, 'pid_state', side_effect=AssertionError('process probe')), \
+                            mock.patch.object(common, 'kill_tree') as kill:
+                        self.assertEqual(jobs.job_status(jid), 'timeout')
+                        self.assertEqual(jobs.running_count(engine), 0)
+                        self.assertEqual([j['status'] for j in jobs.list_jobs()], ['timeout'])
+                        self.assertIn('already finished', self.cli('stop', jid)[1])
+                    kill.assert_not_called()
 
     def test_requested_codex_model_is_not_claimed_as_verified(self):
         rc, out, _ = self.cli('run', '--brief', self.brief, '--cd', self.work,
@@ -629,6 +882,34 @@ class InlineRuns(JobsBase):
         r = self.receipt(self.only_job())
         self.assertEqual(r['disallowed_tool_uses'][0]['tool'], 'Edit')
         self.assertIn('outside the job worktree', r['disallowed_tool_uses'][0]['reason'])
+
+    def assert_secret_stripped(self, jid, seen):
+        self.assertNotIn('TWINLANE_FAKE_API_TOKEN', seen['env_names'])
+        self.assertIn('TWINLANE_ENGINE_JOB', seen['env_names'])
+        self.assertIn('TWINLANE_FAKE_API_TOKEN', self.receipt(jid)['attempts'][0]['env_stripped'])
+        for path in glob.glob(os.path.join(jobs.job_dir(jid), '**', '*'), recursive=True):
+            if os.path.isfile(path):
+                with open(path, 'rb') as h:
+                    self.assertNotIn(b'fake-secret-value-123', h.read(), path)
+
+    def test_code_worker_env_has_no_secret_named_variables(self):
+        # A script the code worker runs (php send.php) finds no token to send with. The
+        # receipt lists the stripped NAMES, never a value.
+        os.environ['TWINLANE_FAKE_API_TOKEN'] = 'fake-secret-value-123'
+        wt = add_worktree(make_repo(self.tmp), self.tmp)
+        rc, out, _ = self.cli('run', '--brief', self.brief, '--cd', wt, '--kind', 'code', '--write')
+        self.assertEqual(rc, 0, out)
+        self.assert_secret_stripped(self.only_job(), self.read_json_file(self.argv_out))
+
+    def test_codex_code_worker_env_has_no_secret_named_variables(self):
+        os.environ['TWINLANE_FAKE_API_TOKEN'] = 'fake-secret-value-123'
+        wt = add_worktree(make_repo(self.tmp), self.tmp)
+        rc, out, _ = self.cli('run', '--brief', self.brief, '--cd', wt, '--kind', 'integrate', '--write')
+        self.assertEqual(rc, 0, out)
+        seen = self.read_json_file(self.codex_argv_out)
+        self.assertEqual(seen['strict_credits'], '1')
+        self.assertIn('TWINLANE_CODEX_BIN', seen['env_names'])
+        self.assert_secret_stripped(self.only_job(), seen)
 
     def test_intel_receives_the_guard_hook(self):
         rc, out, _ = self.cli('run', '--brief', self.brief, '--cd', self.work)
@@ -760,6 +1041,93 @@ class ContinueLostJob(JobsBase):
     def plan(self, jid, *extra):
         args = jobs._run_parser().parse_args(['--brief', self.brief, '--continue-job', jid, *extra])
         return jobs.plan_run(args, POLICY)
+
+    # ---- --resume <session> must not bypass the liveness guard of the job that owns the session
+
+    def plan_resume(self, session, *extra):
+        args = jobs._run_parser().parse_args(['--brief', self.brief, '--cd', self.work, '--resume', session, *extra])
+        return jobs.plan_run(args, POLICY)
+
+    def receipt_with_session(self, status, sid):
+        return {'id': 'x', 'status': status, 'session_id': sid, 'session_engine': 'claude', 'final_path': None,
+                'cwd': self.work, 'attempts': [{'n': 1, 'engine': 'claude', 'status': status, 'session_id': sid}]}
+
+    def test_resume_of_the_session_of_a_live_tracked_job_is_refused_like_continue_job(self):
+        sources = {
+            'receipt': dict(result=self.receipt_with_session('timeout', 'sess-live-r')),   # receipt, runner alive
+            'raw events': dict(files={'events.jsonl': self.claude_events('sess-live-r', 'working')}),  # no receipt yet
+        }
+        for name, kw in sources.items():
+            with self.subTest(source=name):
+                self.fresh_jobs()
+                jid = self.prior('claude', alive=True, **kw)
+                with self.assertRaises(jobs.Refusal) as ctx:
+                    self.plan_resume('sess-live-r')
+                self.assertEqual(ctx.exception.code, common.EXIT_REFUSED)
+                self.assertIn(jid, ctx.exception.message)
+                self.assertIn('is still running', ctx.exception.message)
+                self.assertIn(f'twinlane wait {jid}', ctx.exception.message)
+                self.assertIn(f'twinlane stop {jid}', ctx.exception.message)
+                self.assertNotIn('sess-live-r', ctx.exception.message)  # never echo a caller-supplied value
+
+    def test_resume_of_the_session_of_an_unknown_state_job_is_refused(self):
+        jid = self.prior('claude', alive=True, files={'events.jsonl': self.claude_events('sess-unk', 'working')})
+        with unreadable_identity(self.live_pid()[0]):
+            with self.assertRaises(jobs.Refusal) as ctx:
+                self.plan_resume('sess-unk')
+        self.assertIn(jid, ctx.exception.message)
+        self.assertIn(jobs.IDENTITY_UNREADABLE, ctx.exception.message)
+
+    def test_resume_of_the_session_of_a_survivor_job_is_refused(self):
+        jid = self.prior('claude', result=self.receipt_with_session('timeout', 'sess-surv'))
+        common.write_json(os.path.join(common.JOBS, jid, jobs.SURVIVOR),
+                          {'engine': 'claude', 'pid': self.live_pid()[0], 'created': self.live_pid()[1], 'why': 't'})
+        with self.assertRaises(jobs.Refusal):
+            self.plan_resume('sess-surv')
+
+    def test_resume_of_the_session_of_a_finished_tracked_job_is_allowed(self):
+        self.prior('claude', result=self.receipt_with_session('done', 'sess-done'),
+                   files={'events.jsonl': self.claude_events('sess-done', 'finished')})
+        plan = self.plan_resume('sess-done')
+        self.assertEqual(plan['resume'], 'sess-done')
+
+    def test_resume_of_an_untracked_session_is_allowed(self):
+        self.prior('claude', alive=True, files={'events.jsonl': self.claude_events('sess-other', 'working')})
+        plan = self.plan_resume('sess-interactive-user')  # the user's own session: no tracked job owns it
+        self.assertEqual(plan['resume'], 'sess-interactive-user')
+        self.assertFalse([n for n in plan['notes'] if 'session lookup' in n])
+
+    def test_resume_session_lookup_that_did_not_finish_refuses(self):
+        # An owner beyond the scan budget was resumed with only a note. Fail closed.
+        self.prior('claude', alive=True, files={'events.jsonl': self.claude_events('sess-slow', 'working')})
+        with mock.patch.object(jobs, 'SESSION_SCAN_S', 0):  # no time at all: nothing could be scanned
+            with self.assertRaises(jobs.Refusal) as ctx:
+                self.plan_resume('sess-slow')
+        self.assertEqual(ctx.exception.code, common.EXIT_REFUSED)
+        self.assertIn('session lookup stopped', ctx.exception.message)
+        self.assertNotIn('sess-slow', ctx.exception.message)
+
+    def test_resume_finds_a_session_that_is_not_on_the_first_event_line(self):
+        # A valid first event without the session hid the owner on line two.
+        events = [{'type': 'system', 'subtype': 'hook_started'}] + self.claude_events('sess-line2', 'working')
+        jid = self.prior('claude', alive=True, files={'events.jsonl': events})
+        with self.assertRaises(jobs.Refusal) as ctx:
+            self.plan_resume('sess-line2')
+        self.assertIn(jid, ctx.exception.message)
+
+    def test_resume_owner_that_came_to_life_after_planning_is_refused_at_start(self):
+        owner = self.prior('claude', result=self.receipt_with_session('done', 'sess-race'))
+        plan = self.plan_resume('sess-race')
+        self.assertEqual(plan['resume_jobs'], [owner])
+        new = jobs.create_job(plan)
+        st_path = os.path.join(common.JOBS, owner, 'status.json')
+        st = common.read_json(st_path)
+        st['pid'], st['pid_created'] = self.live_pid()  # its runner is alive again
+        common.write_json(st_path, st)
+        r = jobs.run_job(new)
+        self.assertEqual(r['status'], 'refused')
+        self.assertIn(f'--resume (session of job {owner}): its runner', r['attempts'][0]['error'])
+        self.assertFalse(os.path.exists(self.argv_out))  # no engine started
 
     def test_finished_codex_prior_on_codex_embeds_its_final_message(self):
         # Codex cannot resume, so a done Codex prior continued on Codex must not lose both session and message.
@@ -895,6 +1263,37 @@ class ContinueLostJob(JobsBase):
         jid = self.prior('codex', child_alive=True, files={'codex/events.jsonl': self.codex_events('busy')})
         self.assertEqual(jobs.job_status(jid), 'orphaned')
         self.assert_refused(jid, 'its engine process')
+
+    def assert_refused_unreadable(self, jid, what):
+        with self.assertRaises(jobs.Refusal) as cm:
+            self.plan(jid)
+        self.assertEqual(cm.exception.code, common.EXIT_REFUSED)
+        self.assertIn(f'{what} (pid {self.live_pid()[0]}) may still be running', cm.exception.message)
+        self.assertIn('cannot be read', cm.exception.message)
+        self.assertIn(f'twinlane wait {jid}', cm.exception.message)
+        rc, _, err = self.cli('run', '--brief', self.brief, '--continue-job', jid, '--dry-run')
+        self.assertEqual(rc, common.EXIT_REFUSED)
+        self.assertIn('cannot be read', err)
+        self.assertEqual(jobs._job_ids(), [jid])  # nothing created
+
+    def test_prior_whose_runner_identity_is_unreadable_is_refused_not_continued(self):
+        # The sandbox sees `process_info=(True, None)`. That must block --continue-job.
+        jid = self.prior('claude', alive=True, files={'events.jsonl': self.claude_events('sess-u', 'busy')})
+        with unreadable_identity(self.live_pid()[0]):
+            self.assertEqual(jobs.job_status(jid), 'unknown')
+            self.assert_refused_unreadable(jid, 'its runner')
+            self.assertIn('cannot be read', jobs._continue_blocked(jid))
+
+    def test_prior_whose_engine_identity_is_unreadable_is_refused_not_continued(self):
+        jid = self.prior('codex', child_alive=True, files={'codex/events.jsonl': self.codex_events('busy')})
+        with unreadable_identity(self.live_pid()[0]):
+            self.assert_refused_unreadable(jid, 'its engine process')
+
+    def test_prior_with_a_dead_runner_and_a_readable_mismatch_is_still_lost(self):
+        # pid-reuse protection is unchanged: a readable identity that differs is another process.
+        jid = self.prior('claude', files={'events.jsonl': self.claude_events('sess-d', 'halfway')})
+        self.assertEqual(jobs.job_status(jid), 'lost')
+        self.assertIsNone(jobs._continue_blocked(jid))
 
     def test_stopped_prior_whose_kill_failed_is_refused(self):
         jid = self.prior('claude', alive=True, files={'events.jsonl': self.claude_events('sess-stop', 'busy')},
@@ -1488,6 +1887,120 @@ class SlotsAndLifecycle(JobsBase):
         self.assertEqual(jobs.job_status(jid), 'lost')
         self.assertEqual(jobs.running_count('claude'), 0)
 
+    # ---- alive / dead / unknown
+
+    def stamped_job(self, jid, engine='claude', **extra):
+        """A job whose runner is a real sleeping process, recorded with its creation stamp: (jid, process)."""
+        child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        return self.fake_job(jid, pid=child.pid, pid_created=common.process_created(child.pid), engine=engine,
+                             **extra), child
+
+    def test_unreadable_runner_identity_is_unknown_not_lost_and_holds_its_slot(self):
+        # The sandbox view: the runner exists, its creation time cannot be read. That used to read `lost`.
+        jid, child = self.stamped_job('20261008-000001-claude-aaaa')
+        with unreadable_identity(child.pid):
+            self.assertEqual(jobs.job_status(jid), 'unknown')
+            self.assertEqual([j['status'] for j in jobs.list_jobs()], ['unknown'])
+            self.assertEqual(jobs.running_count('claude'), 1)
+            self.assertEqual(jobs.running_count('codex'), 0)
+            mine = self.fake_job('20261008-000002-claude-bbbb', status='queued', pid=os.getpid())
+            self.assertFalse(jobs.try_acquire_slot(mine, 'claude', 1, max_parallel=1))
+            self.assertTrue(jobs.try_acquire_slot(mine, 'claude', 1, max_parallel=2))
+        self.assertEqual(jobs.job_status(jid), 'running')  # readable again: it was alive all along
+
+    def test_liveness_matrix_unknown_dead_and_mismatch(self):
+        jid, child = self.stamped_job('20261008-000001-claude-aaaa')
+        with self.subTest('exists, identity unreadable'), unreadable_identity(child.pid):
+            self.assertEqual((jobs.job_status(jid), jobs.running_count('claude')), ('unknown', 1))
+        if common.IS_WIN:
+            with self.subTest('does not exist'), mock.patch.object(common, '_win_process_info',
+                                                                   return_value=(False, None)):
+                self.assertEqual((jobs.job_status(jid), jobs.running_count('claude')), ('lost', 0))
+        with self.subTest('readable identity that does not match is a reused pid'):
+            wrong = self.fake_job('20261008-000002-claude-bbbb', pid=child.pid,
+                                  pid_created=common.process_created(child.pid) + 1)
+            self.assertEqual(jobs.job_status(wrong), 'lost')
+            self.assertEqual(jobs.running_count('claude'), 1)  # only the real runner
+        with self.subTest('exited'):
+            gone = self.fake_job('20261008-000003-claude-cccc', pid=self.dead_pid(), pid_created=12345)
+            self.assertEqual(jobs.job_status(gone), 'lost')
+
+    def test_unreadable_engine_child_of_a_dead_runner_is_unknown_and_holds_its_slot(self):
+        child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        jid = self.fake_job('20261008-000001-claude-aaaa', pid=self.dead_pid(), pid_created=12345,
+                            child_pid=child.pid, child_created=common.process_created(child.pid))
+        self.assertEqual(jobs.job_status(jid), 'orphaned')  # readable: certainly alive
+        with unreadable_identity(child.pid):
+            self.assertEqual(jobs.job_status(jid), 'unknown')
+            self.assertEqual(jobs.running_count('claude'), 1)
+
+    def test_stop_refuses_to_kill_an_unreadable_identity(self):
+        jid, child = self.stamped_job('20261008-000001-claude-aaaa')
+        with unreadable_identity(child.pid), mock.patch.object(common, 'kill_tree') as kill:
+            rc, out, _ = self.cli('stop', jid, '--json')
+        self.assertEqual(rc, common.EXIT_FAILED)
+        data = json.loads(out)
+        self.assertEqual((data['status'], data['identity_unknown_pids']), ('unknown', [child.pid]))
+        kill.assert_not_called()
+        self.assertIsNone(child.poll())
+        self.assertIsNone(common.read_json(os.path.join(common.JOBS, jid, 'result.json')), 'no false stopped receipt')
+
+    # ---- a crash between survivor.json and the receipt
+
+    def _crashed_runner_with_survivor(self, jid, created):
+        """Survivor.json written, the runner then died before any receipt: the engine (a real sleeping
+        process) is still alive. `created` None is a survivor recorded without a stamp. -> (jid, engine process)"""
+        child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        stamp = common.process_created(child.pid) if created else None
+        jid = self.fake_job(jid, pid=self.dead_pid(), pid_created=12345)  # runner gone; no child_pid in status
+        common.write_json(os.path.join(common.JOBS, jid, jobs.SURVIVOR),
+                          {'engine': 'claude', 'pid': child.pid, 'created': stamp, 'why': 'test'})
+        return jid, child
+
+    def test_survivor_without_a_receipt_is_not_lost_and_holds_its_slot(self):
+        for created, expected in ((True, 'orphaned'), (False, 'unknown')):
+            with self.subTest(stamped=created):
+                self.fresh_jobs()
+                jid, child = self._crashed_runner_with_survivor('20261008-000001-claude-aaaa', created)
+                self.assertEqual(jobs.job_status(jid), expected)
+                self.assertEqual([j['status'] for j in jobs.list_jobs()], [expected])
+                self.assertEqual((jobs.running_count('claude'), jobs.running_count('codex')), (1, 0))
+                mine = self.fake_job('20261008-000002-claude-bbbb', status='queued', pid=os.getpid())
+                self.assertFalse(jobs.try_acquire_slot(mine, 'claude', 1, max_parallel=1))
+                self.assertIsNotNone(jobs._continue_blocked(jid))
+                child.kill()
+                child.wait()
+                self.assertEqual(jobs.job_status(jid), 'lost')  # the survivor is gone: nothing left to protect
+                self.assertEqual(jobs.running_count('claude'), 0)
+
+    def test_stop_refuses_to_write_stopped_over_a_stampless_survivor_without_a_receipt(self):
+        jid, child = self._crashed_runner_with_survivor('20261008-000001-claude-aaaa', created=False)
+        with mock.patch.object(common, 'kill_tree') as kill:
+            rc, out, _ = self.cli('stop', jid, '--json')
+        self.assertEqual(rc, common.EXIT_FAILED)
+        data = json.loads(out)
+        self.assertEqual((data['status'], data['identity_unknown_pids']), ('unknown', [child.pid]))
+        kill.assert_not_called()
+        self.assertIsNone(child.poll())
+        self.assertIsNone(common.read_json(os.path.join(common.JOBS, jid, 'result.json')), 'no false stopped receipt')
+
+    def test_wait_does_not_return_early_on_unknown(self):
+        jid, child = self.stamped_job('20261008-000001-claude-aaaa')
+        other = self.fake_job('20261008-000002-claude-bbbb', pid=os.getpid())
+        with unreadable_identity(child.pid):
+            for extra in ((), ('--any',)):
+                with self.subTest(extra=extra):
+                    rc, out, _ = self.cli('wait', jid, other, *extra, '--timeout', '0.3', '--json')
+                    self.assertEqual(rc, common.EXIT_RUNNING)
+                    data = json.loads(out)
+                    self.assertEqual((data['timed_out'], data['finished'], data['jobs'][jid]), (True, [], 'unknown'))
+
     def test_stop_keeps_an_existing_receipt(self):
         receipt = {'status': 'done', 'final_text': 'kept'}
         jid = self.fake_job('20261008-000010-claude-done', pid=self.dead_pid(), result=receipt)
@@ -1722,10 +2235,12 @@ class EndToEndBackground(JobsBase):
         self.assertIn(ARABIC, r['final_text'])
         st = common.read_json(os.path.join(common.JOBS, jid, 'status.json'))
         self.assertNotEqual(st['pid'], os.getpid())  # the detached runner did the work
-        info = common.job_info()
-        if common.IS_WIN and info['in_job'] and info['breakaway_ok'] is False:
-            # Inside a job that forbids breakaway (a desktop app's shell): WMI started it, with our env.
-            self.assertEqual(common.read_json(os.path.join(common.JOBS, jid, 'job.json'))['detach']['mode'], 'wmi')
+        mode = common.read_json(os.path.join(common.JOBS, jid, 'job.json'))['detach']['mode']
+        if common.IS_WIN:
+            # Every Windows background launch uses WMI, including a caller outside job objects.
+            self.assertEqual(mode, 'wmi')
+        else:
+            self.assertEqual(mode, 'posix')
         self.assertFalse(os.path.exists(os.path.join(common.JOBS, jid, 'runner.env.json')))
         self.assertEqual(self.read_json_file(self.argv_out)['anthropic_env'], [])
         rows = {j['id']: j for j in jobs.list_jobs()}
@@ -2011,7 +2526,7 @@ class UsageReceipts(JobsBase):
         self.assertEqual(self.state_files(), ['claude-usage.json', 'meter.json'])
 
     def test_queued_cache_writes_never_outlast_the_deadline_on_a_busy_lock(self):
-        # rv3 finding: with the cache lock held, a 50 ms budget took 356 ms, because the queued writes waited
+        # with the cache lock held, a 50 ms budget took 356 ms, because the queued writes waited
         # for the lock AFTER the reader returned. Each write now waits only for the time left, or is dropped.
         release = threading.Event()
         release.set()
@@ -2039,6 +2554,151 @@ class UsageReceipts(JobsBase):
         finally:
             hold.set()
             t.join(5)
+
+    # --- the after-job bound covers the cache WRITE too, not just the lock (slow write, sharing violations)
+
+    @staticmethod
+    def cache_writer_done():
+        for t in [t for t in threading.enumerate() if t.name == 'twinlane-after-meter-cache']:
+            t.join(15)
+        return not any(t.name == 'twinlane-after-meter-cache' for t in threading.enumerate())
+
+    def cache_bytes(self):
+        out = {}
+        for n in self.state_files():
+            with open(os.path.join(common.STATE, n), 'rb') as h:
+                out[n] = h.read()
+        return out
+
+    def plant_old_cache(self, existing):
+        for n in self.state_files():
+            os.remove(os.path.join(common.STATE, n))
+        if existing:
+            common.write_json(os.path.join(common.STATE, 'meter.json'), usage_meter(claude=(77.0, 77.0), at=-3000))
+            common.write_json(os.path.join(common.STATE, 'claude-usage.json'),
+                              {'reading_at': common.iso(common.now() - dt.timedelta(hours=2)), 'source': 'old',
+                               'windows': [], 'extra_usage_enabled': False})
+        return self.cache_bytes()
+
+    def test_a_slow_cache_write_does_not_extend_the_after_meter_bound(self):
+        # with a 30 ms budget and a 180 ms write the call returned after ~181 ms, timed_out False.
+        real_write = common.write_json
+        budget, delay = 0.4, 1.5
+        for existing in (False, True):
+            with self.subTest(existing_cache=existing):
+                old = self.plant_old_cache(existing)
+                release = threading.Event()
+                release.set()
+                p1, p2 = self.real_meter_with_fake_readers(release)
+
+                def slow_write(path, data, deadline=None):
+                    time.sleep(delay)
+                    return real_write(path, data, deadline=deadline)
+
+                notes = []
+                with p1, p2, mock.patch.object(common, 'write_json', slow_write):
+                    t0 = time.monotonic()
+                    m, timed_out = jobs._bounded_after_meter(common.load_policy(), budget, notes)
+                    took = time.monotonic() - t0
+                    self.assertLess(took, budget + 0.25)
+                    self.assertFalse(timed_out)                       # the reading itself arrived in time
+                    self.assertEqual(m['codex']['max_pct'], 20.0)
+                    self.assertEqual(notes, ['meter cache write still pending at the deadline'])
+                    self.assertTrue(self.cache_writer_done())         # the late writer finishes after the deadline...
+                self.assertEqual(self.cache_bytes(), old)             # ...and changed nothing: old file or no file
+                self.assertEqual([n for n in os.listdir(common.STATE) if n.startswith('.tmp-')], [])
+
+    def test_windows_sharing_violations_on_the_cache_replace_are_bounded_by_the_deadline(self):
+        budget = 0.4
+        for existing in (False, True):
+            with self.subTest(existing_cache=existing):
+                old = self.plant_old_cache(existing)
+                release = threading.Event()
+                release.set()
+                p1, p2 = self.real_meter_with_fake_readers(release)
+                attempts = []
+
+                def busy(src, dst):
+                    attempts.append(time.monotonic())
+                    raise PermissionError(13, 'sharing violation')
+
+                notes = []
+                with p1, p2, mock.patch('os.replace', busy):
+                    t0 = time.monotonic()
+                    m, timed_out = jobs._bounded_after_meter(common.load_policy(), budget, notes)
+                    took = time.monotonic() - t0
+                    self.assertLess(took, budget + 0.25)              # 20 retries used to sleep ~10 s
+                    self.assertFalse(timed_out)
+                    self.assertEqual(notes, ['meter cache write still pending at the deadline'])
+                    self.assertTrue(self.cache_writer_done())
+                    self.assertTrue(attempts)                         # it did try, and stopped trying at the deadline
+                    self.assertLess(max(attempts) - t0, budget + 0.05)
+                self.assertEqual(self.cache_bytes(), old)
+                self.assertEqual([n for n in os.listdir(common.STATE) if n.startswith('.tmp-')], [])
+
+    def test_a_replace_started_before_the_deadline_lands_late_and_the_note_says_pending(self):
+        # A replace begun before the deadline finished after it, while the note said
+        # The cache was not updated. The note now says pending, and the late file is the complete new one.
+        budget = 0.4
+        old = self.plant_old_cache(True)
+        release = threading.Event()
+        release.set()
+        p1, p2 = self.real_meter_with_fake_readers(release)
+        real_replace = os.replace
+
+        def slow(src, dst):
+            time.sleep(budget + 0.3)          # starts inside the budget, finishes well after it
+            real_replace(src, dst)
+
+        notes = []
+        with p1, p2, mock.patch('os.replace', slow):
+            t0 = time.monotonic()
+            m, timed_out = jobs._bounded_after_meter(common.load_policy(), budget, notes)
+            self.assertLess(time.monotonic() - t0, budget + 0.25)
+            self.assertFalse(timed_out)
+            self.assertEqual(notes, [jobs.CACHE_DEADLINE_NOTE])
+            self.assertIn('pending', jobs.CACHE_DEADLINE_NOTE)
+            self.assertTrue(self.cache_writer_done())
+        now = self.cache_bytes()
+        self.assertNotEqual(now, old)                      # the late replace did land
+        for blob in now.values():
+            json.loads(blob)                               # and every cache file is complete JSON
+        self.assertEqual([n for n in os.listdir(common.STATE) if n.startswith('.tmp-')], [])
+
+    def test_a_transient_sharing_violation_inside_the_deadline_still_writes_the_complete_cache(self):
+        self.plant_old_cache(False)
+        release = threading.Event()
+        release.set()
+        p1, p2 = self.real_meter_with_fake_readers(release)
+        real_replace, fails = os.replace, {}
+
+        def flaky(src, dst):
+            fails[dst] = fails.get(dst, 0) + 1
+            if fails[dst] <= 2:
+                raise PermissionError(13, 'sharing violation')
+            return real_replace(src, dst)
+
+        notes = []
+        with p1, p2, mock.patch('os.replace', flaky):
+            m, timed_out = jobs._bounded_after_meter(common.load_policy(), 5, notes)
+        self.assertEqual((timed_out, notes), (False, []))
+        self.assertEqual(self.state_files(), ['claude-usage.json', 'meter.json'])
+        self.assertEqual(common.read_json(os.path.join(common.STATE, 'meter.json'))['codex']['max_pct'], 20.0)
+
+    def test_a_skipped_cache_write_is_noted_in_the_receipt_and_never_loses_it(self):
+        self.two_phase(lambda: usage_meter(at=-5), lambda: usage_meter(claude=(11.0, 40.0)))
+
+        def bounded(policy, timeout_s, notes=None):
+            notes.append(jobs.CACHE_DEADLINE_NOTE)
+            return usage_meter(claude=(11.0, 40.0)), False
+
+        with mock.patch.object(jobs, '_bounded_after_meter', bounded):
+            r, out = self.run_claude()
+        self.assertEqual(r['status'], 'done')
+        self.assertEqual(r['usage']['claude']['delta']['five_hour'], 1.0)   # the reading is in the receipt anyway
+        self.assertEqual(r['usage']['cache_note'], 'meter cache write still pending at the deadline')
+        self.assertIn('meter cache write still pending at the deadline', r['notes'])
+        self.assertIn('meter cache write still pending at the deadline', out)
 
     def test_an_in_deadline_reader_that_began_before_a_newer_reading_does_not_overwrite_it(self):
         from twinlane import meter as meter_mod
@@ -2097,6 +2757,23 @@ class UsageReceipts(JobsBase):
             out, cut = jobs._overlapping_jobs('me', end - dt.timedelta(seconds=10), end)
         self.assertEqual((out, cut), ({}, False))
         self.assertEqual(reads, [])
+
+    def test_a_job_whose_runner_identity_is_unreadable_still_overlaps(self):
+        # `unknown` is a live job, so the usage delta of a job beside it is approximate.
+        end = common.now()
+        child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        jid = '20200101-000000-codex-unk'
+        d = os.path.join(common.JOBS, jid)
+        os.makedirs(d)
+        common.write_json(os.path.join(d, 'job.json'), {'id': jid, 'primary': {'engine': 'codex'}})
+        common.write_json(os.path.join(d, 'status.json'), {
+            'status': 'running', 'pid': child.pid, 'pid_created': common.process_created(child.pid),
+            'engine': 'codex', 'started_at': common.iso(end - dt.timedelta(seconds=60))})
+        with unreadable_identity(child.pid):
+            out, cut = jobs._overlapping_jobs('me', end - dt.timedelta(seconds=10), end)
+        self.assertEqual((out, cut), ({'codex': [jid]}, False))
 
     def test_a_cut_short_overlap_scan_is_labelled_approximate(self):
         self.two_phase(lambda: usage_meter(at=-5), lambda: usage_meter(claude=(11.0, 40.0)))
@@ -2304,7 +2981,8 @@ class AutoRefreshPlanning(JobsBase):
         m = meter_with()
         m['claude'].update(status='unknown', max_pct=None, windows=[],
                            token_expired_at=common.iso(common.now() - dt.timedelta(minutes=5)))
-        with mock.patch.object(jobs, '_meter', lambda policy, fresh=False, auto_refresh=True: m):
+        # The refresh is a model call: it runs only when the last recorded reading shows extra usage OFF.
+        with mock.patch.object(jobs, '_meter', lambda policy, fresh=False, auto_refresh=True: m),                 mock.patch('twinlane.meter.refresh_blocker', return_value=None):
             rc, out, err = self.cli('run', '--brief', self.brief, '--cd', self.work, '--dry-run', '--json')
         self.assertEqual(rc, 0, out + err)
         text = json.dumps(json.loads(out))
@@ -2326,6 +3004,95 @@ class AutoRefreshPlanning(JobsBase):
             jobs.plan_failover(dict(spec, profile='intel'), {'engine': 'claude'}, POLICY)   # other = codex
             jobs.plan_failover(dict(spec, profile='intel'), {'engine': 'codex'}, POLICY)    # other = claude
         self.assertEqual(seen, [True, False, False, True])
+
+
+class CodexCreditAdmission(JobsBase):
+    """Twinlane refuses Codex paid credits itself, for every model, and does not trust the transport's flag."""
+
+    SPEC = {'kind': 'sweep', 'urgent': False}
+
+    def params(self, tier='luna', model=None):
+        return jobs.engine_params('codex', 'sweep', {}, POLICY, 'intel', model=model, tier=tier)
+
+    def pre(self, meter, params, policy=None):
+        jobs._read_meter = lambda p: meter
+        return jobs.preflight(self.SPEC, params, policy or POLICY, False)[0]
+
+    def meter_codex(self, **over):
+        m = meter_with()
+        m['codex'].update(over)
+        return m
+
+    def test_on_credits_refuses_every_model_luna_included(self):
+        for tier, model in (('luna', None), ('sol', None), ('sol-high', None), ('astra', None),
+                            ('sol-high', 'gpt-6-luna')):
+            why = self.pre(self.meter_codex(on_credits=True), self.params(tier, model))
+            self.assertIn('paid credits', why or '', (tier, model))
+            self.assertIn('codex.allow_credits', why)  # says how the user can OK it
+
+    def test_past_included_usage_refuses_like_credits(self):
+        for over in ({'ordinary_usage_allowed': False}, {'limit_reached_type': 'weekly'},
+                     {'spend_control_reached': True}):
+            self.assertIn('paid credits', self.pre(self.meter_codex(**over), self.params('luna')) or '', over)
+
+    def test_unknown_reading_refuses_every_model(self):
+        for tier in ('luna', 'sol-high'):
+            # No age: twinlane's own check refuses. A reading marked unknown is stopped by the route (not usable)
+            # first, and by the credit check too if the route were wrong.
+            self.assertIn('reading is unknown', self.pre(self.meter_codex(age_s=None), self.params(tier)) or '')
+            self.assertIn('unknown', self.pre(self.meter_codex(status='unknown'), self.params(tier)) or '')
+            self.assertIn('reading is unknown', jobs.codex_credit_refusal(self.meter_codex(status='unknown'),
+                                                                          self.params(tier), POLICY) or '')
+
+    def test_the_effective_model_is_judged_not_the_tier(self):
+        # A review probe: a 600 s old reading refused tier=luna but accepted tier=sol-high + model=gpt-6-luna.
+        old = self.meter_codex(age_s=600)
+        for p in (self.params('luna'), self.params('sol-high', 'gpt-6-luna'), self.params('sol-high')):
+            self.assertIn('600s old', self.pre(old, p) or '')
+        self.assertEqual(jobs.codex_model(self.params('sol-high', 'gpt-6-luna')), 'gpt-6-luna')
+        self.assertIn('gpt-6-luna', self.pre(old, self.params('sol-high', 'gpt-6-luna')))
+        self.assertEqual(jobs.codex_model(self.params('astra')), 'gpt-6-astra')
+
+    def test_explicit_credits_ok_passes(self):
+        # The one existing switch: policy.codex.allow_credits (the user's OK); it is also what adds --allow-credits.
+        lenient = json.loads(json.dumps(POLICY))
+        lenient['codex']['allow_credits'] = True
+        self.assertIsNone(self.pre(self.meter_codex(on_credits=True, age_s=900), self.params('sol-high', 'gpt-6-luna'),
+                                   lenient))
+
+    def test_included_usage_and_a_fresh_reading_pass(self):
+        for tier, model in (('luna', None), ('sol', None), ('sol-high', 'gpt-6-luna'), ('astra', None)):
+            self.assertIsNone(self.pre(self.meter_codex(), self.params(tier, model)), (tier, model))
+
+    def test_a_refused_codex_job_starts_nothing(self):
+        self.meter = self.meter_codex(on_credits=True)
+        rc, _, _ = self.cli('run', '--brief', self.brief, '--cd', self.work, '--kind', 'sweep', '--engine', 'codex',
+                            '--tier', 'sol-high', '--model', 'gpt-6-luna')
+        self.assertEqual(rc, common.EXIT_REFUSED)
+        r = self.receipt(self.only_job())
+        self.assertEqual(r['status'], 'refused')
+        self.assertIn('gpt-6-luna would spend them', r['attempts'][0]['error'])
+        self.assertFalse(os.path.exists(self.codex_argv_out))
+
+    def test_failover_from_claude_passes_the_same_checks(self):
+        os.environ['FAKE_LIMIT'] = '1'
+        self.meter = self.meter_codex(on_credits=True)
+        rc, _, _ = self.cli('run', '--brief', self.brief, '--cd', self.work, '--kind', 'intel')
+        r = self.receipt(self.only_job())
+        self.assertEqual([a['status'] for a in r['attempts']], ['limit_hit', 'refused'])
+        self.assertEqual(r['attempts'][1]['engine'], 'codex')
+        self.assertIn('paid credits', r['attempts'][1]['error'])
+        self.assertFalse(os.path.exists(self.codex_argv_out))  # the transport was never started
+        self.assertNotEqual(rc, 0)
+
+    def test_failover_with_an_unknown_codex_reading_is_refused(self):
+        os.environ['FAKE_LIMIT'] = '1'
+        self.meter = self.meter_codex(age_s=None)
+        self.cli('run', '--brief', self.brief, '--cd', self.work, '--kind', 'intel')
+        r = self.receipt(self.only_job())
+        self.assertEqual([a['status'] for a in r['attempts']], ['limit_hit', 'refused'])
+        self.assertIn('reading is unknown', r['attempts'][1]['error'])
+        self.assertFalse(os.path.exists(self.codex_argv_out))
 
 
 if __name__ == '__main__':

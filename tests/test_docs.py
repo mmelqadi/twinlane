@@ -60,6 +60,34 @@ class DocumentedBoundaries(unittest.TestCase):
                        'TWINLANE_CODEX_BIN', 'at most 3 copies'):
             self.assertIn(phrase.lower(), limits.lower())
 
+    def test_restart_survival_is_not_overclaimed(self):
+        readme, limits, changes = doc('README.md'), doc('LIMITS.md'), doc('CHANGELOG.md')
+        for body in (readme, limits, changes):
+            self.assertIn('not a general guarantee', body)
+        self.assertIn('Sign-out, shutdown, sleep and reboot were not tested', readme)
+        self.assertIn('`detach=wmi`', readme)
+        self.assertIn('`--bg` is refused (exit 3)', readme)
+        for body in (readme, limits, changes):
+            self.assertNotIn('always survive', body.lower())
+            self.assertNotIn('guaranteed to survive', body.lower())
+
+    def test_guard_and_credit_limits_are_stated(self):
+        readme, limits, design = doc('README.md'), doc('LIMITS.md'), doc('DESIGN.md')
+        for body in (readme, limits, design):
+            self.assertIn('not a sandbox', body)
+        self.assertIn('a command obfuscated in a way it does not model can still pass', readme)
+        self.assertIn('it exits 2', design)
+        self.assertIn('Nothing in twinlane stops a running Codex job that crosses into credits partway', limits)
+        self.assertIn('There is no per-job credits flag', readme)
+        self.assertIn('never their values', readme)
+
+    def test_liveness_and_batons(self):
+        readme = doc('README.md')
+        self.assertIn('never `lost`', readme)
+        self.assertIn('survivor.json', readme)
+        self.assertIn('exact count', readme)
+        self.assertIn('never its `owner`', readme)
+
     def test_config_and_install_preview(self):
         readme = doc('README.md')
         self.assertIn('twinlane install --yes', readme)

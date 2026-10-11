@@ -116,9 +116,17 @@ class CodeProfile(unittest.TestCase):
 
     @unittest.skipUnless(os.name == 'nt', 'cmd switches only exist on Windows')
     def test_cmd_switches_inside_the_windows_worktree_are_not_paths(self):
-        for cmd in ('del /Q build\\x.txt', 'rmdir /S /Q build', 'robocopy src dst /MIR', 'xcopy src dst /E /I'):
+        for cmd in ('del /Q build\\x.txt', 'rmdir /S /Q build', 'robocopy src dst /MIR', 'xcopy src dst /E /I',
+                    'del /F /Q build', 'move /Y a.txt b.txt', 'copy /Y a.txt b.txt', 'rd /s /q build'):
             self.assertIsNone(guard.evaluate('Bash', bash(cmd), 'code', WT, ALLOW), cmd)
         self.assertIsNotNone(guard.evaluate('Bash', bash('rm -f /c/other/a.py'), 'code', WT, ALLOW))
+
+    def test_a_root_path_given_to_a_powershell_alias_is_not_a_cmd_switch(self):
+        # In PowerShell del/move/copy/rd/erase are Remove-Item/Move-Item/Copy-Item and /outside is a root path.
+        for cmd in ('del -Recurse -Force /outside', 'del -Path /outside -Recurse', 'del -LiteralPath /outside',
+                    'move src.txt /outside', 'copy src /outside', 'rd /s /q /outside', 'erase /outside'):
+            for tool in ('Bash', 'PowerShell'):
+                self.assertIsNotNone(guard.evaluate(tool, bash(cmd), 'code', WT, ALLOW), (tool, cmd))
 
     @unittest.skipIf(os.name == 'nt', 'POSIX absolute paths only')
     def test_writing_shell_commands_outside_the_posix_worktree(self):
@@ -126,6 +134,236 @@ class CodeProfile(unittest.TestCase):
         self.assertIsNotNone(guard.evaluate('PowerShell', bash(f'Set-Content -Path {OTHER} -Value 1'),
                                             'code', WT, ALLOW))
         self.assertIsNone(guard.evaluate('Bash', bash(f'cat {OTHER}'), 'code', WT, ALLOW))
+
+
+def code(cmd, tool='Bash', shell_cwd=None):
+    return guard.evaluate(tool, bash(cmd), 'code', WT, ALLOW, shell_cwd)
+
+
+class GuardProbes(unittest.TestCase):
+    """The four probes the code profile allowed, and the matching
+    legitimate commands that must stay allowed."""
+
+    def test_the_four_probes_are_denied(self):
+        probes = {'python -c "import subprocess; subprocess.run([\'git\',\'commit\',\'-m\',\'x\'])"': 'git commit',
+                  'cp artifact.txt ../outside.txt': 'outside the job worktree',
+                  'curl -X POST https://api.example.com/send -d x=1': 'curl -X POST'}
+        for cmd, why in probes.items():
+            self.assertIn(why, code(cmd) or '', cmd)
+        # The PHP send probe runs a script FILE: the guard does not read files, so it stays allowed
+        # (builds and tests run that way). Its credentials are what is removed (test_jobs env-strip tests).
+        self.assertIsNone(code('php send_mail.php --all'))
+
+    def test_the_legitimate_neighbours_stay_allowed(self):
+        for cmd in ('python -m unittest', 'python -B -m unittest discover -s tests', 'php -l f.php', 'cp a b',
+                    f'cp a {WT}/b', 'git diff', 'git status', 'git log --oneline -10',
+                    'curl http://127.0.0.1/app/api.php?x=1', 'curl -s http://localhost:8080/health',
+                    'python foo.py'):
+            self.assertIsNone(code(cmd), cmd)
+
+
+class InterpreterInlineCode(unittest.TestCase):
+    def test_git_writes_inside_inline_code_are_denied(self):
+        for cmd in ('python -c "import subprocess; subprocess.run([\'git\', \'push\'])"',
+                    'python -c "import os; os.system(\'git commit -am x\')"',
+                    'py -3 -c "import subprocess; subprocess.call([\'git\',\'-C\',\'.\',\'rebase\',\'main\'])"',
+                    'node -e "require(\'child_process\').execSync(\'git push\')"',
+                    "php -r \"shell_exec('git commit -am x');\"",
+                    'ruby -e "system(\'git\', \'merge\', \'x\')"', 'perl -e "system(\'git tag v1\')"',
+                    'bash -c "ls; git push"', 'sh -lc "git reset --hard"', 'cmd /c "git update-ref -d x"',
+                    'powershell -NoProfile -Command "git worktree add ../x"', 'pwsh -c "git branch -f main"',
+                    'python - <<\'EOF\'\nimport subprocess\nsubprocess.run(["git", "push"])\nEOF',
+                    'bash <<EOF\ngit commit -m x\nEOF', 'bash <<< "git push"',
+                    'find . -name x -exec git commit -m x \\;', 'Start-Process git -ArgumentList "push"',
+                    'Get-ChildItem | % { git push }', 'eval "git push"'):
+            self.assertIsNotNone(code(cmd), cmd)
+
+    def test_unreadable_code_is_denied(self):
+        for cmd in ('cat x.sh | bash', 'echo "git push" | sh', 'Get-Content x.py | python -',
+                    'powershell -EncodedCommand SQBFAFgA', 'pwsh -enc SQBFAFgA', 'eval "$CMD"',
+                    'python -c "import base64; exec(base64.b64decode(\'eA==\'))"', '$(echo git) push',
+                    '`echo git` push', '& $exe commit'):
+            self.assertIsNotNone(code(cmd), cmd)
+
+    def test_ordinary_inline_code_and_scripts_stay_allowed(self):
+        for cmd in ('python -c "import sys; print(sys.version)"', 'node -e "console.log(1)"', 'php -r "echo 1;"',
+                    'python - <<\'EOF\'\nimport json\nprint(json.load(open("policy.json"))["claude"])\nEOF',
+                    'cat > t.py <<\'EOF\'\nos.system("git commit")\nEOF',  # a heredoc into a file is data
+                    'git diff | python -m json.tool', 'perl -pe "s/a/b/" a.txt', 'bash build.sh',
+                    'powershell -NoProfile -File build.ps1', 'powershell -NoProfile -Command "Get-ChildItem"',
+                    'Get-ChildItem | % { $_.Name }', 'npm test; $LASTEXITCODE', '$r = git status',
+                    'grep -rn "git commit" .', 'rg "curl -X POST" tests'):
+            self.assertIsNone(code(cmd), cmd)
+
+
+class GitWrites(unittest.TestCase):
+    def test_denied(self):
+        for cmd in ('git tag v1', 'git tag -a v1 -m x', 'git worktree add ../x', 'git branch -f main HEAD~1',
+                    'git reset HEAD~1', 'git reset', 'git pull', 'git revert HEAD', 'git checkout -B main',
+                    'git -c alias.ci=commit ci -m x', 'git -c core.pager=sh log', 'git symbolic-ref HEAD x',
+                    'git config alias.ci commit', 'git config core.hooksPath hooks', 'git config --global a.b c',
+                    'git config set a.b c', 'git config --unset a.b', 'git submodule foreach "git push"',
+                    'git send-pack origin main', 'git http-push x', 'git imap-send', 'git notes add -m x',
+                    'git replace a b', 'git svn dcommit', 'git p4 submit', 'git fetch --upload-pack=x origin',
+                    'git ls-remote --upload-pack x origin', 'git -c protocol.ext.allow=always fetch x',
+                    'git -c core.gitproxy=x fetch'):
+            for profile in ('intel', 'code'):
+                self.assertIsNotNone(guard.evaluate('Bash', bash(cmd), profile, WT, ALLOW), (profile, cmd))
+
+    def test_allowed(self):
+        for cmd in ('git tag --list', 'git tag', 'git add a.py', 'git restore --staged a.py', 'git fetch',
+                    'git checkout -- a.py', 'git -c color.ui=never log -3', 'git config user.name',
+                    'git config --get user.name', 'git config --list', 'git config get user.name',
+                    'git notes list', 'git notes show HEAD', 'git submodule status'):
+            self.assertIsNone(code(cmd), cmd)
+
+
+class RelativePathEscapes(unittest.TestCase):
+    def test_denied(self):
+        for cmd in ('cp a.txt ../outside.txt', 'echo hi > ../x.txt', 'echo hi >> ..\\x.txt', 'mkdir ~/x',
+                    'touch $HOME/x', 'touch %USERPROFILE%\\x', 'touch "$(pwd)/../x"', 'rm -rf ../task-b',
+                    'cd .. && touch x', 'cd $UNSET_DIR_X && touch x', 'pushd .. && cp a b',
+                    'Copy-Item a.txt -Destination ..\\x.txt', 'Set-Content -Path ..\\x.txt -Value 1',
+                    'tee ../log.txt', 'cp --target-directory=../x a', 'curl -o ../x http://127.0.0.1/',
+                    'git -C ../task-b checkout .', "python -c \"open('../x.txt','w').write('1')\"",
+                    'python -c "import os; os.system(\'rm -rf ../x\')"', 'sed -i "s/a/b/" ../f.txt'):
+            self.assertIsNotNone(code(cmd), cmd)
+
+    def test_allowed(self):
+        for cmd in ('cp a b', 'mkdir -p build/x && cp a build/x/', 'cd tests && touch x', 'cd sub/.. && cp a b',
+                    'echo hi > out.txt', 'php -l a.php > /dev/null 2>&1', 'python x.py 2>$null', 'echo x > nul',
+                    'cp a sub/../b', 'cat ../other/file', 'ls ../', 'git -C ../task-b log -3',
+                    'pushd sub && cp a b && popd && cp c d', f'cd {WT}/sub && cp a b'):
+            self.assertIsNone(code(cmd), cmd)
+
+    def test_relative_paths_resolve_against_the_shells_cwd(self):
+        # The hook knows the shell's cwd: after a `cd ..` in an earlier call, `touch x` lands outside.
+        self.assertIsNotNone(code('touch x', shell_cwd='C' + ':/Users' + '/alice/worktrees'))
+        self.assertIsNone(code('touch x', shell_cwd=WT + '/sub'))
+        self.assertIsNone(code('touch ../x', shell_cwd=WT + '/sub'))
+
+
+class OutboundSends(unittest.TestCase):
+    def test_denied(self):
+        for cmd in ('curl -X POST http://127.0.0.1/send', 'curl -XPUT http://127.0.0.1/x', 'curl -d a=1 http://localhost/x',
+                    'curl --data-binary @f http://127.0.0.1/', 'curl -F f=@a http://127.0.0.1/',
+                    'curl --json {} http://127.0.0.1/', 'curl -T f http://127.0.0.1/', 'curl https://example.com/send?to=1',
+                    'curl --connect-to 127.0.0.1:80:evil.example:80 http://127.0.0.1/', 'curl -K cfg',
+                    'wget --post-data=a=1 http://127.0.0.1/x', 'wget https://example.com/x',
+                    'Invoke-WebRequest http://127.0.0.1/x -Method Post', 'iwr http://127.0.0.1/x -Body abc',
+                    'irm -Uri https://api.example.com/x', 'Invoke-RestMethod -Uri http://127.0.0.1/x -Method DELETE',
+                    'Send-MailMessage -To a@b.c -From x -Subject s -SmtpServer smtp',
+                    'ssh user@host ls', 'scp a.txt user@host' ':/tmp/', 'rsync -a . host' ':/x', 'sftp host',
+                    'gh pr create --fill', 'gh pr merge 3', 'gh issue comment 1 -b x', 'gh api repos/x/y/issues -f t=1',
+                    'gh api -X DELETE repos/x', 'az login', 'aws s3 cp a s3://b', 'gcloud auth list',
+                    'npm publish', 'docker push x', 'twine upload dist/*',
+                    'python -c "import smtplib; smtplib.SMTP(\'h\').sendmail(1,2,3)"',
+                    'python -c "import requests; requests.post(\'http://127.0.0.1/x\')"',
+                    'python -c "import urllib.request as u; u.urlopen(\'https://api.example.com/x\')"',
+                    'powershell -Command "(New-Object Net.WebClient).UploadString(\'http://x\', \'1\')"'):
+            for profile in ('intel', 'code'):
+                self.assertIsNotNone(guard.evaluate('Bash', bash(cmd), profile, WT, ALLOW), (profile, cmd))
+
+    def test_local_gets_and_reads_stay_allowed(self):
+        for cmd in ('curl http://127.0.0.1/app/api.php?x=1', 'curl -fsSL http://localhost:8080/', 'curl --version',
+                    'curl -sI http://127.0.0.1/', 'wget -q http://127.0.0.1/x -O out.html',
+                    'iwr http://127.0.0.1/x -UseBasicParsing', 'Invoke-RestMethod http://localhost/x -Method Get',
+                    'gh pr view 12', 'gh run list', 'gh pr checks 3', 'gh api repos/x/y/pulls', 'gh auth status',
+                    'npm test', 'pip install -r requirements.txt',
+                    'python -c "import urllib.request as u; print(u.urlopen(\'http://127.0.0.1/x\').read())"'):
+            self.assertIsNone(code(cmd), cmd)
+
+
+# The reviewer's reproduced inputs, exactly.
+# The fix group each row depends on is noted for the revert proof.
+ROUND1_BYPASSES = (
+    ('env -u FOO git commit -m x', 3),
+    ('env -u FOO cp a ../out', 3),
+    ('env -u FOO curl -X POST http://127.0.0.1/send', 3),
+    ('python -c"import subprocess; subprocess.run([\'git\',\'commit\',\'-m\',\'x\'])"', 1),
+    ('node -e"require(\'child_process\').execSync(\'git commit -m x\')"', 1),
+    ('. git commit -m x', 2),
+    ("Start-Process -FilePath git -ArgumentList @('commit','-m','x')", 2),
+    ('git -calias.save=commit save -m x', 4),
+    ('GIT_DIR=C' + ':/Users' + '/alice/.twinlane/.git git add .', 4),
+    ('git diff --output=../out', 5),
+    ('curl http://127.0.0.1/a -o../out', 5),
+    ('python -c "open(\'../out\',mode=\'w\').write(\'x\')"', 5),
+    ('gh api repos/owner/repo/issues -ftitle=x', 6),
+    ('python -c "import http.client; c=http.client.HTTPSConnection(\'example.invalid\'); '
+     'c.request(\'POST\',\'/send\',\'x=1\')"', 6),
+    ('git stash push', 4),
+    ('git stash clear', 4),
+)
+# The two benign commands a review found denied, then the 19 normal forms it checked.
+ROUND1_ALLOWED = (
+    'cp ../template.txt ./copy.txt', 'python -c "print(\'https://example.invalid\')"',
+    'python -m unittest', 'python -B -m unittest discover -s tests', 'php -l helpers/a.php',
+    'vendor/bin/phpstan analyse helpers', 'npm test', 'git status', 'git diff', 'git log --oneline -10',
+    'git show HEAD', 'git add a.py', 'rg -n foo helpers/', 'grep -rn foo .', 'cp a.txt b.txt', 'mv a.txt b.txt',
+    'curl -s http://127.0.0.1/app/api.php?x=1', 'mkdir -p build/x', 'pytest -q', 'Get-Content a.txt',
+    'echo hi > out.txt',
+)
+
+
+class ReviewRound1Inputs(unittest.TestCase):
+    def test_the_reviewers_bypass_inputs_are_denied(self):
+        for cmd, _fix in ROUND1_BYPASSES:
+            self.assertIsNotNone(code(cmd), cmd)
+
+    def test_the_false_positives_and_normal_commands_are_allowed(self):
+        self.assertEqual(len(ROUND1_ALLOWED), 21)
+        for cmd in ROUND1_ALLOWED:
+            self.assertIsNone(code(cmd), cmd)
+
+    def test_an_overlong_command_is_denied_unread(self):
+        cmd = 'echo ' + 'a' * guard.MAX_COMMAND_CHARS
+        for profile in ('intel', 'code'):
+            self.assertIn('too long to inspect', guard.evaluate('Bash', bash(cmd), profile, WT, ALLOW) or '')
+        self.assertIsNone(code('echo ' + 'a' * (guard.MAX_COMMAND_CHARS - 10)))
+        # Under the size cap, a command that needs more scanning than MAX_WORK is denied as too complex.
+        many = '; '.join(f'ls {i}' for i in range(3000))
+        self.assertLess(len(many), guard.MAX_COMMAND_CHARS)
+        self.assertIn('too complex to inspect', code(many) or '')
+
+
+# The reviewer's reproduced inputs, with the fix
+# group each depends on (1 an unfinished scan denies, 2 git config from the environment, 3 env -S / env -C).
+ROUND2_BYPASSES = (
+    ("python -c \"import subprocess; subprocess.run(['git'," + "'-C','.'," * 8 + "'commit','-m','x'])\"", 1),
+    ("python -c \"open('../out'," + ' ' * 310 + "'w').write('x')\"", 1),
+    ("python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1/" + 'a' * 310 +
+     "',data=b'x')\"", 1),
+    ("GIT_CONFIG_PARAMETERS=\"'alias.save=commit'\" git save -m x", 2),
+    ('GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.save GIT_CONFIG_VALUE_0=commit git save -m x', 2),
+    ('env -S "git commit -m x"', 3),
+    ('env -C .. cp a b', 3),
+)
+
+
+class ReviewRound2Inputs(unittest.TestCase):
+    def test_the_reviewers_inputs_are_denied(self):
+        for cmd, _fix in ROUND2_BYPASSES:
+            self.assertIsNotNone(code(cmd), cmd)
+
+
+# The reviewer's reproduced inputs, tagged with the fix that closes each.
+ROUND3_BYPASSES = (
+    ('env -S "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.save GIT_CONFIG_VALUE_0=commit git save -m x"', 'split'),
+    ("python - <<'EOF'\nopen('" + './' * 200 + "../out','w').write('x')\nEOF", 'long'),
+    ('sudo -D .. cp a b', 'sudo'),
+    ('sudo --chdir=.. cp a b', 'sudo'),
+)
+
+
+class ReviewRound3Inputs(unittest.TestCase):
+    def test_the_reviewers_inputs_are_denied(self):
+        for cmd, _fix in ROUND3_BYPASSES:
+            self.assertIsNotNone(code(cmd), cmd)
+
+    def test_the_same_shapes_inside_the_worktree_stay_allowed(self):
+        for cmd in ('env -S "git status"', 'sudo -D . cp a b', "python - <<'EOF'\nopen('out','w').write('x')\nEOF"):
+            self.assertIsNone(code(cmd), cmd)
 
 
 class HookProtocol(unittest.TestCase):
@@ -157,12 +395,41 @@ class HookProtocol(unittest.TestCase):
                                 {'TWINLANE_ENGINE_JOB': 'j1', 'TWINLANE_ENGINE_PROFILE': 'intel'})
         self.assertEqual((rc, out), (0, ''))
 
-    def test_garbage_input_fails_open(self):
-        with mock.patch.dict(os.environ, {'TWINLANE_ENGINE_JOB': 'j1'}):
+    def deny_reason(self, out):
+        h = json.loads(out)['hookSpecificOutput']
+        self.assertEqual(h['permissionDecision'], 'deny')
+        return h['permissionDecisionReason']
+
+    def test_garbage_input_fails_closed_inside_a_job(self):
+        # An exception inside main() used to allow the call.
+        for raw in ('not json', '[1, 2]'):
+            with mock.patch.dict(os.environ, {'TWINLANE_ENGINE_JOB': 'j1'}):
+                out = io.StringIO()
+                with redirect_stdout(out):
+                    self.assertEqual(guard.main(io.StringIO(raw)), 0)
+            self.assertIn('guard error', self.deny_reason(out.getvalue()), raw)
+
+    def test_an_internal_error_denies_inside_a_job(self):
+        payload = {'tool_name': 'Bash', 'tool_input': {'command': 'git status'}}
+        with mock.patch.object(guard, 'evaluate', side_effect=RuntimeError('boom')):
+            rc, out = self.run_main(payload, {'TWINLANE_ENGINE_JOB': 'j1', 'TWINLANE_ENGINE_PROFILE': 'code',
+                                              'TWINLANE_ENGINE_CWD': WT})
+        self.assertEqual(rc, 0)
+        self.assertIn('guard error (RuntimeError)', self.deny_reason(out))
+
+    def test_errors_stay_silent_outside_a_job(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop('TWINLANE_ENGINE_JOB', None)
             out = io.StringIO()
-            with redirect_stdout(out):
+            with redirect_stdout(out), mock.patch.object(guard, 'evaluate', side_effect=RuntimeError('boom')):
                 self.assertEqual(guard.main(io.StringIO('not json')), 0)
         self.assertEqual(out.getvalue(), '')
+
+    def test_the_shells_cwd_reaches_the_path_check(self):
+        rc, out = self.run_main({'tool_name': 'Bash', 'tool_input': {'command': 'touch x'},
+                                 'cwd': 'C' + ':/Users' + '/alice/worktrees'},
+                                {'TWINLANE_ENGINE_JOB': 'j1', 'TWINLANE_ENGINE_PROFILE': 'code', 'TWINLANE_ENGINE_CWD': WT})
+        self.assertIn('outside the job worktree', self.deny_reason(out))
 
 
 if __name__ == '__main__':

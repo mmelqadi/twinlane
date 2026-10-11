@@ -14,7 +14,7 @@
   twinlane hook                          (Claude Code UserPromptSubmit hook; reads JSON on stdin)
   twinlane guard                         (PreToolUse guard inside twinlane jobs only; reads JSON on stdin)
 
-kinds: code intel plan review (Claude first) | parallel sweep integrate verify (Codex first)
+kinds: code intel plan review (Claude first) | parallel sweep integrate verify
 Policy: packaged defaults merged with TWINLANE_CONFIG or <home>/config.json
 """
 import os
@@ -33,14 +33,19 @@ if __name__ == '__main__' and sys.argv[1:2] == ['_job']:
         except (OSError, ValueError):
             sys.exit(5)  # EXIT_FAILED: never run a job with the wrong environment
 
-from twinlane import common  # noqa: E402
+try:
+    from twinlane import common  # noqa: E402
+except BaseException:
+    if sys.argv[1:2] == ['guard'] and os.environ.get('TWINLANE_ENGINE_JOB'):
+        sys.exit(2)  # guard bootstrap cannot silently bypass enforcement on an import failure
+    raise
 
 
 def status(argv):
     from twinlane import baton, jobs, meter
     as_json = '--json' in argv
     m = meter.read(fresh='--fresh' in argv, auto_refresh=True)
-    js = [j for j in jobs.list_jobs(limit=50) if j.get('status') in ('queued', 'running', 'orphaned')]
+    js = [j for j in jobs.list_jobs(limit=50) if j.get('status') in ('queued', 'running', 'orphaned', 'unknown')]
     bs = baton.list_batons()[:10]
     if as_json:
         common.emit({'meter': m, 'running_jobs': js, 'batons': bs}, True)
@@ -54,8 +59,7 @@ def status(argv):
 
 
 def fail_open(name):
-    """Hooks run on every prompt or tool call: any failure (a bad TWINLANE_HOME, an unwritable
-    state dir, a broken module) must exit 0 silently, never block or print a traceback."""
+    """Advisory hooks fail open; a worker's enforcement guard must block on bootstrap failure too."""
     try:
         common.utf8_stdio()
         common.ensure_dirs()
@@ -64,7 +68,9 @@ def fail_open(name):
             return hook.main()
         from twinlane import guard
         return guard.main()
-    except BaseException:  # noqa: BLE001 - fail-open by contract
+    except BaseException:  # noqa: BLE001 - preserve the enforcement boundary before guard.main loads
+        if name == 'guard' and os.environ.get('TWINLANE_ENGINE_JOB'):
+            return 2  # PreToolUse blocking exit; does not depend on imports or writable stdout
         return 0
 
 

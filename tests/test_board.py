@@ -183,6 +183,89 @@ class CollectTests(BoardBase):
         self.assertIn('extra usage is ON', text)
         self.assertIn('paid credits', text)
 
+    def test_claude_held_for_unknown_extra_usage_says_why(self):
+        # The board shows the hold in the attention list, the meter view and the route reasons.
+        raw = {'source': 'oauth', 'reading_at': iso_ago(30), 'extra_usage_enabled': None,
+               'windows': [{'name': 'five_hour', 'pct': 20.0, 'resets_at': iso_in(3600)}]}
+        held = meter.finish_claude(raw, self.policy)
+        self.assertEqual(held['status'], 'unknown')
+        self.write_meter(claude=held, codex={'status': 'out', 'max_pct': 100.0})
+        data = board.collect(policy=self.policy)
+        self.assertEqual(data['meters']['claude']['hold'], 'extra usage state unknown')
+        text = ' '.join(a['text'] for a in data['attention'])
+        self.assertIn('claude UNKNOWN', text)
+        self.assertIn('extra usage state unknown', text)
+        self.assertTrue(data['meters']['routes']['code']['refused'])
+        self.assertIn('[extra usage state unknown]', data['meters']['routes']['code']['reason'])
+
+    def sonnet_stop(self):
+        """Seven_day_sonnet alone stops Claude while 5h and 7d look fine."""
+        return {'status': 'stop', 'max_pct': 90.0,
+                'windows': [{'name': 'five_hour', 'pct': 5.0, 'resets_at': iso_in(3600)},
+                            {'name': 'seven_day', 'pct': 15.0, 'resets_at': iso_in(86400 * 3)},
+                            {'name': 'seven_day_sonnet', 'pct': 90.0, 'resets_at': iso_in(86400 * 2)}]}
+
+    def test_a_window_that_controls_routing_is_shown_marked_and_named_in_the_refusal(self):
+        self.write_meter(claude=self.sonnet_stop(), codex={'status': 'out', 'max_pct': 100.0})
+        for flag in ('', '--md'):
+            with self.subTest(flag=flag):
+                rc, out = self.run_board(*([flag] if flag else []))
+                self.assertEqual(rc, 0)
+                self.assertIn('7d-sonnet 90% (resets in 1d', out)
+                self.assertEqual(out.count('[binding]'), 2)                  # one per engine
+                self.assertIn('[refused by claude stop at 7d-sonnet 90%, codex out]', out)
+                self.assertIn('claude STOP (90% in 7d-sonnet, stop at 85%)', out)
+        rc, out = self.run_board('--json')
+        m = json.loads(out)['meters']
+        wins = {w['name']: w for w in m['claude']['windows']}
+        self.assertEqual([n for n, w in wins.items() if w['binding']], ['seven_day_sonnet'])
+        self.assertEqual((wins['seven_day_sonnet']['pct'], wins['seven_day_sonnet']['recognised']), (90.0, True))
+        self.assertEqual(m['claude']['binding']['name'], 'seven_day_sonnet')
+        self.assertTrue(m['routes']['code']['refused'])
+        blockers = m['routes']['code']['blockers']
+        self.assertEqual([b['engine'] for b in blockers], ['claude', 'codex'])
+        self.assertEqual((blockers[0]['window'], blockers[0]['status'], blockers[0]['pct']), ('7d-sonnet', 'stop', 90.0))
+
+    def test_an_unrecognised_window_is_shown_with_its_label_in_text_markdown_and_json(self):
+        self.write_meter(claude={'max_pct': 28.7, 'windows': [
+            {'name': 'five_hour', 'pct': 20.0, 'resets_at': iso_in(3600)},
+            {'name': 'seven_day', 'pct': 18.0, 'resets_at': iso_in(86400 * 3)},
+            {'name': 'iguana_necktie', 'pct': 28.728186, 'resets_at': iso_in(86400 * 27)}]})
+        for flag in ('', '--md'):
+            with self.subTest(flag=flag):
+                _, out = self.run_board(*([flag] if flag else []))
+                self.assertIn('iguana_necktie (unrecognised window) 28.7% (resets in 26d', out)
+                self.assertIn('[binding]', out)
+                self.assertIn('5h 20% (resets in', out)
+        _, out = self.run_board('--json')
+        wins = {w['name']: w for w in json.loads(out)['meters']['claude']['windows']}
+        self.assertEqual((wins['iguana_necktie']['recognised'], wins['iguana_necktie']['binding'],
+                          wins['iguana_necktie']['label']), (False, True, 'iguana_necktie'))  # never renamed
+        self.assertTrue(wins['five_hour']['recognised'] and not wins['five_hour']['binding'])
+
+    def test_an_unprintable_window_name_is_not_printed_and_still_counted(self):
+        self.write_meter(claude={'max_pct': 60.0, 'windows': [
+            {'name': 'five_hour', 'pct': 20.0, 'resets_at': iso_in(3600)},
+            {'name': 'x\nINJECT', 'pct': 60.0, 'resets_at': iso_in(3600)},
+            {'name': 'z' * 41, 'pct': 10.0, 'resets_at': iso_in(3600)}]})
+        _, out = self.run_board()
+        self.assertNotIn('INJECT', out)
+        self.assertNotIn('z' * 41, out)
+        self.assertIn('(invalid window name) 60% (resets in', out)
+        self.assertEqual(out.count('(invalid window name)'), 2)
+        _, out = self.run_board('--json')
+        bad = [w for w in json.loads(out)['meters']['claude']['windows'] if w['name'] is None]
+        self.assertEqual(len(bad), 2)
+        self.assertEqual([w['binding'] for w in bad], [True, False])
+
+    def test_another_codex_limit_id_is_listed_and_counts_as_known(self):
+        self.write_meter(codex={'max_pct': 70.0, 'windows': [
+            {'name': 'weekly', 'pct': 30.0, 'resets_at': iso_in(7200)},
+            {'name': 'codex_astra:weekly', 'pct': 70.0, 'resets_at': iso_in(7200), 'limit': 'codex_astra'}]})
+        _, out = self.run_board()
+        self.assertIn('codex_astra:weekly 70% (resets in', out)
+        self.assertNotIn('codex_astra:weekly (unrecognised window)', out)   # another limit id is a known kind
+
     def test_jobs_attention_and_verdicts(self):
         self.write_meter()
         self.add_job('20261009-100000-claude-aaaa', 'running', name='live-one', started_ago=100)
@@ -212,6 +295,48 @@ class CollectTests(BoardBase):
         self.assertIn('20261009-100001-codex-bbbb at 83% of its timeout', joined)
         self.assertNotIn('gggg', joined)                           # older than the 24 h window
         self.assertIn('gggg', '\n'.join(a['text'] for a in board.collect(show_all=True, policy=self.policy)['attention']))
+
+    def test_baton_live_count_uses_unfinished_jobs_not_only_pointers(self):
+        # A size-trimmed baton keeps 10 in-flight pointers but lists all 90 live jobs in jobs[]: the board counts 90.
+        self.add_baton('busy')
+        b = baton.load('busy')
+        ids = [f'20261009-143941-codex-{i:04x}' for i in range(90)]
+        b['jobs'] = [{'id': i, 'engine': 'codex', 'status': 'running'} for i in ids]
+        b['jobs'] += [{'id': f'20261009-143941-claude-{i:04x}', 'engine': 'claude', 'status': 'done'} for i in range(5)]
+        b['progress']['in_flight'] = [{'what': 'w', 'job': i, 'check': f'twinlane result {i}'} for i in ids[-10:]]
+        common.write_json(baton.baton_path('busy'), b)
+        row = {r['slug']: r for r in board.collect(policy=self.policy)['batons']}['busy']
+        self.assertEqual(len(row['in_flight']), 90)          # each live job once, finished ones not counted
+        self.assertEqual(set(row['in_flight']), set(ids))
+        self.assertIn('in-flight 90', board._baton_text(row))
+
+    def test_baton_live_count_skips_finished_pointers_and_counts_a_job_once(self):
+        # A stale pointer to a finished job counted as live, and two pointers to one job as two.
+        self.add_baton('stale')
+        b = baton.load('stale')
+        live, done = '20261009-143941-codex-0001', '20261009-143941-claude-0002'
+        b['jobs'] = [{'id': live, 'engine': 'codex', 'status': 'running'},
+                     {'id': done, 'engine': 'claude', 'status': 'done'}]
+        b['progress']['in_flight'] = [{'what': 'w', 'job': j, 'check': f'twinlane result {j}'} for j in (live, live, done)]
+        common.write_json(baton.baton_path('stale'), b)
+        row = {r['slug']: r for r in board.collect(policy=self.policy)['batons']}['stale']
+        self.assertEqual(row['in_flight'], [live])
+
+    def test_a_job_with_an_unreadable_identity_is_live_unknown_and_in_attention(self):
+        # The board must not call a running job `lost` just because this view cannot read it.
+        self.write_meter()
+        self.add_job('20261009-100000-claude-uuuu', 'running', started_ago=100)
+        self.add_job('20261009-100001-claude-llll', 'lost', started_ago=100)
+        with mock.patch.object(common, 'pid_state', side_effect=lambda pid, created=None:
+                               common.DEAD if pid == DEAD_PID else common.UNKNOWN):
+            data = board.collect(policy=self.policy)
+        self.assertEqual({r['id'][-4:]: r['status'] for r in data['jobs']['live']}, {'uuuu': 'unknown'})
+        self.assertEqual({r['id'][-4:]: r['status'] for r in data['jobs']['finished']}, {'llll': 'lost'})
+        self.assertEqual(data['jobs']['unreadable'], [])
+        text = '\n'.join(a['text'] for a in data['attention'])
+        self.assertIn('unknown: 20261009-100000-claude-uuuu', text)
+        self.assertIn('check from the host', text.split('unknown: 20261009-100000-claude-uuuu')[1].splitlines()[0])
+        self.assertNotIn('lost: 20261009-100000-claude-uuuu', text)
 
     def test_batons_and_pending_approvals(self):
         self.write_meter()
@@ -603,6 +728,20 @@ class RobustnessTests(BoardBase):
         self.assertEqual([r['id'] for r in data['jobs']['live']], ['20261001-000000-claude-old0'])
         self.assertEqual(len(data['jobs']['finished']), board.FINISHED_DEFAULT)
 
+    def test_an_old_timeout_whose_engine_outlived_its_kill_is_live_behind_many_finished_jobs(self):
+        self.write_meter()
+        old = '20261001-000000-claude-surv'
+        d = self.add_job(old, 'timeout', started_ago=200000, ended_ago=190000)
+        common.write_json(os.path.join(d, 'survivor.json'), {'engine': 'claude', 'pid': os.getpid(),
+                                                             'created': common.process_created(os.getpid()),
+                                                             'why': 'engine process survived its kill'})
+        for i in range(105):
+            self.add_job(f'20261009-{i // 3600:02d}{i // 60 % 60:02d}{i % 60:02d}-claude-{i:04x}', 'done',
+                         started_ago=500, ended_ago=400)
+        data = board.collect(policy=self.policy)
+        self.assertEqual([(r['id'], r['status']) for r in data['jobs']['live']], [(old, 'orphaned')])
+        self.assertIn(f'orphaned: {old}', ' '.join(a['text'] for a in data['attention']))
+
     def test_a_long_job_created_long_ago_that_failed_recently_is_in_attention(self):
         # Round-3 finding: the shortcut skipped by CREATION age; a 29 h-old job that failed 1 h ago vanished.
         self.write_meter()
@@ -895,6 +1034,136 @@ class CollectedMarkerTests(BoardBase):
         with mock.patch.object(common, 'write_text', side_effect=OSError('read-only')), \
                 redirect_stdout(io.StringIO()):
             self.assertEqual(jobs.cli('result', [jid]), 0)
+
+
+class LostTogetherTests(BoardBase):
+    """Jobs that went quiet within a minute of each other share one cause: ATTENTION shows them as one line."""
+    T0 = dt.datetime(2026, 10, 9, 12, 52, 0, tzinfo=dt.timezone.utc)
+
+    def add_lost(self, tag, at_s, started_ago=900, codex_dir=False):
+        """A lost job whose files are all dated T0 + at_s seconds (the runner went quiet then)."""
+        jid = jid_ago(started_ago, tag, 'codex')
+        d = self.add_job(jid, 'lost', engine='codex', started_ago=started_ago)
+        if codex_dir:  # the Codex runner writes its events one folder down
+            os.makedirs(os.path.join(d, 'codex'))
+            with open(os.path.join(d, 'codex', 'events.jsonl'), 'w', encoding='utf-8') as h:
+                h.write('{}\n')
+        with open(os.path.join(d, 'runner.log'), 'w', encoding='utf-8') as h:
+            h.write('')
+        self.date_files(d, at_s)
+        return jid, d
+
+    def date_files(self, d, at_s):
+        stamp = (self.T0 + dt.timedelta(seconds=at_s)).timestamp()
+        for top, _, files in os.walk(d):
+            for f in files:
+                os.utime(os.path.join(top, f), (stamp, stamp))
+
+    def texts(self):
+        return [a['text'] for a in board.collect(policy=self.policy)['attention']]
+
+    def test_four_jobs_lost_within_15_seconds_are_one_line(self):
+        self.write_meter()
+        ids = [self.add_lost(f'l{i}00', i * 5, started_ago=900 - i)[0] for i in range(4)]
+        data = board.collect(policy=self.policy)
+        texts = [a['text'] for a in data['attention']]
+        lost_lines = [t for t in texts if 'lost' in t]
+        self.assertEqual(len(lost_lines), 1, lost_lines)
+        line = lost_lines[0]
+        self.assertTrue(line.startswith('4 jobs lost together at 12:52Z ('), line)
+        for jid in ids:
+            self.assertIn(jid, line)
+        self.assertIn('a sign-out, shutdown or sleep can end every runner; rerun each with twinlane run --continue-job ID',
+                      line)
+        item = [a for a in data['attention'] if 'lost together' in a['text']][0]
+        self.assertEqual((item['priority'], item['kind']), (board.P_FAIL, 'problem'))
+        self.assertEqual(sorted(item['ids']), sorted(ids))
+        # grouping never hides a job: every row stays in the data and in --json
+        rc, out = self.run_board('--json')
+        self.assertEqual(rc, 0)
+        rows = [r for r in json.loads(out)['jobs']['finished'] if r['status'] == 'lost']
+        self.assertEqual(sorted(r['id'] for r in rows), sorted(ids))
+        self.assertTrue(all(r['last_activity_at'] for r in rows))
+        rc, text = self.run_board()
+        self.assertEqual(sum('lost together' in line for line in text.splitlines()), 1)
+        rc, md = self.run_board('--md')
+        self.assertIn('4 jobs lost together at 12:52Z', md)
+
+    def test_two_jobs_lost_ten_minutes_apart_keep_their_own_lines(self):
+        self.write_meter()
+        a, _ = self.add_lost('aaaa', 0)
+        b, _ = self.add_lost('bbbb', 600, started_ago=800)
+        texts = self.texts()
+        lost = [t for t in texts if t.startswith('lost: ')]
+        self.assertEqual(len(lost), 2, texts)
+        self.assertTrue(any(a in t for t in lost) and any(b in t for t in lost))
+        self.assertFalse(any('lost together' in t for t in texts))
+
+    def test_a_single_lost_job_keeps_todays_line(self):
+        self.write_meter()
+        jid, _ = self.add_lost('eeee', 0)
+        self.assertEqual([t for t in self.texts() if 'lost' in t], [f'lost: {jid} codex eeee (15m ago)'])
+
+    def test_the_window_is_60_seconds_from_the_first_job_of_a_group(self):
+        self.write_meter()
+        first, _ = self.add_lost('f001', 0, started_ago=900)
+        second, _ = self.add_lost('f002', 55, started_ago=899)
+        third, _ = self.add_lost('f003', 110, started_ago=898)   # 55 s after the second, 110 s after the first
+        texts = self.texts()
+        grouped = [t for t in texts if 'lost together' in t]
+        self.assertEqual(len(grouped), 1)
+        self.assertIn('2 jobs lost together', grouped[0])
+        self.assertIn(first, grouped[0])
+        self.assertIn(second, grouped[0])
+        self.assertNotIn(third, grouped[0])
+        self.assertTrue(any(t.startswith(f'lost: {third}') for t in texts))
+
+    def test_the_newest_file_one_folder_down_counts_as_activity(self):
+        self.write_meter()
+        a, da = self.add_lost('c001', 0, codex_dir=True, started_ago=900)
+        stamp = (self.T0 + dt.timedelta(seconds=300)).timestamp()
+        os.utime(os.path.join(da, 'codex', 'events.jsonl'), (stamp, stamp))
+        self.add_lost('c002', 300, started_ago=899)
+        self.assertTrue(any('2 jobs lost together at 12:57Z' in t for t in self.texts()), self.texts())
+
+    def test_the_collected_marker_does_not_move_last_activity(self):
+        self.write_meter()
+        a, da = self.add_lost('m001', 0, started_ago=900)
+        self.add_lost('m002', 3, started_ago=899)
+        with open(os.path.join(da, 'collected'), 'w', encoding='utf-8') as h:
+            h.write(common.iso(common.now()) + '\n')                     # written long after the loss
+        self.assertTrue(any('2 jobs lost together at 12:52Z' in t for t in self.texts()), self.texts())
+
+    def test_a_group_counts_once_toward_the_cap_and_keeps_its_priority(self):
+        self.write_meter(claude={'status': 'stop', 'max_pct': 90.0})
+        for i in range(4):
+            self.add_lost(f'g{i}00', i, started_ago=900 - i)
+        for i in range(5):
+            self.add_job(f'20261009-09{i:02d}00-claude-f{i:03x}', 'failed', started_ago=900, ended_ago=800)
+        texts = self.texts()
+        self.assertEqual(len(texts), 1 + 1 + 5)                         # STOP, one group line, five failures
+        self.assertTrue(texts[0].startswith('claude STOP'))             # P0 first; the group is P2, after it
+        _, out = self.run_board()
+        self.assertEqual(sum(1 for line in out.splitlines() if line.startswith('! ')), board.CAPS['attention'])
+        self.assertIn('+1 more (--all)', out)                           # 7 items, cap 6: counted as items, not jobs
+
+    def test_a_lost_job_with_no_dated_files_is_not_grouped(self):
+        self.write_meter()
+        self.add_lost('n001', 0, started_ago=900)
+        self.add_lost('n002', 1, started_ago=899)
+        with mock.patch.object(board, '_last_activity', return_value=None):
+            texts = self.texts()
+        self.assertEqual(sum(t.startswith('lost: ') for t in texts), 2)
+        self.assertFalse(any('lost together' in t for t in texts))
+
+    def test_dating_the_jobs_changes_nothing_on_disk(self):
+        self.write_meter()
+        for i in range(3):
+            self.add_lost(f'r{i}00', i, started_ago=900 - i)
+        before = tree_state(self.tmp)
+        board.collect(policy=self.policy)
+        self.run_board('--md')
+        self.assertEqual(tree_state(self.tmp), before)
 
 
 if __name__ == '__main__':

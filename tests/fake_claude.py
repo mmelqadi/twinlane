@@ -13,7 +13,7 @@ Env knobs:
   FAKE_TOUCH_NO_TOOL_USE=1  create FAKE_TOUCH without a tool_use (a peer's write, as far as the job can tell)
   FAKE_TOOL_USE=JSON      emit one assistant tool_use {"name": ..., "input": {...}}
   FAKE_BAD_EVENTS=1       emit malformed events first (content 5, rate_limit_info a string, broken JSON)
-  FAKE_ARGV_OUT=PATH      write {argv, anthropic_env, job, brief_head, cwd} as JSON to PATH
+  FAKE_ARGV_OUT=PATH      write {argv, anthropic_env, env_names, job, brief_head, cwd} as JSON to PATH
 """
 import json
 import os
@@ -48,7 +48,8 @@ def main():
     if out:
         with open(out, 'w', encoding='utf-8') as h:
             json.dump({'argv': sys.argv[1:], 'anthropic_env': [k for k in os.environ if k.startswith('ANTHROPIC_')],
-                       'job': os.environ.get('TWINLANE_ENGINE_JOB'), 'brief_head': brief[:3000], 'cwd': os.getcwd(),
+                       'env_names': sorted(os.environ), 'job': os.environ.get('TWINLANE_ENGINE_JOB'),
+                       'brief_head': brief[:3000], 'cwd': os.getcwd(),
                        'pid': os.getpid(), 'pgid': os.getpgid(0) if os.name != 'nt' else None},
                       h, ensure_ascii=False)
     model = arg('--model') or 'claude-opus-5-5'

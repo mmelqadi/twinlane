@@ -3,6 +3,7 @@ import contextlib
 import glob
 import json
 import os
+import pathlib
 import shutil
 import subprocess
 import sys
@@ -36,6 +37,69 @@ class PidAliveNeverKills(unittest.TestCase):
     def test_bad_pids(self):
         for pid in (None, '', 'x', 0, -5):
             self.assertFalse(common.pid_alive(pid))
+
+
+def unreadable_identity(*pids):
+    """Patch the platform's process probe so these pids exist but their creation time cannot be read, as in a
+    restricted-token sandbox. Other pids are probed for real. No pids = every pid."""
+    if common.IS_WIN:
+        real = common._win_process_info
+        return mock.patch.object(common, '_win_process_info',
+                                 side_effect=lambda pid: (True, None) if not pids or pid in pids else real(pid))
+    real = common._posix_start_time
+    return mock.patch.object(common, '_posix_start_time',
+                             side_effect=lambda pid: None if not pids or pid in pids else real(pid))
+
+
+class PidStateIsTriState(unittest.TestCase):
+    """Alive / dead / unknown. A process that exists but whose identity cannot be read is UNKNOWN, never dead."""
+
+    def setUp(self):
+        self.child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+        self.addCleanup(self.child.wait)
+        self.addCleanup(self.child.kill)
+        self.created = common.process_created(self.child.pid)
+        self.assertTrue(self.created, 'the live child must have a readable creation stamp')
+
+    def test_readable_match_is_alive(self):
+        self.assertEqual(common.pid_state(self.child.pid, self.created), common.ALIVE)
+        self.assertEqual(common.pid_state(self.child.pid), common.ALIVE)  # no stamp to compare
+
+    def test_readable_mismatch_is_dead(self):
+        # pid-reuse protection survives: a readable identity that differs is another process.
+        self.assertEqual(common.pid_state(self.child.pid, self.created + 1), common.DEAD)
+        self.assertEqual(common.pid_state(self.child.pid, 'not-a-stamp'), common.DEAD)
+
+    def test_exited_process_and_bad_pids_are_dead(self):
+        done = subprocess.Popen([sys.executable, '-c', 'pass'])
+        done.wait()
+        self.assertEqual(common.pid_state(done.pid, 12345), common.DEAD)
+        for pid in (None, '', 'x', 0, -5):
+            self.assertEqual(common.pid_state(pid), common.DEAD)
+
+    def test_existing_but_unreadable_is_unknown(self):
+        with unreadable_identity(self.child.pid):
+            self.assertEqual(common.pid_state(self.child.pid, self.created), common.UNKNOWN)
+            self.assertEqual(common.pid_state(self.child.pid, ''), common.ALIVE)  # nothing to compare: it exists
+            # The strict probe never claims what it cannot prove; the lenient one never claims death.
+            self.assertFalse(common.pid_alive(self.child.pid, self.created))
+            self.assertTrue(common.pid_maybe_alive(self.child.pid, self.created))
+
+    def test_nonexistent_with_no_readable_identity_is_still_dead(self):
+        done = subprocess.Popen([sys.executable, '-c', 'pass'])
+        done.wait()
+        if common.IS_WIN:
+            with mock.patch.object(common, '_win_process_info', return_value=(False, None)):
+                self.assertEqual(common.pid_state(done.pid, 12345), common.DEAD)
+                self.assertFalse(common.pid_maybe_alive(done.pid, 12345))
+        else:
+            self.assertEqual(common.pid_state(done.pid, 12345), common.DEAD)
+
+    def test_kill_tree_refuses_an_unreadable_identity(self):
+        # It cannot prove the pid is still the stamped process, so it must not kill it.
+        with unreadable_identity(self.child.pid):
+            self.assertFalse(common.kill_tree(self.child.pid, self.created))
+        self.assertIsNone(self.child.poll(), 'kill_tree killed a process whose identity it could not read')
 
 
 @unittest.skipUnless(shutil.which('git'), 'git not installed')
@@ -224,6 +288,72 @@ class ReadDuringReplace(unittest.TestCase):
         self.assertEqual(errors, [])
 
 
+class WriteDeadline(unittest.TestCase):
+    """The replace retries of an atomic write (and the read retries) stop at a caller's deadline."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp(prefix='twinlane-wd-')
+        self.addCleanup(shutil.rmtree, self.d, ignore_errors=True)
+        self.path = os.path.join(self.d, 'cache.json')
+
+    def test_sharing_violations_stop_at_the_deadline_and_leave_the_old_file(self):
+        common.write_json(self.path, {'old': True})
+        before = pathlib.Path(self.path).read_bytes()
+        tries = []
+
+        def busy(src, dst):
+            tries.append(time.monotonic())
+            raise PermissionError(13, 'sharing violation')
+
+        t0 = time.monotonic()
+        with mock.patch('os.replace', busy):
+            with self.assertRaises(TimeoutError):
+                common.write_json(self.path, {'new': 'x' * 5000}, deadline=t0 + 0.2)
+        self.assertLess(time.monotonic() - t0, 0.45)           # without a deadline: 20 retries, about 10 s
+        self.assertTrue(tries)
+        self.assertLess(max(tries) - t0, 0.25)
+        self.assertEqual(pathlib.Path(self.path).read_bytes(), before)  # never a partial file
+        self.assertEqual([n for n in os.listdir(self.d) if n.startswith('.tmp-')], [])
+
+    def test_a_deadline_already_past_writes_nothing(self):
+        with self.assertRaises(TimeoutError):
+            common.write_json(self.path, {'n': 1}, deadline=time.monotonic() - 1)
+        self.assertEqual(os.listdir(self.d), [])
+
+    def test_a_transient_violation_inside_the_deadline_still_replaces_completely(self):
+        real, n = os.replace, []
+
+        def flaky(src, dst):
+            n.append(1)
+            if len(n) < 3:
+                raise PermissionError(13, 'sharing violation')
+            return real(src, dst)
+
+        with mock.patch('os.replace', flaky):
+            common.write_json(self.path, {'new': True}, deadline=time.monotonic() + 5)
+        self.assertEqual(common.read_json(self.path), {'new': True})
+
+    def test_no_deadline_keeps_the_old_unbounded_behaviour(self):
+        real, n = os.replace, []
+
+        def flaky(src, dst):
+            n.append(1)
+            if len(n) < 3:
+                raise PermissionError(13, 'sharing violation')
+            return real(src, dst)
+
+        with mock.patch('os.replace', flaky):
+            common.write_json(self.path, {'new': True})
+        self.assertEqual(common.read_json(self.path), {'new': True})
+
+    def test_a_busy_file_reads_as_the_default_at_the_deadline(self):
+        common.write_json(self.path, {'a': 1})
+        t0 = time.monotonic()
+        with mock.patch('builtins.open', side_effect=PermissionError(13, 'sharing violation')):
+            self.assertEqual(common.read_json(self.path, 'dflt', deadline=t0 + 0.02), 'dflt')
+        self.assertLess(time.monotonic() - t0, 0.15)
+
+
 class FileLock(unittest.TestCase):
     def test_lock_is_exclusive(self):
         d = tempfile.mkdtemp(prefix='twinlane-lock-')
@@ -244,6 +374,30 @@ class FmtAge(unittest.TestCase):
         self.assertEqual(common.fmt_age(720), '12m')
         self.assertEqual(common.fmt_age(3 * 3600 + 5), '3h')
         self.assertEqual(common.fmt_age(2 * 86400), '2d')
+
+
+class StripSecretEnv(unittest.TestCase):
+    """A code worker gets no secret-named variables; only their NAMES are reported."""
+    SECRETS = ('GITHUB_TOKEN', 'GH_TOKEN', 'OPENAI_API_KEY', 'SLACK_BOT_TOKEN', 'AWS_ACCESS_KEY_ID',
+               'AZURE_CLIENT_SECRET', 'DB_PASSWORD', 'SMTP_PASSWD', 'SMS_APIKEY', 'STRIPE_SECRET_KEY', 'SIGNING_KEY',
+               'SSH_PRIVATE_KEY', 'GOOGLE_APPLICATION_CREDENTIALS', 'NPM_TOKEN', 'SENTRY_DSN', 'DATABASE_URL',
+               'SSH_AUTH_SOCK', 'ANTHROPIC_API_KEY')
+    KEPT = ('PATH', 'PWD', 'USERPROFILE', 'APPDATA', 'CODEX_HOME', 'TWINLANE_CODEX_BIN',
+            'TWINLANE_CODEX_ADAPTER_STRICT_CREDITS', 'TWINLANE_ENGINE_JOB', 'TWINLANE_ENGINE_CWD', 'PYTHONPATH',
+            'KEYBOARD_LAYOUT', 'SSH_ASKPASS')
+
+    def test_secret_names_go_and_ordinary_ones_stay(self):
+        env = {k: f'value-of-{k}' for k in self.SECRETS + self.KEPT}
+        out, names = common.strip_secret_env(env)
+        self.assertEqual(names, sorted(self.SECRETS))
+        self.assertEqual(sorted(out), sorted(self.KEPT))
+        self.assertFalse([n for n in names if 'value-of' in n])  # names, never values
+        self.assertEqual(env['GITHUB_TOKEN'], 'value-of-GITHUB_TOKEN')  # the caller's dict is not changed
+
+    def test_the_allowlist_keeps_a_name(self):
+        with mock.patch.object(common, 'SECRET_ENV_KEEP', frozenset({'GH_TOKEN'})):
+            out, names = common.strip_secret_env({'GH_TOKEN': 'x', 'NPM_TOKEN': 'y'})
+        self.assertEqual((sorted(out), names), (['GH_TOKEN'], ['NPM_TOKEN']))
 
 
 PING = os.path.join(os.environ.get('SystemRoot', 'C' + r':\Windows'), 'System32', 'PING.EXE')

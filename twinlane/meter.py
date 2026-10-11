@@ -11,6 +11,7 @@ import contextlib
 import datetime as dt
 import glob
 import json
+import math
 import os
 import queue
 import re
@@ -28,9 +29,17 @@ OAUTH_TIMEOUT_S = 6
 APP_SERVER_TIMEOUT_S = 15
 ROLLOUT_FILES = 40
 STATUS_RANK = {'ok': 0, 'caution': 1, 'handoff': 2, 'stop': 3, 'out': 4}
+USABLE_STATUSES = ('ok', 'caution', 'handoff')
+HOLD_EXTRA_UNKNOWN = 'extra usage state unknown'
+HOLD_EXTRA_ON = 'extra usage is ON'
+HOLD_EXTRA_UNKNOWN_NOTE = ('Claude held: extra usage state unknown (a call could bill it); record a reading '
+                           'showing it OFF: twinlane meter --record-claude <get_usage json>')
 SHORT_NAMES = {'five_hour': '5h', 'seven_day': '7d', 'seven_day_opus': '7d-opus',
                'seven_day_sonnet': '7d-sonnet', 'seven_day_oauth_apps': '7d-apps'}
 CORE_WINDOWS = {'five_hour', 'seven_day', 'weekly'}
+UNRECOGNISED_WINDOW = '(unrecognised window)'
+INVALID_WINDOW = '(invalid window name)'
+MINUTES_WINDOW = re.compile(r'\d+min')  # the name window_name_from_minutes gives an unfamiliar length
 FUTURE_SKEW_S = 60  # a reading stamped further ahead than this is invalid, not fresh
 
 
@@ -61,16 +70,18 @@ def _older(new, cur) -> bool:
     return a is not None and b is not None and a < b
 
 
-def _locked_update(path: str, decide, timeout_s: float = CACHE_LOCK_S) -> bool:
+def _locked_update(path: str, decide, timeout_s: float = CACHE_LOCK_S, deadline: float | None = None) -> bool:
     """Read-decide-write `path` under a cross-process lock. decide(current) returns the new content, or None
     to leave the file alone. True when it wrote. A lock that stays busy for `timeout_s` writes nothing (a
-    cache write is never worth waiting for)."""
+    cache write is never worth waiting for). With `deadline` (a time.monotonic() value) the read and the
+    replace retries stop at it too: a write that cannot finish by then writes nothing (the file stays the old
+    one or becomes the complete new one, never a partial)."""
     try:
         with common.file_lock(path + '.lock', timeout_s=timeout_s, poll_s=min(0.05, max(0.001, timeout_s / 4))):
-            new = decide(common.read_json(path))
+            new = decide(common.read_json(path, deadline=deadline))
             if new is None:
                 return False
-            common.write_json(path, new)
+            common.write_json(path, new, deadline=deadline)
             return True
     except TimeoutError:
         return False
@@ -82,7 +93,7 @@ def _cache_update(path: str, decide) -> bool:
     write is queued instead of done (True means queued)."""
     queue_ = getattr(_deferral, 'queue', None)
     if queue_ is not None:
-        queue_.append(lambda timeout_s=CACHE_LOCK_S: _locked_update(path, decide, timeout_s))
+        queue_.append(lambda timeout_s=CACHE_LOCK_S, deadline=None: _locked_update(path, decide, timeout_s, deadline))
         return True
     return _locked_update(path, decide)
 
@@ -103,8 +114,10 @@ def deferred_cache_writes():
 
 def run_deferred(queue_: list, deadline: float | None = None) -> int:
     """Run queued cache writes. With `deadline` (a time.monotonic() value) each write waits for the cache
-    lock only for the time left, and the writes still queued when it passes are dropped (a skipped cache
-    write only means the next read refreshes). -> number of writes skipped or refused by a busy lock."""
+    lock, read the file and retry the replace only for the time left, and the writes still queued when it
+    passes are dropped (a skipped cache write only means the next read refreshes). The time one write spends
+    inside the filesystem cannot be interrupted from here: a caller that must return at the deadline runs this
+    in a thread (jobs._bounded_after_meter). -> number of writes skipped or refused by a busy lock."""
     skipped = 0
     for write in queue_:
         if deadline is None:
@@ -114,8 +127,59 @@ def run_deferred(queue_: list, deadline: float | None = None) -> int:
         if left <= 0:
             skipped += 1
             continue
-        skipped += not write(min(CACHE_LOCK_S, left))
+        skipped += not write(min(CACHE_LOCK_S, left), deadline)
     return skipped
+
+
+# ---------------------------------------------------------------- windows the router counts
+
+def safe_window_name(name) -> str | None:
+    """A window name safe to print on one line (baton.WINDOW_NAME: no control characters, 1-40 chars), or None."""
+    from . import baton  # lazy: baton is the owner of the rule and needs nothing from here at import time
+    return name if isinstance(name, str) and baton.WINDOW_NAME.fullmatch(name) else None
+
+
+def is_recognised(w) -> bool:
+    """True when the code knows what the window is. A window of another Codex limit id carries that id."""
+    if not isinstance(w, dict):
+        return False
+    name = safe_window_name(w.get('name'))
+    if name is None:
+        return False
+    return bool(w.get('limit') or name in SHORT_NAMES or name in CORE_WINDOWS
+                or name in SHORT_NAMES.values() or MINUTES_WINDOW.fullmatch(name))
+
+
+def binding_index(windows) -> int | None:
+    """Index of the window the router's max_pct comes from: the highest usable percent, the first on a tie."""
+    best = None
+    for i, w in enumerate(windows if isinstance(windows, list) else []):
+        p = w.get('pct') if isinstance(w, dict) else None
+        if isinstance(p, bool) or not isinstance(p, (int, float)) or p != p:
+            continue
+        if best is None or p > windows[best]['pct']:
+            best = i
+    return best
+
+
+def binding_window(windows) -> dict | None:
+    """{name, pct, recognised} of the binding window; name is None when it is not printable."""
+    i = binding_index(windows)
+    if i is None:
+        return None
+    w = windows[i]
+    return {'name': safe_window_name(w.get('name')), 'pct': w['pct'], 'recognised': is_recognised(w)}
+
+
+def window_label(w: dict) -> str:
+    """How a window is named in output: the short name when known, the raw name with an explicit
+    `(unrecognised window)` mark when not, `(invalid window name)` when the name cannot be printed."""
+    name = safe_window_name((w or {}).get('name'))
+    if name is None:
+        return INVALID_WINDOW
+    if not is_recognised(w):
+        return f'{name} {UNRECOGNISED_WINDOW}'
+    return SHORT_NAMES.get(name, name)
 
 
 # ---------------------------------------------------------------- shared shaping
@@ -136,7 +200,11 @@ def _window(name: str, pct, resets_at) -> dict | None:
     try:
         p = float(pct)
     except (TypeError, ValueError):
-        return None
+        p = None
+    if isinstance(pct, bool) or p is None or not math.isfinite(p) or p < 0:
+        # Keep the invalid window visible: dropping it would make a partial reading look usable.
+        return {'name': name, 'pct': None, 'resets_at': common.iso(common.parse_time(resets_at)),
+                'invalid_pct': True}
     return {'name': name, 'pct': p, 'resets_at': common.iso(common.parse_time(resets_at))}
 
 
@@ -188,7 +256,8 @@ def _finish_common(raw: dict, engine_policy: dict, thresholds: dict, now) -> dic
     """Fields both engines share: source, age, windows, max_pct, status before engine rules."""
     raw = raw or {}
     out = {'status': 'unknown', 'source': raw.get('source') or 'none', 'reading_at': raw.get('reading_at'),
-           'age_s': None, 'windows': [], 'max_pct': None, 'next_reset': None, 'note': raw.get('note') or ''}
+           'age_s': None, 'windows': [], 'binding_window': None, 'max_pct': None, 'next_reset': None,
+           'note': raw.get('note') or ''}
     if out['source'] == 'none' or not raw.get('reading_at'):
         out['note'] = out['note'] or 'no reading'
         return out
@@ -199,10 +268,24 @@ def _finish_common(raw: dict, engine_policy: dict, thresholds: dict, now) -> dic
         return out
     age = common.age_s(raw.get('reading_at'))
     out['age_s'] = None if age is None else int(age)
-    out['windows'] = effective_windows(raw.get('windows') or [], now)
+    windows = []
+    for w in raw.get('windows') or []:
+        w = w if isinstance(w, dict) else {'name': None}
+        checked = _window(w.get('name'), w.get('pct'), w.get('resets_at'))
+        windows.append({**w, **checked})
+    out['windows'] = effective_windows(windows, now)
+    bi = binding_index(out['windows'])
+    for i, w in enumerate(out['windows']):
+        w['recognised'] = is_recognised(w)
+        if i == bi:
+            w['binding'] = True
+    out['binding_window'] = binding_window(out['windows'])
     pcts = [w['pct'] for w in out['windows'] if w.get('pct') is not None]
     out['max_pct'] = max(pcts) if pcts else None
     out['next_reset'] = next_reset(out['windows'], thresholds)
+    if any(w.get('invalid_pct') for w in out['windows']):
+        out['note'] = _join(out['note'], 'invalid usage percentage: reading is incomplete')
+        return out
     max_age = engine_policy.get('stale_reading_max_age_s', 1800)
     if age is None or age > max_age:
         out['note'] = _join(out['note'], f'reading is {out["age_s"]}s old (> {max_age}s): stale')
@@ -226,12 +309,19 @@ def finish_claude(raw: dict, policy: dict, now=None) -> dict:
     if (raw or {}).get('refresh'):
         out['refresh'] = raw['refresh']
     if out['status'] != 'unknown' and out['extra_usage_enabled']:
-        if cp.get('extra_usage_allowed'):
+        if cp.get('extra_usage_allowed') is True:
             out['note'] = _join(out['note'], 'WARNING: extra usage is ON; policy allows dispatch and charges may apply')
         else:
             out['status'] = worse(out['status'], 'stop')
             out['note'] = _join(out['note'], 'extra usage is ON; twinlane refuses dispatch')
-    elif out['status'] != 'unknown' and out['extra_usage_enabled'] is None             and (out['max_pct'] or 0) >= th.get('handoff_pct', 80):
+            out['hold'] = HOLD_EXTRA_ON  # a window reset does not clear it, so no `wait until`
+    elif out['status'] in USABLE_STATUSES and out['extra_usage_enabled'] is None and cp.get('extra_usage_allowed') is not True:
+        # Unknown is not OFF: any Claude call could bill extra usage, so the reading is held as `unknown`
+        # (never routed) with the reason in `hold`, which route, the meter line and the board show.
+        out['status'] = 'unknown'
+        out['hold'] = HOLD_EXTRA_UNKNOWN
+        out['note'] = _join(out['note'], HOLD_EXTRA_UNKNOWN_NOTE)
+    elif out['status'] == 'stop' and out['extra_usage_enabled'] is None:
         # route.usable refuses the urgent stop path unless extra usage is known to be OFF.
         out['note'] = _join(out['note'], 'extra usage state unknown: no urgent dispatch past the stop line')
     return out
@@ -317,6 +407,8 @@ def _oauth_windows(obj: dict) -> list[dict]:
     for key, val in obj.items():
         if key == 'extra_usage' or not isinstance(val, dict) or 'utilization' not in val:
             continue
+        if val.get('utilization') is None and val.get('resets_at') is None:
+            continue  # OAuth uses a wholly null optional window for a model with no allowance window.
         w = _window(key, val.get('utilization'), val.get('resets_at'))
         if w:
             wins.append(w)
@@ -466,13 +558,29 @@ def token_expired_at(creds_path: str | None = None) -> str | None:
     return common.iso(exp) if o.get('accessToken') and exp is not None and exp <= common.now() else None
 
 
+def refresh_blocker() -> str | None:
+    """Why the refresh call must not run, or None. It is a real model call, and an expired token means
+    the live usage endpoint cannot say whether extra usage is on, so the last recorded state decides:
+    only a recorded OFF allows it (ON and unknown both block). twinlane has no refresh without a model call."""
+    cached = load_claude_cache()
+    extra = None if cached is None else cached.get('extra_usage_enabled')
+    if extra is False:
+        return None
+    state = 'extra usage is ON' if extra else 'extra usage state unknown'
+    return (f'{state}: no model call to renew the token; record a reading that shows extra usage OFF '
+            '(twinlane meter --record-claude <get_usage json>), or renew the CLI login yourself')
+
+
 def read_claude_raw(refresh: bool = False, creds_path=None, _http=None, _run=None) -> dict:
     reading, why = _try_oauth(creds_path, _http)
     if reading:
         save_claude_cache(reading, 'oauth')
         return reading
     notes = [why]
-    if refresh:
+    blocked = refresh_blocker() if refresh else None
+    if blocked:
+        notes.append(f'refresh not run: {blocked}')
+    elif refresh:
         notes.append(_refresh_token(_run))
         reading, why2 = _try_oauth(creds_path, _http)
         if reading:
@@ -578,6 +686,10 @@ def read_claude_auto(policy: dict | None = None, creds_path=None, _http=None, _r
     raw = read_claude_raw(False, creds_path, _http, _run)
     expired = raw.get('token_expired_at')
     if not expired or not auto_refresh_enabled(policy) or finish_claude(raw, policy or {})['status'] != 'unknown':
+        return raw
+    blocked = refresh_blocker()
+    if blocked:  # checked before the claim, so recording an OFF reading later still allows this expiry its try
+        raw['note'] = _join(raw.get('note'), f'automatic refresh not run: {blocked}')
         return raw
     marker = _claim_refresh(expired)
     if marker is None:
@@ -1105,16 +1217,17 @@ def _fmt_age(s) -> str:
 
 
 def _fmt_windows(sec: dict, now, say_resets: bool) -> list[str]:
+    """Every window of the reading except another limit id's (listed on its own line by _detail_lines);
+    nothing the router counts is left out, and the binding one is marked."""
     parts = []
-    for w in sec.get('windows') or []:
-        if w.get('limit'):  # another limit id: listed on its own line by _detail_lines
-            continue
-        if w.get('name') not in CORE_WINDOWS and not w.get('pct'):
+    wins = sec.get('windows') or []
+    bi = binding_index(wins)
+    for i, w in enumerate(wins):
+        if w.get('limit'):
             continue
         reset = _fmt_reset(w.get('resets_at'), now)
-        label = SHORT_NAMES.get(w.get('name'), w.get('name'))
         when = f'resets {reset}' if say_resets and not parts else reset
-        parts.append(f'{label} {_fmt_pct(w.get("pct"))} ({when})')
+        parts.append(f'{window_label(w)} {_fmt_pct(w.get("pct"))} ({when})' + (' [binding]' if i == bi else ''))
     return parts
 
 
@@ -1177,13 +1290,20 @@ def _detail_lines(m: dict, now) -> list[str]:
         out.append('  codex: ' + ' · '.join(bits))
     names = {lim.get('id'): lim.get('name') for lim in sec.get('limits') or []}
     groups: dict = {}
-    for w in sec.get('windows') or []:
+    all_wins = sec.get('windows') or []
+    bi = binding_index(all_wins)
+    for i, w in enumerate(all_wins):
         if w.get('limit'):
-            groups.setdefault(w['limit'], []).append(w)
+            groups.setdefault(w['limit'], []).append((i, w))
     for lid, wins in groups.items():
-        shown = ' · '.join(f'{(w.get("name") or "").split(":", 1)[-1]} {_fmt_pct(w.get("pct"))} '
-                           f'({_fmt_reset(w.get("resets_at"), now)})' for w in wins)
-        label = f'{names[lid]} [{lid}]' if names.get(lid) else lid
+        # names here come from the provider's reply, so each passes safe_window_name too
+        shown = ' · '.join(f'{(safe_window_name(w.get("name")) or INVALID_WINDOW).split(":", 1)[-1]} '
+                           f'{_fmt_pct(w.get("pct"))} ({_fmt_reset(w.get("resets_at"), now)})'
+                           + (' [binding]' if i == bi else '') for i, w in wins)
+        safe_lid = safe_window_name(lid) or INVALID_WINDOW
+        raw = names.get(lid)  # a display name ('GPT-6 Astra') may hold spaces, never control characters
+        safe_name = raw if isinstance(raw, str) and 0 < len(raw) <= 60 and raw.isprintable() else None
+        label = f'{safe_name} [{safe_lid}]' if safe_name else safe_lid
         out.append(f'  codex limit {label}: {shown}')
     refresh = (m.get('claude') or {}).get('refresh')
     if refresh:
