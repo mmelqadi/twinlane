@@ -82,7 +82,8 @@ WRITE_FLAGS = re.compile(r'(^|\s)(--output(=|\s|$)|--ext-diff|--pre(=|\s|$))')
 WRITE_VERBS = re.compile(r'(^|[\s;&|(])(cp|mv|rm|rmdir|del|erase|copy|move|ren|rename|robocopy|xcopy|mkdir|md|touch|'
                          r'tee|truncate|ln|install|sed\s+-i|perl\s+-i|copy-item|move-item|remove-item|'
                          r'set-content|add-content|out-file|new-item|rename-item|clear-content|'
-                         r'dd|unzip|tar|7z|rsync|scp|patch|wget|expand-archive)(?=\s|$)', re.I)
+                         r'dd|unzip|tar|gtar|bsdtar|7z|7za|7zz|cpio|jar|zip|rsync|scp|patch|wget|expand-archive|'
+                         r'sort|split|csplit|sqlite3|python\S*\s+-m\s+(?:zipfile|tarfile|shutil))(?=\s|$)', re.I)
 # Commands whose every path argument is a write target when they lead a command.
 WRITE_VERB_NAMES = {'cp', 'mv', 'rm', 'rmdir', 'rd', 'del', 'erase', 'copy', 'move', 'ren', 'rename', 'robocopy',
                     'xcopy', 'mkdir', 'md', 'touch', 'tee', 'truncate', 'ln', 'install', 'copy-item', 'cpi',
@@ -90,7 +91,7 @@ WRITE_VERB_NAMES = {'cp', 'mv', 'rm', 'rmdir', 'rd', 'del', 'erase', 'copy', 'mo
                     'new-item', 'ni', 'rename-item', 'rni', 'clear-content', 'clc', 'tee-object', 'rsync', 'scp'}
 # On Windows a bare /X is usually a cmd switch (del /Q, robocopy /MIR), so only Git Bash drive paths (/c/...) count.
 _SLASH_ROOT = r'/[a-zA-Z]/[^\s"\'|;&<>]*' if os.name == 'nt' else r'/[^\s"\'|;&<>]*'
-ABS_PATH = re.compile(r'(?<![\w/.])([A-Za-z]:[\\/][^\s"\'|;&<>]*|' + _SLASH_ROOT + r'|'
+ABS_PATH = re.compile(r'(?<![\w/.:])([A-Za-z]:[\\/][^\s"\'|;&<>]*|' + _SLASH_ROOT + r'|'
                       r'\\' r'\\' r'[^\s"\'|;&<>]+)')
 DOTDOT = re.compile(r'(^|[\\/])\.\.([\\/]|$)')  # a `..` path component
 SEGMENT_SPLIT = re.compile(r'&&|\|\||[;|&\r\n]')  # a lone & (background) starts a new command too
@@ -101,7 +102,7 @@ CD_WORDS = {'cd', 'chdir', 'pushd', 'popd', 'set-location', 'sl', 'push-location
 # Wrappers that run the command after them: `sudo git push`, `xargs -n1 rm`, `timeout 5 curl ...`, and
 # PowerShell's call operator `&` and dot-sourcing `. git commit`.
 WRAPPERS = {'env', 'command', 'exec', 'nohup', 'time', 'start', 'sudo', 'nice', 'ionice', 'stdbuf', 'builtin',
-            'call', 'xargs', 'timeout', 'watch', '&', '@', '.'}
+            'busybox', 'toybox', 'call', 'xargs', 'timeout', 'watch', '&', '@', '.'}
 # Wrapper options that take a value (`env -u NAME git ...`): the value is never the program. Spelled
 # separately, attached (`-uNAME`, `-n1`) or as `--opt=value`.
 WRAPPER_VALUE_OPTS = {
@@ -708,17 +709,29 @@ def _expand(word: str) -> str | None:
     return w
 
 
-def _path_candidates(word: str) -> list:
+def _path_candidates(word: str, head: str = '') -> list:
     """Every path a word can name, quotes removed: the word itself, a value after `=` or `:`, a short option's
-    attached value (`-d../x`), and every value a flag cluster could carry (`-xvC../x`)."""
+    attached value (`-d../x`), and every value a flag cluster could carry (`-xvC../x`). A POSIX shell drops a
+    backslash before an ordinary character (`.\\./x` is `../x`), so that reading is a candidate too."""
     w = (word or '').replace('"', '').replace("'", '')
+    unescaped = re.sub(r'\\([^\\/])', r'\1', w)
+    if unescaped != w:
+        return _candidates_of(w, head) + _candidates_of(unescaped, head)
+    return _candidates_of(w, head)
+
+
+def _candidates_of(w: str, head: str = '') -> list:
     if not w.startswith('-'):
         return [w] + ([w.split('=', 1)[1]] if '=' in w else [])  # dd of=../x
     out = [w.split(sep, 1)[1] for sep in '=:' if sep in w]
     if not out and not w.startswith('--'):  # a flag cluster: the value may start after any of its letters
+        if head in ('tar', 'gtar', 'bsdtar'):  # tar's value starts right after its first value-taking letter
+            j = next((k for k, c in enumerate(w[1:], 1) if c in 'fCTXgKNLVHb' or not c.isalpha()), len(w))
+            if j < len(w) and w[j].isalpha() and w[j + 1:]:
+                out.append(w[j + 1:])
         i = 2
         while i < len(w) and w[i - 1].isalpha():
-            if w[i] not in '/\\':
+            if i == 2 or w[i] not in '/\\':
                 out.append(w[i:])
             i += 1
     return out
@@ -792,12 +805,53 @@ def path_hazard(ws: list[str], seg: str, root: str, base: str | None, stack: lis
         if not _inside(path, root) and not path.lower().startswith(('/dev/null', 'nul')) \
                 and not any(path in s for s in sources) and writing:
             return base, f'a writing command names a path outside the job worktree ({common.clip(path, 120)})'
-    if writing:  # a command it does not model (unzip -d, tar -C) still names `..` paths: resolve each one
+    why = _archive_hazard(head, ws)
+    if why:
+        return base, why
+    if writing:  # a command it does not model (unzip -d, tar -C) still names paths: resolve each one
+        text = head in TEXT_WORDS  # `echo $HOME > out.txt` prints a variable, it does not write to it
+        powershell = any(re.match(r'^-[A-Za-z]{2,}', w) for w in ws[1:])
         for w in (words(seg) if raw is None else raw)[1:]:
-            for cand in _path_candidates(w):
-                if DOTDOT.search(cand) and cand not in sources and _outside(cand, root, base):
+            if _cmd_switch(head, w, powershell):  # `del /Q` is a switch, not the root path /Q
+                continue
+            for cand in _path_candidates(w, head):
+                if cand in sources or not (DOTDOT.search(cand) or (not text and ROOTED.match(cand))):
+                    continue
+                if _outside(cand, root, base):
                     return base, f'a writing command names a path outside the job worktree ({common.clip(cand, 120)})'
     return base, None
+
+
+TEXT_WORDS = {'echo', 'printf', 'write-output', 'write-host', 'write', 'echo.'}
+ROOTED = re.compile(r'^(~|\$|%|[\\/]|[A-Za-z]:)')  # home, a variable, a root or a drive: resolved, never assumed
+
+
+def _flag_letters(w: str) -> str:
+    """The letters of a short-option cluster (`-xPf` -> `xPf`), up to its first non-letter."""
+    m = re.match(r'^-([A-Za-z]+)', w) if w.startswith('-') and not w.startswith('--') else None
+    return m.group(1) if m else ''
+
+
+def _archive_hazard(head: str, ws: list) -> str | None:
+    """Options that let the ARCHIVE choose where files land (absolute or `..` member names). The defaults of
+    unzip, tar, bsdtar and 7z strip those; these switches turn the stripping off, and cpio/jar never strip."""
+    args = ws[1:]
+    why = f'{head} with an option that lets archive member names write outside the job worktree'
+    if head == 'unzip' and any(w.startswith('-') and not w.startswith('--') and ':' in w for w in args):
+        return why  # -: keeps `../` members
+    if head in ('tar', 'gtar', 'bsdtar'):
+        old_style = args[0] if args and not args[0].startswith('-') else ''
+        if any(w in ('--absolute-names', '-s') or w.startswith(('--transform', '--xform', '--absolute-names'))
+               for w in args) or 'P' in old_style or any('P' in _flag_letters(w) for w in args):
+            return why
+    if head == 'cpio' and (any('i' in _flag_letters(w) for w in args) or '--extract' in args) \
+            and '--no-absolute-filenames' not in args:
+        return why
+    if head in ('7z', '7za', '7zz', '7zr') and any(w.lower().startswith('-spf') for w in args):
+        return why
+    if head == 'jar' and args and re.match(r'^-?x', args[0]):
+        return f'{head} extraction keeps `../` member names; extract with unzip instead'
+    return None
 
 
 GIT_ENV_NAMES = r'(GIT_DIR|GIT_WORK_TREE|GIT_INDEX_FILE|GIT_CONFIG\w*)'

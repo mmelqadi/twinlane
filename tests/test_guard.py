@@ -245,7 +245,31 @@ class RelativePathEscapes(unittest.TestCase):
     SHAPES = ('unzip a.zip -d {p} > log.txt', 'unzip a.zip -d{p} > log.txt', 'tar -xf a.tar -C{p} > l.txt',
               'tar -xvC{p} -f a.tar > l.txt', 'tar -xf a.tar --directory={p} > l.txt', 'dd if=a of={p}',
               'rsync a {p}', 'cp a {p}', 'touch {p}', 'echo x > {p}', 'Copy-Item a -Destination:{p}',
-              'unzip a.zip -d {p}', 'tar -xf a.tar -C {p}', 'Expand-Archive a.zip -DestinationPath {p}')
+              'unzip a.zip -d {p}', 'tar -xf a.tar -C {p}', 'Expand-Archive a.zip -DestinationPath {p}',
+              'wget -q http://127.0.0.1/x -O {p}', 'sort -o {p} a', 'split a {p}', 'csplit -f {p} a 1',
+              'sqlite3 {p} "create table t(a)"', 'python -m zipfile -e a.zip {p}')
+    # Destinations that are not `..` but still outside: home, variables, roots, and a POSIX-escaped dot.
+    ROOTED = ('~/x', '$HOME/x', '${HOME}/x', '%TEMP%\\x', '/tmp/x', '.\\./x')
+
+    def test_rooted_destinations_in_every_option_shape_are_denied(self):
+        for shape in self.SHAPES:
+            if shape.startswith('echo'):
+                continue
+            for p in self.ROOTED:
+                self.assertIsNotNone(code(shape.format(p=p)), shape.format(p=p))
+
+    def test_archive_options_that_let_member_names_escape_are_denied(self):
+        for cmd in ('unzip -: a.zip', 'unzip -o -: a.zip', 'tar -xPf a.tar', 'tar xPf a.tar',
+                    'tar --absolute-names -xf a.tar', 'tar -xf a.tar --transform s,^,../,', 'bsdtar -xf a.tar -s ,^,../,',
+                    'cpio -idm < a.cpio', 'cpio --extract < a.cpio', '7z x a.7z -spf', 'jar xf a.jar',
+                    'busybox tar -xPf a.tar', 'sudo tar -xPf a.tar', 'nohup unzip -: a.zip', '/usr/bin/tar -xPf a.tar'):
+            self.assertIsNotNone(code(cmd), cmd)
+
+    def test_archive_defaults_that_strip_member_names_are_allowed(self):
+        for cmd in ('unzip a.zip', 'unzip -o a.zip -d out', 'tar -xf a.tar', 'tar -xzf a.tgz -C out', '7z x a.7z',
+                    'cpio -idm --no-absolute-filenames < a.cpio', 'tar -cf a.tar src', 'echo $HOME > out.txt',
+                    'del /Q build\\x.txt', 'curl -o out.html http://127.0.0.1/x', 'sort a > out.txt'):
+            self.assertIsNone(code(cmd), cmd)
 
     def test_every_escape_spelling_in_every_option_shape_is_denied(self):
         for shape in self.SHAPES:
