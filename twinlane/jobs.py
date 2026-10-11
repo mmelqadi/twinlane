@@ -675,6 +675,16 @@ def _engine_gone(proc, grace_s: float = KILL_GRACE_S) -> bool:
     return proc.poll() is not None
 
 
+def _pid_gone(pid, created, grace_s: float = KILL_GRACE_S) -> bool:
+    """After a kill this process did not start: wait up to the grace for the pid to stop being that process."""
+    deadline = time.monotonic() + grace_s
+    while common.pid_maybe_alive(pid, created):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.1)
+    return True
+
+
 def _note_survivor(job_id: str, engine: str, proc, created, why: str) -> None:
     """Record that `proc` outlived its kill, BEFORE any receipt says the job ended: the receipt then cannot hide
     it from job_status, running_count or `twinlane stop`. Best effort: a read-only disk must not hide it from the
@@ -2575,6 +2585,8 @@ def _stop_survivor(jid: str, receipt: dict, survivor: dict, as_json: bool) -> in
         common.emit({'id': jid, 'status': 'unknown', 'identity_unknown_pids': [pid], 'killed_pids': []}, as_json, msg)
         return common.EXIT_FAILED
     killed = common.kill_tree(pid, created)
+    if killed:  # SIGKILL is asynchronous on POSIX: the process may still be running the instant kill() returns
+        _pid_gone(pid, created)
     if common.pid_maybe_alive(pid, created):
         msg = (f'{jid}: stop FAILED: engine pid {pid} is still alive after the kill; the job stays orphaned and '
                f'holds its slot. Retry `twinlane stop {jid}` or end the process by hand.')

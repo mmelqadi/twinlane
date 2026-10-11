@@ -15,7 +15,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ (github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')) && fromJSON('["windows-latest", "macos-latest", "ubuntu-latest"]') || fromJSON('["ubuntu-latest"]') }}
+        os: [windows-latest, macos-latest, ubuntu-latest]
         python-version: ['3.9', '3.12']
     steps:
       - uses: actions/checkout@v7

@@ -81,7 +81,8 @@ ENGINE_WORDS = {'claude', 'codex', 'claude.exe', 'codex.exe', 'claude.cmd', 'cod
 WRITE_FLAGS = re.compile(r'(^|\s)(--output(=|\s|$)|--ext-diff|--pre(=|\s|$))')
 WRITE_VERBS = re.compile(r'(^|[\s;&|(])(cp|mv|rm|rmdir|del|erase|copy|move|ren|rename|robocopy|xcopy|mkdir|md|touch|'
                          r'tee|truncate|ln|install|sed\s+-i|perl\s+-i|copy-item|move-item|remove-item|'
-                         r'set-content|add-content|out-file|new-item|rename-item|clear-content)(?=\s|$)', re.I)
+                         r'set-content|add-content|out-file|new-item|rename-item|clear-content|'
+                         r'dd|unzip|tar|7z|rsync|scp|patch|wget|expand-archive)(?=\s|$)', re.I)
 # Commands whose every path argument is a write target when they lead a command.
 WRITE_VERB_NAMES = {'cp', 'mv', 'rm', 'rmdir', 'rd', 'del', 'erase', 'copy', 'move', 'ren', 'rename', 'robocopy',
                     'xcopy', 'mkdir', 'md', 'touch', 'tee', 'truncate', 'ln', 'install', 'copy-item', 'cpi',
@@ -707,6 +708,22 @@ def _expand(word: str) -> str | None:
     return w
 
 
+def _path_candidates(word: str) -> list:
+    """Every path a word can name, quotes removed: the word itself, a value after `=` or `:`, a short option's
+    attached value (`-d../x`), and every value a flag cluster could carry (`-xvC../x`)."""
+    w = (word or '').replace('"', '').replace("'", '')
+    if not w.startswith('-'):
+        return [w] + ([w.split('=', 1)[1]] if '=' in w else [])  # dd of=../x
+    out = [w.split(sep, 1)[1] for sep in '=:' if sep in w]
+    if not out and not w.startswith('--'):  # a flag cluster: the value may start after any of its letters
+        i = 2
+        while i < len(w) and w[i - 1].isalpha():
+            if w[i] not in '/\\':
+                out.append(w[i:])
+            i += 1
+    return out
+
+
 def _outside(word: str, root: str, base: str | None) -> bool:
     """True when a path word resolves outside root. Relative paths resolve against base (the shell's cwd,
     None when a `cd` could not be followed); `..`, `~` and variables count as outside unless they resolve
@@ -777,7 +794,7 @@ def path_hazard(ws: list[str], seg: str, root: str, base: str | None, stack: lis
             return base, f'a writing command names a path outside the job worktree ({common.clip(path, 120)})'
     if writing:  # a command it does not model (unzip -d, tar -C) still names `..` paths: resolve each one
         for w in (words(seg) if raw is None else raw)[1:]:
-            for cand in ([w] if not w.startswith('-') else []) + ([w.split('=', 1)[1]] if '=' in w else []):
+            for cand in _path_candidates(w):
                 if DOTDOT.search(cand) and cand not in sources and _outside(cand, root, base):
                     return base, f'a writing command names a path outside the job worktree ({common.clip(cand, 120)})'
     return base, None

@@ -239,6 +239,24 @@ class RelativePathEscapes(unittest.TestCase):
                     'pushd sub && cp a b && popd && cp c d', f'cd {WT}/sub && cp a b'):
             self.assertIsNone(code(cmd), cmd)
 
+    # Every escape spelling under every way a command can take a path. A guard fix that closes one cell and
+    # misses its neighbour fails here, not in the next review.
+    SPELLINGS = ('../x', './../x', '..\\x', '"../x"', "'../x'", 'sub/../../x', '..')
+    SHAPES = ('unzip a.zip -d {p} > log.txt', 'unzip a.zip -d{p} > log.txt', 'tar -xf a.tar -C{p} > l.txt',
+              'tar -xvC{p} -f a.tar > l.txt', 'tar -xf a.tar --directory={p} > l.txt', 'dd if=a of={p}',
+              'rsync a {p}', 'cp a {p}', 'touch {p}', 'echo x > {p}', 'Copy-Item a -Destination:{p}',
+              'unzip a.zip -d {p}', 'tar -xf a.tar -C {p}', 'Expand-Archive a.zip -DestinationPath {p}')
+
+    def test_every_escape_spelling_in_every_option_shape_is_denied(self):
+        for shape in self.SHAPES:
+            for p in self.SPELLINGS:
+                self.assertIsNotNone(code(shape.format(p=p)), shape.format(p=p))
+
+    def test_the_same_shapes_inside_the_worktree_are_allowed(self):
+        for shape in self.SHAPES:
+            for p in ('out', './out', 'sub/../out', '"out"', 'sub\\out'):
+                self.assertIsNone(code(shape.format(p=p)), shape.format(p=p))
+
     def test_relative_paths_resolve_against_the_shells_cwd(self):
         # The hook knows the shell's cwd: after a `cd ..` in an earlier call, `touch x` lands outside.
         self.assertIsNotNone(code('touch x', shell_cwd=PARENT))

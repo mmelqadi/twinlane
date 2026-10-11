@@ -23,6 +23,8 @@
 - Code workers start without secret-named environment variables; the receipt lists the stripped names only.
 - On Windows, `/X` after `del`, `rd`, `move` or `copy` is read as a switch only when it is one of that verb's cmd switches and no PowerShell parameter is present, so `del /outside` is a path.
 - `claude.extra_usage_allowed` takes effect only when it is the JSON value `true`.
+- Archive and transfer tools (`unzip`, `tar`, `7z`, `dd`, `rsync`, `scp`, `patch`, `wget`, `Expand-Archive`) count as writes, and every `..` path a writing command names is resolved, including attached option values (`-d../x`, `-xvC../x`, `of=../x`, `-Destination:..\x`) and quoted ones.
+- `twinlane stop` gives a killed survivor its grace period before judging it alive (on Linux, SIGKILL lands after `kill()` returns).
 - Still a heuristic over command text, not a sandbox.
 
 ### Board, meter and batons
