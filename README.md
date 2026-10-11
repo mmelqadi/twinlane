@@ -2,6 +2,8 @@
 
 Run Claude Code and Codex together on your included subscriptions: one usage meter, failover before a limit hits, background workers with receipts.
 
+Works with Anthropic's Claude Code CLI and the OpenAI Codex CLI on Windows, macOS and Linux (Python 3.9+, standard library). Use it when you keep hitting Claude Code usage limits or Codex rate limits mid-task, when you want parallel AI coding agents in separate git worktrees, or when you need a guardrail hook that keeps an autonomous coding agent inside its worktree.
+
 ![twinlane board](docs/demo.svg)
 
 ## Why
