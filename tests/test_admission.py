@@ -164,7 +164,8 @@ runpy.run_path(sys.argv[0],run_name='__main__')
         proc = mock.Mock(pid=12345)
         proc.poll.return_value = None
         proc.wait.side_effect = subprocess.TimeoutExpired('synthetic', 0)
-        with mock.patch.object(common, 'acquire_codex', return_value=('synthetic.exe', None, 'lease')), \
+        with mock.patch.dict(os.environ, {'TWINLANE_CODEX_BIN': 'synthetic'}), \
+                mock.patch.object(common, 'acquire_codex', return_value=('synthetic.exe', None, 'lease')), \
                 mock.patch.object(common, 'release_codex') as release, \
                 mock.patch.object(jobs.subprocess, 'Popen', return_value=proc), \
                 mock.patch.object(common, 'process_created', side_effect=OSError('identity unavailable')), \

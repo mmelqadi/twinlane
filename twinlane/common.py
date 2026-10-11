@@ -1025,6 +1025,22 @@ def _win_process_info(pid: int) -> tuple[bool, int | None]:
         k32.CloseHandle(h)
 
 
+def _posix_zombie(pid: int) -> bool:
+    """True when the pid is a zombie: killed or exited and only waiting for its parent to reap it."""
+    try:
+        with open(f'/proc/{pid}/stat', encoding='ascii', errors='replace') as h:
+            return h.read().rsplit(')', 1)[1].split()[0] == 'Z'
+    except (OSError, IndexError):
+        pass
+    if sys.platform != 'darwin':
+        return False
+    try:
+        result = subprocess.run(['ps', '-o', 'stat=', '-p', str(pid)], capture_output=True, text=True, timeout=3)
+        return result.returncode == 0 and result.stdout.strip().startswith('Z')
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
 def _posix_start_time(pid: int) -> int | None:
     try:
         with open(f'/proc/{pid}/stat', encoding='ascii', errors='replace') as h:
@@ -1094,6 +1110,8 @@ def pid_state(pid, created=None) -> str:
             alive = False
         except PermissionError:
             alive = True
+        if alive and _posix_zombie(pid):
+            return DEAD
         actual = _posix_start_time(pid) if alive else None
     if not alive:
         return DEAD

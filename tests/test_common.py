@@ -102,6 +102,22 @@ class PidStateIsTriState(unittest.TestCase):
         self.assertIsNone(self.child.poll(), 'kill_tree killed a process whose identity it could not read')
 
 
+@unittest.skipIf(os.name == 'nt', 'zombies are a POSIX state')
+class ZombieIsDead(unittest.TestCase):
+    def test_a_killed_child_its_parent_has_not_reaped_is_dead(self):
+        child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+        self.addCleanup(child.wait)
+        created = common.process_created(child.pid)
+        self.assertEqual(common.pid_state(child.pid, created), common.ALIVE)
+        os.kill(child.pid, 9)
+        deadline = time.time() + 10
+        while time.time() < deadline and not common._posix_zombie(child.pid):
+            time.sleep(0.05)
+        self.assertTrue(common._posix_zombie(child.pid), 'the killed child never showed as a zombie')
+        self.assertEqual(common.pid_state(child.pid, created), common.DEAD)
+        self.assertEqual(common.pid_state(child.pid), common.DEAD)
+
+
 @unittest.skipUnless(shutil.which('git'), 'git not installed')
 class GitKeepsPorcelainLeadingSpace(unittest.TestCase):
     def setUp(self):

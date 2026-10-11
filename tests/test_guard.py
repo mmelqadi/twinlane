@@ -18,6 +18,7 @@ ALLOW = common.load_policy()['claude']['intel_allow']
 WT = ('\x43:\x2fUsers/alice/worktrees/task-a' if os.name == 'nt' else
       os.path.join(tempfile.gettempdir(), 'twinlane-guard-worktree', 'task-a'))
 OTHER = os.path.join(tempfile.gettempdir(), 'twinlane-guard-other', 'x.py')
+PARENT = os.path.dirname(WT)  # outside the job worktree on every OS
 
 
 def bash(cmd):
@@ -238,7 +239,7 @@ class RelativePathEscapes(unittest.TestCase):
 
     def test_relative_paths_resolve_against_the_shells_cwd(self):
         # The hook knows the shell's cwd: after a `cd ..` in an earlier call, `touch x` lands outside.
-        self.assertIsNotNone(code('touch x', shell_cwd='C' + ':/Users' + '/alice/worktrees'))
+        self.assertIsNotNone(code('touch x', shell_cwd=PARENT))
         self.assertIsNone(code('touch x', shell_cwd=WT + '/sub'))
         self.assertIsNone(code('touch ../x', shell_cwd=WT + '/sub'))
 
@@ -285,7 +286,7 @@ ROUND1_BYPASSES = (
     ('. git commit -m x', 2),
     ("Start-Process -FilePath git -ArgumentList @('commit','-m','x')", 2),
     ('git -calias.save=commit save -m x', 4),
-    ('GIT_DIR=C' + ':/Users' + '/alice/.twinlane/.git git add .', 4),
+    ('GIT_DIR=' + PARENT + '/.twinlane/.git git add .', 4),
     ('git diff --output=../out', 5),
     ('curl http://127.0.0.1/a -o../out', 5),
     ('python -c "open(\'../out\',mode=\'w\').write(\'x\')"', 5),
@@ -427,7 +428,7 @@ class HookProtocol(unittest.TestCase):
 
     def test_the_shells_cwd_reaches_the_path_check(self):
         rc, out = self.run_main({'tool_name': 'Bash', 'tool_input': {'command': 'touch x'},
-                                 'cwd': 'C' + ':/Users' + '/alice/worktrees'},
+                                 'cwd': PARENT},
                                 {'TWINLANE_ENGINE_JOB': 'j1', 'TWINLANE_ENGINE_PROFILE': 'code', 'TWINLANE_ENGINE_CWD': WT})
         self.assertIn('outside the job worktree', self.deny_reason(out))
 

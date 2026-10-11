@@ -89,7 +89,7 @@ WRITE_VERB_NAMES = {'cp', 'mv', 'rm', 'rmdir', 'rd', 'del', 'erase', 'copy', 'mo
                     'new-item', 'ni', 'rename-item', 'rni', 'clear-content', 'clc', 'tee-object', 'rsync', 'scp'}
 # On Windows a bare /X is usually a cmd switch (del /Q, robocopy /MIR), so only Git Bash drive paths (/c/...) count.
 _SLASH_ROOT = r'/[a-zA-Z]/[^\s"\'|;&<>]*' if os.name == 'nt' else r'/[^\s"\'|;&<>]*'
-ABS_PATH = re.compile(r'(?<![\w/])([A-Za-z]:[\\/][^\s"\'|;&<>]*|' + _SLASH_ROOT + r'|'
+ABS_PATH = re.compile(r'(?<![\w/.])([A-Za-z]:[\\/][^\s"\'|;&<>]*|' + _SLASH_ROOT + r'|'
                       r'\\' r'\\' r'[^\s"\'|;&<>]+)')
 SEGMENT_SPLIT = re.compile(r'&&|\|\||[;|&\r\n]')  # a lone & (background) starts a new command too
 REDIRECT = re.compile(r'"[^"]*"|\'[^\']*\'|(?:\d|&|\*)?>>?\|?\s*("[^"]*"|\'[^\']*\'|[^\s;&|<>]+)')
@@ -200,7 +200,7 @@ def segments(command: str) -> list[str]:
 
 # One token of a command line: a double-quoted string (a `\` or backtick escapes the next character; an
 # unclosed one runs to the end), a single-quoted string, an operator, or plain text.
-CMD_TOKEN = re.compile(r'"(?:[^"\x5c`]|[\x5c`][\s\S])*+(?:"|[\x5c`]?\Z)|\'[^\']*+(?:\'|\Z)|&&|\|\||[;|&\r\n]'
+CMD_TOKEN = re.compile(r'"(?:[^"\x5c`]|[\x5c`][\s\S])*(?:"|[\x5c`]?\Z)|\'[^\']*(?:\'|\Z)|&&|\|\||[;|&\r\n]'
                        r'|[^"\';|&\r\n]+')
 CMD_OPS = {'&&', '||', ';', '|', '&', '\r', '\n'}
 
@@ -257,7 +257,7 @@ def heredocs(command: str) -> tuple[str, list[str]]:
     return '\n'.join(out), bodies
 
 
-WORD = re.compile(r'(?:[^\s"\']++|"[^"]*+"|\'[^\']*+\'|["\'])++')
+WORD = re.compile(r'(?:[^\s"\']|"[^"]*"|\'[^\']*\'|["\'])+')
 QUOTED = re.compile(r'"([^"]*)"|\'([^\']*)\'')
 
 
