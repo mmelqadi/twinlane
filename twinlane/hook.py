@@ -82,7 +82,7 @@ def refresh_due(meter: dict | None, max_age_s: float) -> bool:
 def spawn_refresh(state_dir: str, spawn=None) -> bool:
     """Start `twinlane meter --fresh --json` detached unless one started within REFRESH_THROTTLE_S.
 
-    --fresh only: never --refresh, which would spend a Claude call.
+    --fresh rereads usage without making a model call.
     """
     marker = os.path.join(state_dir, 'hook-refresh.json')
     last = common.read_json(marker, {}) or {}

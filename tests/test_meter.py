@@ -421,6 +421,34 @@ class ClaudeSourceTests(TempState):
         meter.read_claude_raw(refresh=False, _http=mock.Mock(), _run=run)
         run.assert_not_called()
 
+    def test_malformed_refresh_output_keeps_the_cached_reading(self):
+        self.write_creds(-60)
+        self.record_extra_off()
+        for body in ('not json', '[1]', '"unexpected"', '42', 'null',
+                     '{"usage": 1}', '{"usage": "input_tokens"}', '{"usage": ["input_tokens"]}'):
+            with self.subTest(body=body), mock.patch.object(common, 'claude_bin', return_value='fake-claude'):
+                run = mock.Mock(return_value=(1, body, ''))
+                raw = meter.read_claude_raw(refresh=True, _http=mock.Mock(), _run=run)
+                run.assert_called_once()
+                self.assertEqual(raw['source'], 'desktop')
+                self.assertIs(raw['extra_usage_enabled'], False)
+                self.assertIn('refresh call rc=1', raw['note'])
+                self.assertIn('after refresh:', raw['note'])
+
+    def test_malformed_refresh_output_still_retries_oauth(self):
+        self.write_creds(-60)
+        self.record_extra_off()
+
+        def run(*args, **kwargs):
+            self.write_creds(3600)
+            return 0, '["unexpected"]', ''
+
+        with mock.patch.object(common, 'claude_bin', return_value='fake-claude'):
+            raw = meter.read_claude_raw(refresh=True, _http=lambda *a: (200, fixture('oauth_usage.json')),
+                                       _run=run)
+        self.assertEqual(raw['source'], 'oauth')
+        self.assertIn('token refreshed', raw['note'])
+
 
 class RefreshGateTests(TempState):
     """The token refresh is a real (tiny) model call: it may run only when extra usage is known OFF."""
@@ -489,7 +517,7 @@ class RefreshGateTests(TempState):
         self.assertEqual(m['claude']['source'], 'oauth')
 
     def test_the_raw_refresh_path_is_gated_too(self):
-        # `twinlane meter --refresh` and the second half of the old read(False) -> read(True) pair.
+        # Explicit internal refreshes are gated just like automatic refreshes.
         for extra in (True, None):
             self.write_creds(-60)
             self.seed(extra)
