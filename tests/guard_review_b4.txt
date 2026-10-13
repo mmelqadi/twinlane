@@ -1,0 +1,93 @@
+PowerShell	D	git push
+PowerShell	D	if ($true) { git push }
+PowerShell	D	foreach ($x in 1) { git push }
+PowerShell	D	1 | ForEach-Object { git push }
+PowerShell	D	1 | % { git push }
+PowerShell	D	try { git push } finally {}
+PowerShell	D	& { git push }
+PowerShell	D	. { git push }
+PowerShell	D	Invoke-Command { git push }
+PowerShell	D	Invoke-Command -ScriptBlock { psql -l }
+PowerShell	D	icm { git push }
+PowerShell	D	Start-Process git -ArgumentList push
+PowerShell	D	Start-Process -FilePath git -ArgumentList 'push'
+PowerShell	D	saps git push
+PowerShell	D	start git push
+PowerShell	D	Start-Process cmd.exe -ArgumentList '/c git push'
+PowerShell	D	Start-Process psql -ArgumentList '-l'
+PowerShell	D	Start-Job { git push }
+PowerShell	D	Start-ThreadJob { git push }
+PowerShell	D	Invoke-Expression 'git push'
+PowerShell	D	iex 'git push'
+PowerShell	D	iex "git $('pu'+'sh')"
+PowerShell	D	Invoke-Expression ('g'+'it push')
+PowerShell	D	iex ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('Z2l0IHB1c2g=')))
+PowerShell	D	[Diagnostics.Process]::Start('git','push')
+PowerShell	D	[System.Diagnostics.Process]::Start("psql")
+PowerShell	D	$p = New-Object System.Diagnostics.Process
+PowerShell	D	$s=[scriptblock]::Create('git push'); & $s
+PowerShell	D	& ([scriptblock]::Create('git push'))
+PowerShell	D	$ExecutionContext.InvokeCommand.InvokeScript('git push')
+PowerShell	D	& (gcm git) push
+PowerShell	D	& $env:ComSpec /c git push
+PowerShell	D	cmd /c "git push"
+PowerShell	D	cmd.exe /c git push
+PowerShell	D	cmd /c "set x=git&& call %x% push"
+PowerShell	D	cmd /c g^i^t push
+PowerShell	D	cmd /c "g""it push"
+PowerShell	D	cmd /v:on /c "set x=git&& !x! push"
+PowerShell	D	powershell -c "git push"
+PowerShell	D	powershell -enc ZwBpAHQAIABwAHUAcwBoAA==
+PowerShell	D	powershell -e ZwBpAHQAIABwAHUAcwBoAA==
+PowerShell	D	powershell -Command -
+PowerShell	D	'git push' | powershell -Command -
+PowerShell	D	'git push' | powershell -
+PowerShell	D	'git push' | cmd
+PowerShell	D	git.exe push
+PowerShell	D	git `push
+PowerShell	D	g`it push
+PowerShell	D	& "g`it" push
+PowerShell	D	& ('git') push
+PowerShell	D	&'git' push
+PowerShell	D	. 'git' push
+PowerShell	D	Invoke-Sqlcmd -Query x
+PowerShell	D	Invoke-SqlCmd2 -Query x
+PowerShell	D	[System.Data.SqlClient.SqlConnection]::new('x')
+PowerShell	D	Add-Type -AssemblyName System.Data; $c = New-Object Data.SqlClient.SqlConnection
+PowerShell	D	$c = New-Object 'Data.SqlClient.SqlConnection'
+PowerShell	D	$c = New-Object ('System.Data.Sql'+'Client.SqlConnection')
+PowerShell	D	Set-Content -Path ..\..\x.txt -Value x
+PowerShell	D	E:Set-Content \x43:\x5cWindows\x5cx.txt x
+PowerShell	D	'x' | Out-File ..\x.txt
+PowerShell	D	E:'x' | Out-File -FilePath \x43:\x5cx.txt
+PowerShell	D	'x' > ..\x.txt
+PowerShell	D	E:Add-Content -Path \x43:\x5cx.txt -Value 1
+PowerShell	D	E:New-Item -ItemType Junction -Path link -Target \x43:\x5cWindows
+PowerShell	D	New-Item -ItemType SymbolicLink -Path link -Value C:\
+PowerShell	D	ni -ItemType Junction link -Target ..\..
+PowerShell	D	E:Copy-Item x -Destination \x43:\x5cx
+PowerShell	D	Move-Item x ..\..\x
+PowerShell	D	Remove-Item -Recurse ..\..\other
+PowerShell	D	ri -r ..\..\other
+PowerShell	D	E:[IO.File]::WriteAllText('\x43:\x5cx.txt','x')
+PowerShell	D	[System.IO.File]::WriteAllText("..\x.txt","x")
+PowerShell	D	E:[IO.File]::Delete('\x43:\x5cx')
+PowerShell	D	[IO.Directory]::Delete('..\..\x', $true)
+PowerShell	D	Set-Content -LiteralPath ('..'+'\x') x
+PowerShell	D	$p='..\x'; Set-Content $p x
+PowerShell	D	Set-Content $env:TEMP\x x
+PowerShell	D	Set-Content ~\x x
+PowerShell	D	Set-Location ..; Set-Content x y
+PowerShell	D	cd ..; 'x' > y
+PowerShell	D	Push-Location ..\..; rm -r x
+PowerShell	D	E:Export-Csv -Path \x43:\x5cx.csv
+PowerShell	D	Get-Date | Export-Clixml ..\x.xml
+PowerShell	D	Tee-Object -FilePath ..\x
+PowerShell	D	E:Start-Transcript -Path \x43:\x5cx.txt
+PowerShell	D	E:Expand-Archive x.zip -DestinationPath \x43:\x5cx
+PowerShell	D	E:Invoke-WebRequest http://example.com -OutFile \x43:\x5cx
+PowerShell	D	Rename-Item x ..\y
+PowerShell	D	Set-ItemProperty HKCU:\x -Name y -Value z
+PowerShell	D	New-ItemProperty HKCU:\Software\x -Name y
+PowerShell	D	Register-ScheduledTask x
+PowerShell	D	schtasks /create /tn x /tr "git push"

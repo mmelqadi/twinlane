@@ -37,8 +37,17 @@
     "tier_by_kind": {"parallel": "sol", "sweep": "luna", "integrate": "sol", "verify": "sol-high",
       "code": "sol-high", "intel": "sol-high", "plan": "astra", "review": "astra"},
     "write_kinds": ["code", "integrate"], "allow_credits": false, "max_parallel": 4,
-    "timeout_s": 3600, "preflight_max_age_s": 300, "stale_reading_max_age_s": 1800
+    "timeout_s": 3600, "preflight_max_age_s": 300, "stale_reading_max_age_s": 1800,
+    "binary_source": "auto", "exec_config": [], "min_cli_version": null
   },
+  "guard": {"allow_subagents": false, "self_aliases": [], "deny_commands": [], "deny_text": []},
+  "secrets": {"extra_env_name_patterns": []},
+  "land": {"heartbeat_s": 15, "heartbeat_stale_s": 120, "gate_timeout_s": 1800},
+  "ship": {"dry_run_max_age_s": 1800},
+  "wt": {"deps_dirs": [], "stale_days": 7, "prune_min_age_s": 86400, "link_roots": []},
+  "best_of": {"max_contestants": 3},
+  "resume": {"max_batch": 10},
+  "projects": {},
   "routing": {
     "code": {"primary": "claude", "fallback": "codex"},
     "intel": {"primary": "claude", "fallback": "codex"},

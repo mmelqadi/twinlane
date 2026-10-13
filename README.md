@@ -17,6 +17,7 @@ Works with Anthropic's Claude Code CLI and the OpenAI Codex CLI on Windows, macO
 - **Route new work.** Choose an engine by task type, fresh usage readings, and your configured thresholds.
 - **Prepare a handoff.** Save the task's goal, progress, decisions, and recent evidence in a brief for the next engine.
 - **Inspect delegated work.** Background jobs leave event logs, final results, and receipts you can review locally.
+- **Land and ship deliberately.** A single-integrator land queue with a gate, a release manifest for exactly what landed, worktree health checks, best-of runs across engines, and restart recovery for lost jobs (see the sections below).
 
 If a dispatched worker ends with a recognized usage-limit result, twinlane can make one policy-checked attempt on the other engine, carrying the original brief, available partial output, and worktree changes. This is a new attempt; it does not migrate a running conversation.
 
@@ -157,6 +158,83 @@ route now: ->codex code* intel* plan* review* parallel sweep integrate verify  (
   none (batons point at no linked worktree)
 ```
 
+## Landing finished work
+
+`twinlane land` lets one integrator land worktree branches into the target branch one at a time. Each repository (identified by its main checkout) has one first-in-first-out queue and one integrator lock.
+
+```sh
+twinlane land enqueue my-task --worktree ../app-my-task    # append the branch to the queue
+twinlane land status                                       # queue and lock holder
+twinlane land run --dry-run                                # print the checks; no lock, no writes
+twinlane land run                                          # land the head of the queue
+```
+
+`land run` runs the project's `land.gate` in the slug's worktree on the tree that will land, then fast-forwards the target branch. A failing gate lands nothing, and a gate that moves `HEAD` or changes the tree is refused. If the target moved, `--rebase` rebases a linear branch first; a range that holds merge commits is never rebased. Every outcome (landed, refused, failed, broken lock) is appended to a ledger that records the exact commit range.
+
+The lock is held by the running `land run` process and carries a token and a heartbeat. A live holder is never taken, even with a stale heartbeat. A provably dead holder is cleared only with `twinlane land release --break --reason "..."` (or `land run --break --reason "..."`); a holder whose liveness cannot be judged is never broken. Other subcommands: `next`, `dequeue SLUG`, `log [SLUG]`. Add `--json` for machine-readable output. Exit codes: 0 ok, 2 usage, 3 refused, 4 lock held, 5 gate or land failed. Workers cannot run `land`; run it from the lead session.
+
+## Shipping landed work
+
+`twinlane ship` never ships by default. It turns a landing into a manifest and runs the command you configured, behind a dry run.
+
+```sh
+twinlane ship plan my-task                         # manifest of the slug's latest landing
+twinlane ship plan abc1234..def5678                # or an explicit commit range
+twinlane ship run --manifest PATH                  # dry run: runs ship.dry_run_command, writes a receipt
+twinlane ship run --manifest PATH --execute --confirm 1a2b3c4d
+```
+
+`ship plan` lists the exact files of the range (path, sha256 and size of the bytes a checkout of the source commit produces), the deleted paths and the commits. Commits that are not the slug's are flagged as foreign, and paths that later commits changed again are flagged as superseded; the plan is refused unless you pass `--allow-foreign` or `--allow-superseded`. `--baseline REF` names what is already shipped; `--landing N` picks which landing of the slug (1 is the first, -1 the last).
+
+`ship run --execute` needs a configured `ship.command`, a passing dry-run receipt for the same manifest that is younger than `ship.dry_run_max_age_s` and not used yet, and `--confirm` equal to the first 8 hex digits of the manifest sha256. A receipt is good for one execute. A manifest is accepted only in the exact canonical bytes `ship plan` writes. Without `ship.command`, `ship run` only prints the manifest path and exits 3. Workers cannot run `ship run`.
+
+## Worktree health
+
+```sh
+twinlane wt doctor [--all] [--md | --json]    # read-only report
+twinlane wt prune                              # dry run
+twinlane wt prune --yes [--include-empty]      # remove what passed every check
+```
+
+`wt doctor` reports each linked worktree: merged, unlanded, empty, detached or missing; stale; uncommitted changes; what uses it (a live job, a baton, a land queue entry); missing or dangling dependency folders; and the Windows long-path risk. `--all` also covers every project in your config.
+
+`wt prune` is a dry run unless `--yes`. It removes a worktree only when its branch is merged and had commits of its own, it is clean, nothing uses it, and its last activity is older than `wt.prune_min_age_s`. Links (junctions and symlinks) inside it are unlinked first, without being followed. The branch is deleted with `git branch -d` only; an unmerged branch is never deleted. Every action is recorded in `prune.jsonl`. Workers cannot run `prune`.
+
+## Best-of runs
+
+```sh
+twinlane run --best-of claude,codex@sol-high --brief task.md --cd . --write
+twinlane compare GROUP --wait --test
+```
+
+`run --best-of` starts the same brief on several engines (at most `best_of.max_contestants`, default 3). Each contestant is an ordinary background job, so the meters and the money guard apply to every one, and none fails over to the other engine. N contestants spend N times the usage. A write contestant gets its own worktree and branch cut from `--base` (default `HEAD`); read-only contestants share `--cd`. `--dry-run` shows the plan.
+
+`twinlane compare GROUP` lists each contestant's receipt and diff; `--wait` waits for the jobs, `--test` runs the project's configured `test` command in each worktree. Nothing is picked or merged for you. `compare GROUP --discard` (dry run unless `--yes`) removes only that group's empty worktrees, through the same checks as `wt prune`.
+
+## Resuming lost jobs
+
+`twinlane resume` lists background jobs whose status is exactly `lost`, typically after a reboot or an app quit, with the likely cause when the host's boot time shows one. It never runs on its own. `twinlane resume JOB...` or `--all-lost [--since 48h]` selects jobs; `--yes` continues each one once (`run --continue-job`), at most `resume.max_batch` (default 10), and stops at the first refusal. A job that is `unknown`, `orphaned` or running is never resumed, because it may still be alive. A resumed job is marked in `jobs/<id>/resumed.json` and is not resumed twice.
+
+## Per-project configuration
+
+Land, ship, worktree and best-of behaviour is set per repository in the `projects` map of your **user** config, keyed by the main checkout's path. It is never read from the repository itself, so a worker inside a checkout cannot rewrite the gate or ship command that judges its work.
+
+```json
+{
+  "projects": {
+    "/srv/app": {
+      "land": {"target": "main", "gate": ["make", "check"]},
+      "ship": {"dry_run_command": ["make", "release-dry-run", "MANIFEST={manifest}"],
+               "command": ["make", "release", "MANIFEST={manifest}"]},
+      "wt": {"deps_dirs": ["node_modules"], "stale_days": 7},
+      "test": ["make", "test"]
+    }
+  }
+}
+```
+
+Commands are argv lists, never strings; nothing runs through a shell. Placeholders are `{repo}`, `{worktree}`, `{branch}`, `{slug}`, `{target}`, `{manifest}`, `{source_commit}` and `{base}`; an unknown placeholder is an error, and a value with a line break is refused. A `.bat` or `.cmd` command only receives plain values. Other keys: `land.command`, `land.command_rebases`, `land.heartbeat_s`, `land.heartbeat_stale_s`, `land.gate_timeout_s`, `ship.dry_run_max_age_s`, `wt.root`, `wt.setup_command`, `wt.remove_command`, `wt.link_roots`, `wt.prune_min_age_s`. Unknown keys are refused. Without a `land.gate`, `land run` lands ungated and says so.
+
 ## Configuration
 
 `TWINLANE_HOME` overrides the data directory. Otherwise Windows uses `%LOCALAPPDATA%/twinlane`; macOS and Linux use `$XDG_DATA_HOME/twinlane` or `~/.local/share/twinlane`. The directory holds `state/`, `jobs/`, `batons/`, and `bin/`. `TWINLANE_CONFIG` selects a user JSON file; otherwise twinlane reads `<home>/config.json`. User values merge recursively over the packaged `policy.json`.
@@ -173,11 +251,17 @@ Add local deny rules in your own config, for example:
 
 Arrays replace the packaged array; include the generic rules you still need. Do not put credentials in the config file.
 
+Guard settings go in the `guard` section: `deny_commands` (program names, optionally with leading arguments), `deny_text` (regular expressions matched against the command text), `self_aliases` (extra names for the twinlane command) and `allow_subagents` (default false). A `guard` section that is not an object, or cannot be read, denies every call of the job.
+
+Codex settings: `codex.binary_source` is `auto` (default: the desktop app's private copy when there is one, else `codex` on PATH), `app-copy` or `path`; `TWINLANE_CODEX_BIN` overrides it in every mode. `codex.min_cli_version` (`X.Y.Z`) refuses a binary that is older or whose version cannot be read. `codex.exec_config` is a list of `"key=value"` strings passed to `codex exec` as `-c`; it may not set the model, its effort, the sandbox or the approval policy, which twinlane sets per job.
+
+Installer options: `twinlane install --check` is a read-only report (one hook expected, shims, skills). `--unhook` removes only twinlane's hook entry. `--hook-command CMD` registers or recognises a custom hook command. `--alias NAME[,NAME]` writes command shims into `--bin-dir` (default `~/.local/bin`); `--replace` backs up and replaces a shim twinlane did not write. `--skill DIR` writes the packaged `SKILL.md` into `DIR`. Every write is a preview until `--yes`.
+
 ## Platform and security
 
 Windows has detached background workers and process-tree stop support. POSIX workers detach with a new session and stop their process group. Windows job-object details have no POSIX equivalent. The WMI start was tested with synthetic job-close and tree-kill tests and with real quit-and-reopen tests of the Claude and Codex desktop apps on one Windows machine and build: the runners and engines kept running. That shows survival on that tested setup only; it is not a general guarantee, and it says nothing about whether the task itself succeeds. Sign-out, shutdown, sleep and reboot were not tested. The Codex app-server meter currently finds only the Windows Codex desktop app. It copies a complete app-server build into `<home>/bin`, keeping at most 3 copies of about 434 MB each (about 1.3 GB total). On Linux/macOS, set `TWINLANE_CODEX_BIN` or rely on rollout files. Otherwise the Codex meter reads **unknown**, and parallel/sweep routes fail safe to Claude or refuse.
 
-`twinlane install` registers an advisory hook for interactive sessions. The blocking guard only acts inside twinlane-dispatched workers; interactive sessions are NOT guarded. The guard is a heuristic over shell text, not a sandbox. It parses each shell command a worker runs and denies git history, ref and config writes (commit, push, pull, merge, rebase, reset, revert, tag, `stash` other than list/show, `notes` writes, `config` writes, `submodule foreach`, program options such as `--upload-pack`), outbound sends (curl/wget/Invoke-WebRequest with a body, a non-GET method or a non-local host, mail clients, ssh/scp/rsync to a host, `gh` writes, cloud CLIs, package publishing), nested engine launches, and in the code profile paths outside the worktree: any path named by a write command, a redirect or an output option (`-o`, `--output`, `--target-dir`, ...), and a `..` or home path named by any command that is not on a short read-only list (so `chmod`, `sed --in-place` or `perl -pi` on `../x` are denied without being listed). Archive extractors run only with options known to keep member names inside the destination. It follows wrappers (`env`, `sudo`, `timeout`, `xargs`), `env -S`/`env -C`, git config passed through the environment, and code given inline to an interpreter. It does not read script files, and a command obfuscated in a way it does not model can still pass: quoting beyond simple concatenation, aliases and functions, a bare `$CMD`, a script written and then run, lookalike Unicode in a command name. A command too long or too complex to inspect is denied, and if the guard itself cannot load inside a job it blocks the call (exit 2). The meter reads local CLI credentials and vendor usage information. Its Claude endpoint is undocumented and may change; redirects are refused so the token stays on the original host. No API key router is used.
+`twinlane install` registers an advisory hook for interactive sessions. The blocking guard only acts inside twinlane-dispatched workers; interactive sessions are NOT guarded. The guard is a heuristic over shell text, not a sandbox. It parses each shell command a worker runs and denies git history, ref and config writes (commit, push, pull, merge, rebase, reset, revert, tag, `stash` other than list/show, `notes` writes, `config` writes, `submodule foreach`, program options such as `--upload-pack`), outbound sends (curl/wget/Invoke-WebRequest with a body, a non-GET method or a non-local host, mail clients, ssh/scp/rsync to a host, `gh` writes, cloud CLIs, package publishing), nested engine launches, and in the code profile paths outside the worktree: any path named by a write command, a redirect or an output option (`-o`, `--output`, `--target-dir`, ...), and a `..` or home path named by any command that is not on a short read-only list (so `chmod`, `sed --in-place` or `perl -pi` on `../x` are denied without being listed). Archive extractors run only with options known to keep member names inside the destination. It follows wrappers (`env`, `sudo`, `timeout`, `xargs`), `env -S`/`env -C`, git config passed through the environment, and code given inline to an interpreter. It does not read script files, and a command obfuscated in a way it does not model can still pass: quoting beyond simple concatenation, aliases and functions, a bare `$CMD`, a script written and then run, lookalike Unicode in a command name. It also denies database clients, program runners and nested shells, git ref writes, PowerShell execution and persistence commands (scheduled tasks, crontab), twinlane commands that dispatch or mutate, and any write to the worktree's `.git`; file-tool paths must be literal (`~`, `$VAR` and URLs are refused). The guard is defense in depth, not confinement: see [Limits](LIMITS.md). A command too long or too complex to inspect is denied, and if the guard itself cannot load inside a job it blocks the call (exit 2). The meter reads local CLI credentials and vendor usage information. Its Claude endpoint is undocumented and may change; redirects are refused so the token stays on the original host. No API key router is used.
 
 ## What this is not
 

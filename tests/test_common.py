@@ -415,6 +415,23 @@ class StripSecretEnv(unittest.TestCase):
             out, names = common.strip_secret_env({'GH_TOKEN': 'x', 'NPM_TOKEN': 'y'})
         self.assertEqual((sorted(out), names), (['GH_TOKEN'], ['NPM_TOKEN']))
 
+    def test_secret_env_extra_patterns_stripped(self):
+        env = {'ACME_STORE_URL': 'u', 'acme_shop': 's', 'APP_LICENSE': 'l', 'GH_TOKEN': 't', 'PATH': 'p'}
+        out, names = common.strip_secret_env(env)  # no extras: only the built-in pattern applies
+        self.assertEqual((names, sorted(out)), (['GH_TOKEN'], ['ACME_STORE_URL', 'APP_LICENSE', 'PATH', 'acme_shop']))
+        extra = common.extra_secret_patterns({'secrets': {'extra_env_name_patterns': ['^ACME_', 'LICENSE$']}})
+        out, names = common.strip_secret_env(env, extra)
+        self.assertEqual(names, ['ACME_STORE_URL', 'APP_LICENSE', 'GH_TOKEN', 'acme_shop'])  # patterns ignore case
+        self.assertEqual(sorted(out), ['PATH'])
+        self.assertEqual(env['ACME_STORE_URL'], 'u')  # the caller's dict is not changed
+        self.assertEqual(common.extra_secret_patterns({}), [])
+        self.assertEqual(common.extra_secret_patterns({'secrets': {'extra_env_name_patterns': []}}), [])
+
+    def test_a_bad_extra_pattern_is_refused_not_ignored(self):
+        for bad in ('^ACME_', ['('], [''], [3]):  # a bare string is not a list of patterns
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                common.extra_secret_patterns({'secrets': {'extra_env_name_patterns': bad}})
+
 
 PING = os.path.join(os.environ.get('SystemRoot', 'C' + r':\Windows'), 'System32', 'PING.EXE')
 
@@ -428,6 +445,84 @@ class CodexBinaryPortable(unittest.TestCase):
         self.assertLess(key('0.9.0'), key('0.10.0'))
         self.assertLess(key('0.161.9'), key('codex-cli 0.162.0-alpha.1'))
         self.assertIsNone(key('codex dev build'))
+
+    def test_binary_source_auto_prefers_env_then_app_copy_then_path(self):
+        app = os.path.join('app', 'copy', 'codex')
+
+        def acquire():  # acquire_codex's contract: the explicit binary as set, else the app copy, else nothing
+            env = os.environ.get('TWINLANE_CODEX_BIN')
+            if env:
+                return env, f'TWINLANE_CODEX_BIN as set: {env}', None
+            return (app, '', 'lease') if have_app[0] else (None, 'no complete Codex app build found', None)
+
+        have_app = [True]
+        on_path = [os.path.join('usr', 'bin', 'codex')]
+        with mock.patch.dict(os.environ, {'TWINLANE_CODEX_BIN': ''}), \
+                mock.patch.object(common, 'acquire_codex', side_effect=acquire) as lookup, \
+                mock.patch.object(common.shutil, 'which', side_effect=lambda name: on_path[0]):
+            # 1. TWINLANE_CODEX_BIN wins over an app copy and the PATH
+            os.environ['TWINLANE_CODEX_BIN'] = os.path.join('my', 'codex')
+            self.assertEqual(common.acquire_codex_binary('auto')[::2], (os.path.join('my', 'codex'), None))
+            # 2. no env: the app copy wins over the PATH, and its lease comes back
+            os.environ['TWINLANE_CODEX_BIN'] = ''
+            self.assertEqual(common.acquire_codex_binary('auto'), (app, '', 'lease'))
+            self.assertEqual(common.acquire_codex_binary()[0], app)  # auto is the default
+            # 3. no env, no app copy: the PATH, and the receipt note says so
+            have_app[0] = False
+            binary, why, lease = common.acquire_codex_binary('auto')
+            self.assertEqual((binary, lease), (on_path[0], None))
+            self.assertIn('no complete Codex app build', why)
+            self.assertIn(on_path[0], why)
+            # 4. nothing anywhere: fail closed
+            on_path[0] = None
+            binary, why, lease = common.acquire_codex_binary('auto')
+            self.assertEqual((binary, lease), (None, None))
+            self.assertIn('no codex on PATH', why)
+            # app-copy never falls back to the PATH, and path never looks for an app copy
+            on_path[0] = os.path.join('usr', 'bin', 'codex')
+            self.assertEqual(common.acquire_codex_binary('app-copy')[::2], (None, None))
+            lookup.reset_mock()
+            have_app[0] = True
+            self.assertEqual(common.acquire_codex_binary('path')[0], on_path[0])
+            lookup.assert_not_called()
+            os.environ['TWINLANE_CODEX_BIN'] = os.path.join('my', 'codex')
+            self.assertEqual(common.acquire_codex_binary('path')[0], os.path.join('my', 'codex'))
+            with self.assertRaises(ValueError):
+                common.acquire_codex_binary('whatever')
+
+    def test_min_cli_version_refuses_old_binary(self):
+        refuse = common.codex_version_refusal
+        with mock.patch.object(common, '_read_codex_version', return_value='0.149.1'):
+            self.assertIsNone(refuse('codex', None))   # no minimum, no check (and no version run)
+            self.assertIsNone(refuse('codex', ''))
+            self.assertIsNone(refuse('codex', '0.149.1'))
+            why = refuse('codex', '0.162.0')
+            self.assertIn('0.149.1', why)
+            self.assertIn('older than codex.min_cli_version 0.162.0', why)
+            self.assertIn('codex', why)
+        with mock.patch.object(common, '_read_codex_version', return_value='0.162.0'):
+            self.assertIsNone(refuse('codex', '0.162.0'))
+            self.assertIsNone(refuse('codex', '0.9.0'))  # numeric, not text, order
+        with mock.patch.object(common, '_read_codex_version', return_value='0.162.0-alpha.2'):
+            self.assertIn('older than', refuse('codex', '0.162.0'))  # a pre-release is below its release
+            self.assertIsNone(refuse('codex', '0.162.0-alpha.1'))
+        with mock.patch.object(common, '_read_codex_version', return_value=None):
+            self.assertIn('cannot read the version', refuse('codex', '0.162.0'))  # unproven is refused
+        with mock.patch.object(common, '_read_codex_version', return_value='0.200.0'):
+            for bad in ('latest', 162, True):
+                self.assertIn('not a version number', refuse('codex', bad))
+
+    def test_exec_config_is_validated(self):
+        ok = common.codex_exec_config({'codex': {'exec_config': ['features.apps=false', 'mcp_servers.x-y.enabled=false',
+                                                                 'notify=["a", "b=c"]']}})
+        self.assertEqual(ok, ['features.apps=false', 'mcp_servers.x-y.enabled=false', 'notify=["a", "b=c"]'])
+        self.assertEqual(common.codex_exec_config({'codex': {}}), [])
+        self.assertEqual(common.codex_exec_config(None), [])
+        for bad in ('features.apps=false', ['features.apps'], ['=false'], ['a b=c'], ['k='], [4], ['k=1\nj=2'],
+                    ['-c=1'], ['sandbox_mode="danger-full-access"'], ['Model_Reasoning_Effort="low"'],
+                    ['approval_policy="never"']):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                common.codex_exec_config({'codex': {'exec_config': bad}})
 
     @unittest.skipIf(common.IS_WIN, 'POSIX binary selection only')
     def test_posix_uses_only_an_explicit_binary_without_a_copy(self):
@@ -488,6 +583,28 @@ class CodexBinary(unittest.TestCase):
         if mtime:
             os.utime(path, (mtime, mtime))
         return path
+
+    def test_env_override_is_used_as_is(self):
+        src = self._exe(os.path.join(self.tmp, 'custom'))
+        os.environ['TWINLANE_CODEX_BIN'] = src
+        self.assertEqual(common.codex_bin(), src)
+
+    def test_binary_source_modes_with_a_real_app_bundle(self):
+        self._exe(self._bundle('abc'), body=b'app build')
+        binary, why, lease = common.acquire_codex_binary('auto')
+        self.addCleanup(common.release_codex, lease)
+        self.assertTrue(binary.startswith(self.bin), binary)  # the leased private copy, not the PATH codex
+        self.assertTrue(lease)
+        self.assertEqual(common.acquire_codex_binary('app-copy')[0], binary)
+        self.assertEqual(common.acquire_codex_binary('path')[::2], (os.path.join(self.tmp, 'path-codex'), None))
+        os.environ['TWINLANE_CODEX_BIN'] = self._exe(os.path.join(self.tmp, 'custom'))
+        self.assertEqual(common.acquire_codex_binary('auto')[0], os.environ['TWINLANE_CODEX_BIN'])
+        shutil.rmtree(self._bundle('abc'))  # the app emptied its bundle on exit: only the earlier copy is left
+        os.environ.pop('TWINLANE_CODEX_BIN')
+        again, why, lease2 = common.acquire_codex_binary('app-copy')
+        self.addCleanup(common.release_codex, lease2)
+        self.assertEqual(again, binary)
+        self.assertIn('earlier private copy', why)
 
     def _age(self, copy_dir, seconds):
         """Make a private copy look last used `seconds` ago."""

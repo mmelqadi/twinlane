@@ -1,0 +1,46 @@
+Bash	D	for x in 1; do git push; done
+Bash	D	for x in 1; do psql -l; done
+Bash	D	if true; then psql -l; fi
+Bash	D	if false; then :; else git push; fi
+Bash	D	if false; then :; elif git push; then :; fi
+Bash	D	select x in a; do git push; done
+Bash	D	{ git push; }
+Bash	D	( git push )
+Bash	D	! psql -l
+Bash	D	then twinlane run x
+Bash	D	if true; then twinlane land t1; fi
+Bash	D	if true; then kubectl delete pod x; fi
+Bash	D	if true; then release-prod.sh; fi
+Bash	D	if true; then cp x /etc/passwd; fi
+Bash	D	if true; then cp x ../../other/; fi
+Bash	D	while true; do echo hi > ../../x; done
+Bash	D	trap 'psql -l' EXIT
+Bash	D	trap "twinlane run x" EXIT
+Bash	D	until psql; do :; done
+Bash	D	coproc psql -l
+Bash	D	git fetch . HEAD:main
+Bash	D	git fetch . +HEAD:refs/heads/main
+Bash	D	git fetch origin +HEAD:refs/heads/main
+Bash	D	git branch -f main HEAD
+Bash	D	git update-ref refs/heads/main HEAD
+Bash	D	git symbolic-ref HEAD refs/heads/main
+Bash	D	git reset --hard origin/main
+Bash	D	git checkout main
+Bash	D	git switch main
+Bash	D	git worktree add ../x
+Bash	D	git stash
+Bash	D	git tag v1
+Bash	D	git gc --prune=now
+Bash	D	git reflog expire --all
+Bash	D	git replace HEAD HEAD~1
+Bash	D	git config --global user.name x
+Bash	D	git config user.name x
+Bash	D	git apply --directory=../x p.patch
+Bash	D	git archive -o ../x.tar HEAD
+Bash	D	git bundle create ../x.bundle HEAD
+Bash	D	git format-patch -o ../out HEAD~1
+Bash	D	git diff --output=../x
+Bash	D	git -C ../other status
+Bash	D	git --work-tree=../other checkout -- .
+Bash	D	git clone . ../x
+Bash	D	git init ../x

@@ -12,4 +12,6 @@ os.environ['HOME'] = _HOME
 os.environ['USERPROFILE'] = _HOME
 os.environ['XDG_DATA_HOME'] = _HOME
 os.environ['LOCALAPPDATA'] = _HOME
+# The suite may itself run inside a worker job; a parent job id would change dispatch behaviour.
+os.environ.pop('TWINLANE_ENGINE_JOB', None)
 assert os.environ['TWINLANE_HOME'] == _HOME

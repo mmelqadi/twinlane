@@ -168,6 +168,9 @@ class JobsBase(unittest.TestCase):
             rc = jobs.cli(cmd, list(argv))
         return rc, out.getvalue(), err.getvalue()
 
+    def write_config(self, config):
+        common.write_json(os.path.join(self.home, 'config.json'), config)
+
     def only_job(self):
         ids = jobs._job_ids()
         self.assertEqual(len(ids), 1, ids)
@@ -620,8 +623,277 @@ class InlineRuns(JobsBase):
                                   '--kind', 'parallel', '--engine', 'codex')
         self.assertNotEqual(rc, 0, out)
         self.assertEqual(self.receipt(self.only_job())['status'], 'failed')
-        self.assertIn('no codex CLI on PATH', json.dumps(self.receipt(self.only_job())))
+        self.assertIn('no usable codex CLI', json.dumps(self.receipt(self.only_job())))
         self.assertFalse(os.path.exists(self.codex_argv_out))
+
+    # ---- which Codex binary a job runs (codex.binary_source), and the checks on it
+
+    def _fake_app_build(self):
+        os.environ.pop('TWINLANE_CODEX_BIN', None)
+        bundle = os.path.join(os.environ['LOCALAPPDATA'], 'OpenAI', 'Codex', 'bin', 'abc')
+        os.makedirs(bundle)
+        for name in common.CODEX_FILES:
+            with open(os.path.join(bundle, name), 'wb') as h:
+                h.write(b'codex')
+        return bundle
+
+    def run_codex(self, *extra):
+        return self.cli('run', '--brief', self.brief, '--cd', self.work, '--kind', 'parallel', '--engine', 'codex',
+                        *extra)
+
+    @unittest.skipUnless(common.IS_WIN, 'the desktop-app copy is Windows-only')
+    def test_codex_job_gets_the_private_cli_copy(self):
+        # The desktop app empties its CLI bundle when it exits, and the PATH codex can be an old release the
+        # account refuses for new models, so a job runs a leased copy of the app's own build.
+        self._fake_app_build()
+        with mock.patch.object(common, '_read_codex_version', return_value=None):  # a fake exe cannot run
+            rc, out, _ = self.run_codex()
+        self.assertEqual(rc, 0, out)
+        seen = self.read_json_file(self.codex_argv_out)
+        got = seen['codex_bin']
+        self.assertTrue(got and got.startswith(common.BIN), got)
+        # the copy is leased while the child runs, and released when it exits
+        self.assertEqual(len(seen['leases']), 1, seen['leases'])
+        self.assertEqual(os.listdir(os.path.join(os.path.dirname(got), 'leases')), [])
+
+    def test_no_codex_anywhere_fails_the_job_instead_of_using_path(self):
+        self.write_config({'codex': {'binary_source': 'app-copy'}})
+        os.environ.pop('TWINLANE_CODEX_BIN')  # no app build, no private copy: a codex on PATH must not be used
+        on_path = os.path.join(self.tmp, 'path-codex')
+        with mock.patch.object(jobs.shutil, 'which', return_value=on_path):
+            rc, out, _ = self.run_codex()
+        self.assertNotEqual(rc, 0, out)
+        r = self.receipt(self.only_job())
+        self.assertEqual(r['status'], 'failed')
+        self.assertIn('no usable codex CLI', json.dumps(r))
+        self.assertNotIn('path-codex', json.dumps(r))
+        if common.IS_WIN:
+            self.assertIn('no complete Codex app build', json.dumps(r))
+        self.assertFalse(os.path.exists(self.codex_argv_out))  # the transport never started
+
+    def test_auto_falls_back_to_the_path_and_the_receipt_says_so(self):
+        os.environ.pop('TWINLANE_CODEX_BIN')
+        with mock.patch.object(jobs.shutil, 'which', return_value=self.fake_codex_bin):
+            rc, out, _ = self.run_codex()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.read_json_file(self.codex_argv_out)['codex_bin'], self.fake_codex_bin)
+        self.assertIn('using the codex on PATH', ' '.join(self.receipt(self.only_job())['notes']))
+
+    def test_binary_source_path_ignores_the_app_copy(self):
+        self.write_config({'codex': {'binary_source': 'path'}})
+        self._fake_app_build()
+        with mock.patch.object(jobs.shutil, 'which', return_value=self.fake_codex_bin):
+            rc, out, _ = self.run_codex()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.read_json_file(self.codex_argv_out)['codex_bin'], self.fake_codex_bin)
+        self.assertEqual(os.listdir(common.BIN), [])  # no private copy was made
+
+    def test_an_unknown_binary_source_fails_the_job(self):
+        self.write_config({'codex': {'binary_source': 'somewhere'}})
+        rc, out, _ = self.run_codex()
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn('binary_source must be one of', json.dumps(self.receipt(self.only_job())))
+        self.assertFalse(os.path.exists(self.codex_argv_out))
+
+    @unittest.skipUnless(common.IS_WIN, 'the desktop-app copy is Windows-only')
+    def test_a_child_whose_kill_failed_keeps_its_lease(self):
+        # a timed-out child that survived kill_tree may still run from the copy
+        self._fake_app_build()
+
+        class Unkillable:
+            pid = os.getpid()
+
+            def poll(self):
+                return None
+
+            def wait(self, timeout=None):
+                raise subprocess.TimeoutExpired('runner', timeout)
+
+        real_popen = subprocess.Popen
+
+        def popen(argv, *a, **kw):  # git and friends run for real; only the Codex transport is faked
+            if kw.get('env', {}).get('TWINLANE_CODEX_BIN'):
+                return Unkillable()
+            return real_popen(argv, *a, **kw)
+
+        with mock.patch.object(common, '_read_codex_version', return_value=None), \
+                mock.patch.object(jobs.subprocess, 'Popen', side_effect=popen), \
+                mock.patch.object(common, 'kill_tree', return_value=False):
+            self.run_codex()
+        r = self.receipt(self.only_job())
+        self.assertEqual(r['status'], 'timeout')
+        leases = glob.glob(os.path.join(common.BIN, 'codex-*', 'leases', '*.json'))
+        self.assertEqual(len(leases), 1, leases)
+        self.assertIn('survived its kill', json.dumps(r))
+
+    @unittest.skipUnless(common.IS_WIN, 'the desktop-app copy is Windows-only')
+    def test_an_earlier_copy_is_named_in_the_receipt(self):
+        # reusing an older copy is allowed but must be visible
+        bundle = self._fake_app_build()
+        with mock.patch.object(common, '_read_codex_version', return_value=None):
+            first = common.codex_bin()
+        shutil.rmtree(bundle)  # the app emptied its bundle on exit
+        rc, out, _ = self.run_codex()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.read_json_file(self.codex_argv_out)['codex_bin'], first)
+        notes = ' '.join(self.receipt(self.only_job())['notes'])
+        self.assertIn('earlier private copy', notes)
+        self.assertIn(first, notes)
+
+    def test_min_cli_version_refuses_old_binary(self):
+        self.write_config({'codex': {'min_cli_version': '0.162.0'}})
+        with mock.patch.object(common, '_read_codex_version', return_value='0.149.1'):
+            rc, out, _ = self.run_codex()
+        self.assertNotEqual(rc, 0, out)
+        r = self.receipt(self.only_job())
+        self.assertEqual(r['status'], 'failed')
+        error = r['attempts'][0]['error']
+        self.assertIn('0.149.1', error)
+        self.assertIn('older than codex.min_cli_version 0.162.0', error)
+        self.assertFalse(os.path.exists(self.codex_argv_out))  # the transport never started
+        self.fresh_jobs()
+        with mock.patch.object(common, '_read_codex_version', return_value='0.162.1'):
+            rc, out, _ = self.run_codex()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.receipt(self.only_job())['status'], 'done')
+
+    def test_the_money_guard_runs_before_every_attempt_and_before_the_binary_lookup(self):
+        calls = []
+        real_preflight, real_acquire = jobs.preflight, common.acquire_codex_binary
+
+        def preflight(spec, params, *a, **kw):
+            calls.append('preflight:' + params['engine'])
+            return real_preflight(spec, params, *a, **kw)
+
+        def acquire(*a, **kw):
+            calls.append('binary')
+            return real_acquire(*a, **kw)
+
+        with mock.patch.object(jobs, 'preflight', preflight), mock.patch.object(common, 'acquire_codex_binary', acquire):
+            self.assertEqual(self.run_codex()[0], 0)
+            self.assertEqual(calls, ['preflight:codex', 'binary'])
+            del calls[:]
+            self.fresh_jobs()
+            os.environ['FAKE_LIMIT'] = '1'  # claude hits its limit, the job fails over to codex
+            rc, out, _ = self.cli('run', '--brief', self.brief, '--cd', self.work, '--kind', 'intel')
+            self.assertEqual(rc, 0, out)
+            self.assertEqual(calls, ['preflight:claude', 'preflight:codex', 'binary'])
+            # a refusal from the guard means no binary is looked up at all
+            del calls[:]
+            self.fresh_jobs()
+            self.meter['codex'].update(on_credits=True)
+            self.meter['claude'].update(status='ok')
+            with mock.patch.object(jobs, '_decide', lambda *a: dict(fake_decide(*a), refused=False, engine='codex')):
+                self.run_codex()
+            self.assertEqual(calls, ['preflight:codex'])
+            r = self.receipt(self.only_job())
+            self.assertEqual(r['status'], 'refused')
+            self.assertIn('paid credits', r['attempts'][0]['error'])
+
+    def _recording_codex(self):
+        """A fake `codex` that records its argv, then behaves like tests/fake_codex_cli.py."""
+        record = os.path.join(self.tmp, 'codex-cli-argv.json')
+        recorder = os.path.join(self.tmp, 'recording-codex.py')
+        with open(recorder, 'w', encoding='utf-8') as h:
+            h.write('import json, os, runpy, sys\n'
+                    'open(os.environ["RECORD_ARGV"], "w").write(json.dumps(sys.argv[1:]))\n'
+                    'runpy.run_path(os.environ["REAL_FAKE"], run_name="__main__")\n')
+        os.environ.update(TWINLANE_CODEX_BIN=recorder, RECORD_ARGV=record,
+                          REAL_FAKE=os.path.join(HERE, 'fake_codex_cli.py'))
+        self.addCleanup(lambda: [os.environ.pop(k, None) for k in ('RECORD_ARGV', 'REAL_FAKE')])
+        common.CODEX_RUN = None  # the built-in runner, which starts `codex exec`
+        return record
+
+    def test_exec_config_reaches_codex_exec(self):
+        config = ['features.apps=false', 'mcp_servers.demo.enabled=false']
+        self.write_config({'codex': {'exec_config': config}})
+        record = self._recording_codex()
+        rc, out, _ = self.run_codex()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.receipt(self.only_job())['status'], 'done')
+        argv = self.read_json_file(record)
+        self.assertEqual([argv[i + 1] for i in range(len(argv) - 1) if argv[i] == '-c'], config)
+        self.assertEqual(argv[0], 'exec')
+        self.assertIn('--sandbox', argv)
+        # a transport adapter gets the same list in its environment
+        common.CODEX_RUN = FAKE_CODEX
+        seen_env = []
+        real_popen = subprocess.Popen
+
+        def popen(argv, *a, **kw):
+            seen_env.append(kw.get('env') or {})
+            return real_popen(argv, *a, **kw)
+
+        os.environ['TWINLANE_CODEX_BIN'] = self.fake_codex_bin
+        self.fresh_jobs()
+        with mock.patch.object(jobs.subprocess, 'Popen', side_effect=popen):
+            self.assertEqual(self.run_codex()[0], 0)
+        adapter_env = [e for e in seen_env if e.get('TWINLANE_ENGINE_JOB')][0]
+        self.assertEqual(json.loads(adapter_env['TWINLANE_CODEX_EXEC_CONFIG']), config)
+
+    def test_a_bad_exec_config_fails_the_job_before_anything_starts(self):
+        for bad in (['sandbox_mode="danger-full-access"'], ['no equals sign'], 'features.apps=false'):
+            with self.subTest(bad=bad):
+                self.fresh_jobs()
+                self.write_config({'codex': {'exec_config': bad}})
+                record = self._recording_codex()
+                rc, out, _ = self.run_codex()
+                self.assertNotEqual(rc, 0, out)
+                r = self.receipt(self.only_job())
+                self.assertEqual(r['status'], 'failed')
+                self.assertIn('codex policy refused', r['attempts'][0]['error'])
+                self.assertFalse(os.path.exists(record))
+
+    def test_secret_env_extra_patterns_stripped_from_worker_envs(self):
+        self.write_config({'secrets': {'extra_env_name_patterns': ['^ACME_']}})
+        wt = add_worktree(make_repo(self.tmp), self.tmp)
+        with mock.patch.dict(os.environ, {'ACME_STORE_URL': 'u', 'ACME_NOTE': 'n', 'GH_TOKEN': 't', 'KEEP_ME': 'k'}):
+            rc, out, _ = self.cli('run', '--brief', self.brief, '--cd', wt, '--kind', 'integrate', '--write')
+            self.assertEqual(rc, 0, out)
+            names = self.read_json_file(self.codex_argv_out)['env_names']
+            for gone in ('ACME_STORE_URL', 'ACME_NOTE', 'GH_TOKEN'):
+                self.assertNotIn(gone, names)
+            self.assertIn('KEEP_ME', names)
+            stripped = self.receipt(self.only_job())['attempts'][0]['env_stripped']
+            self.assertEqual(sorted(set(stripped) & {'ACME_STORE_URL', 'ACME_NOTE', 'GH_TOKEN', 'KEEP_ME'}),
+                             ['ACME_NOTE', 'ACME_STORE_URL', 'GH_TOKEN'])
+            # the Claude worker env follows the same rule (a code profile only)
+            gone = []
+            env = jobs.claude_env('job-x', 'code', None, gone, ['^ACME_'])
+            self.assertNotIn('ACME_STORE_URL', env)
+            self.assertIn('ACME_STORE_URL', gone)
+            self.assertIn('ACME_STORE_URL', jobs.claude_env('job-x', 'intel', None, None, ['^ACME_']))
+
+    def test_a_sandbox_setup_failure_is_noted_in_the_receipt(self):
+        # Codex can end a run that looks normal while its sandbox helper never started, so no command ran.
+        files = {'codex_out': os.path.join(self.tmp, 'out'), 'codex_log': os.path.join(self.tmp, 'adapter.log')}
+        os.makedirs(files['codex_out'])
+        self.assertFalse(jobs._sandbox_setup_failed(files))
+        for name, text in (('stderr.log', 'ERROR exec_command failed: helper_unknown_error: setup refresh had errors\n'),
+                           ('events.jsonl', '{"aggregated_output": "setup refresh had errors"}\n')):
+            with self.subTest(file=name):
+                path = os.path.join(files['codex_out'], name)
+                with open(path, 'w', encoding='utf-8') as h:
+                    h.write('fine\n' + text)
+                self.assertTrue(jobs._sandbox_setup_failed(files))
+                os.remove(path)
+        # end to end: the real CLI writes the marker to the evidence folder's stderr.log; here it is appended
+        # after the adapter fixture ran
+        real_parse = jobs.parse_codex_out
+
+        def parse(out_dir):
+            with open(os.path.join(out_dir, 'stderr.log'), 'a', encoding='utf-8') as h:
+                h.write('Failed to create unified exec process: helper_unknown_error: setup refresh had errors\n')
+            return real_parse(out_dir)
+
+        with mock.patch.object(jobs, 'parse_codex_out', parse):
+            rc, out, _ = self.run_codex()
+        self.assertEqual(rc, 0, out)
+        r = self.receipt(self.only_job())
+        self.assertEqual(r['status'], 'done')
+        notes = ' '.join(r['notes'])
+        self.assertIn('sandbox could not set up', notes)
+        self.assertIn('unverified', notes)
 
     def test_explicit_codex_binary_is_recorded(self):
         os.environ['TWINLANE_CODEX_BIN'] = self.fake_codex_bin
@@ -1766,6 +2038,31 @@ class ContinueLostJob(JobsBase):
         # An empty runner file is not output.
         common.write_text(path, '')
         self.assertIn('Its last attempt (2, codex) wrote no output', self.plan(jid, '--engine', 'claude')['brief_text'])
+
+    def test_legacy_codex_run_log_counts_as_attempt_file(self):
+        # An earlier tool named the Codex transport log codex-run[-aN].log; its jobs must not read as "ignored".
+        jid = self.prior('claude', attempt=2, attempt_engine='codex',
+                         files={'events.jsonl': self.claude_events('sess-a1', 'a1 note')})
+        common.write_text(os.path.join(common.JOBS, jid, 'codex-run-a2.log'), 'codex: error: auth refused')
+        self.assertEqual(jobs._attempt_file_numbers(jid), ([2], []))
+        plan = self.plan(jid, '--engine', 'claude')
+        self.assertNotIn('codex-run-a2.log', '\n'.join(plan['notes']))
+        self.assertNotIn('ignored unrelated or out-of-range attempt files', '\n'.join(plan['notes']))
+        self.assertIn('Its last attempt (2, codex) left no final message or progress notes and no session id.',
+                      plan['brief_text'])
+        # an unrelated name beside it is still ignored, and so is a legacy name for an out-of-range attempt
+        common.write_text(os.path.join(common.JOBS, jid, 'codex-run-a9.log'), 'x')
+        common.write_text(os.path.join(common.JOBS, jid, 'codex-runner-a2.log'), 'x')
+        self.assertEqual(jobs._attempt_file_numbers(jid), ([2], ['codex-run-a9.log', 'codex-runner-a2.log']))
+        # attempt 1 carries no suffix: codex-run.log is its raw output, and an empty one is not output
+        self.fresh_jobs()
+        jid = self.prior('claude', attempt=1, attempt_engine='codex')
+        path = os.path.join(common.JOBS, jid, 'codex-run.log')
+        common.write_text(path, '')
+        self.assertFalse(jobs._attempt_output(jid, 1))
+        common.write_text(path, 'codex: error: auth refused')
+        self.assertTrue(jobs._attempt_output(jid, 1))
+        self.assertEqual(jobs._last_attempt(jid, None)[0], 1)
 
     def test_contradictory_receipt_never_resumes_older_session(self):
         for attempts, status_attempt in (
@@ -2988,6 +3285,22 @@ class AutoRefreshPlanning(JobsBase):
                 rc, out, err = self.cli('run', '--brief', self.brief, '--cd', self.work, '--dry-run', *extra)
                 self.assertEqual(rc, 0, out + err)
         self.assertEqual(seen, [False, False])
+
+    def test_a_dry_run_says_the_meter_is_unknown_and_a_real_run_would_refresh_once(self):
+        self.write_config({'meter': {'auto_refresh_claude': True}})
+        m = meter_with()
+        m['claude'].update(status='unknown', max_pct=None, windows=[],
+                           token_expired_at=common.iso(common.now() - dt.timedelta(minutes=5)))
+        # The refresh is a model call: it runs only when the last recorded reading shows extra usage OFF.
+        with mock.patch.object(jobs, '_meter', lambda policy, fresh=False, auto_refresh=True: m), \
+                mock.patch('twinlane.meter.refresh_blocker', return_value=None):
+            rc, out, err = self.cli('run', '--brief', self.brief, '--cd', self.work, '--dry-run', '--json')
+        self.assertEqual(rc, 0, out + err)
+        text = json.dumps(json.loads(out))
+        self.assertIn('Claude meter is unknown', text)
+        self.assertIn('a real run would refresh it once', text)
+        self.assertIn('made no model call', text)
+        self.assertEqual(jobs._job_ids(), [])  # and it created nothing
 
     def test_dry_run_routes_away_from_unknown_without_a_model_call(self):
         m = meter_with()

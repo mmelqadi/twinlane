@@ -1,0 +1,110 @@
+# --- inline code
+Bash	D	python -c "import os; os.system('git push')"
+Bash	D	python -c "import os; os.system('g'+'it push')"
+Bash	D	python -c "import os; os.system('tig hsup'[::-1])"
+Bash	D	python -c "import os; os.execvp('git',['git','push'])"
+Bash	D	python -c "import pty; pty.spawn(['git','push'])"
+Bash	D	python -c "__import__('os').popen('psql -l')"
+Bash	D	python -c "import subprocess as s; s.call('ps'+'ql -l', shell=True)"
+Bash	D	python -c "import os; os.system(chr(103)+'it push')"
+Bash	D	python -c "getattr(__import__('o'+'s'),'sys'+'tem')('git push')"
+Bash	D	python3 -c "import runpy; runpy.run_module('twinlane', run_name='__main__')" run
+Bash	D	python -c "import sys; sys.argv=['x','run']; import twinlane.cli as c; c.main()"
+Bash	D	python -c "from twinlane.cli import main; main(['la'+'nd','t1'])"
+Bash	D	python -c "import importlib; importlib.import_module('twin'+'lane.cli').main(['run'])"
+Bash	D	node -e "require('child_process').exec('git push')"
+Bash	D	node -e "require('child_'+'process').execSync('git push')"
+Bash	D	node -e "process.binding('spawn_sync')"
+Bash	D	node -p "require('child_process').spawnSync('psql')"
+Bash	D	perl -e 'system("git push")'
+Bash	D	perl -e '`git push`'
+Bash	D	perl -e 'qx(git push)'
+Bash	D	perl -e 'qx{psql -l}'
+Bash	D	perl -e 'open(my $f, "|-", "git push")'
+Bash	D	perl -e 'open(F, "git push |")'
+Bash	D	ruby -e 'system("git push")'
+Bash	D	ruby -e '%x(git push)'
+Bash	D	ruby -e 'IO.popen("git push")'
+Bash	D	ruby -e 'Kernel.spawn("git push")'
+Bash	D	php -r 'system("git push");'
+Bash	D	php -r 'echo `git push`;'
+Bash	D	php -r 'proc_open("git push",[],$p);'
+Bash	D	php -r 'pcntl_exec("/usr/bin/git",["push"]);'
+Bash	D	awk 'BEGIN{system("git push")}'
+Bash	D	awk 'BEGIN{"git push" | getline}'
+Bash	D	gawk 'BEGIN{system("psql -l")}'
+Bash	D	sed -n '1e git push' README.md
+Bash	D	sed 's/x/git push/e' README.md
+Bash	D	vim -c ':!git push' -c ':q'
+Bash	D	vi -es -c '!git push'
+Bash	D	less +'!git push' README.md
+Bash	D	tclsh <<< 'exec git push'
+Bash	D	lua -e 'os.execute("git push")'
+Bash	D	Rscript -e 'system("git push")'
+Bash	D	deno eval 'new Deno.Command("git",{args:["push"]}).outputSync()'
+Bash	D	bun -e 'Bun.spawnSync(["git","push"])'
+Bash	D	python3.12 -c "import os; os.system('git push')"
+Bash	D	pythonw -c "import os; os.system('git push')"
+Bash	D	py -3.12 -c "import os; os.system('git push')"
+Bash	D	ipython -c "!git push"
+Bash	D	pwsh -c "git push"
+Bash	D	pwsh -Command "& {git push}"
+Bash	D	pwsh -NoProfile -c "Start-Process git -ArgumentList push"
+Bash	D	pwsh -EncodedCommand ZwBpAHQAIABwAHUAcwBoAA==
+Bash	D	pwsh -enc ZwBpAHQAIABwAHUAcwBoAA==
+Bash	D	pwsh -e ZwBpAHQAIABwAHUAcwBoAA==
+Bash	D	pwsh -ec ZwBpAHQAIABwAHUAcwBoAA==
+Bash	D	pwsh -File x.ps1
+Bash	D	echo Z2l0IHB1c2g= | base64 -d | sh
+Bash	D	echo Z2l0IHB1c2g= | base64 --decode | bash
+Bash	D	base64 -d <<< Z2l0IHB1c2g= | sh
+Bash	D	sh -c "$(echo Z2l0IHB1c2g= | base64 -d)"
+Bash	D	eval "$(echo Z2l0IHB1c2g= | base64 -d)"
+Bash	D	eval git push
+Bash	D	eval "git push"
+Bash	D	eval 'git' 'push'
+Bash	D	x=push; git $x
+Bash	D	G=git; $G push
+Bash	D	source <(echo git push)
+Bash	D	. <(echo git push)
+Bash	D	bash <(echo git push)
+Bash	D	exec git push
+Bash	D	exec -a foo git push
+Bash	D	coproc git push
+Bash	D	coproc X { git push; }
+Bash	D	time git push
+Bash	D	! git push
+Bash	D	if true; then git push; fi
+Bash	D	while git push; do :; done
+Bash	D	until git push; do :; done
+Bash	D	f(){ git push; }; f
+Bash	D	function f { git push; }; f
+Bash	D	[[ $(git push) ]]
+Bash	D	(( $(git push) ))
+Bash	D	x=$(git push)
+Bash	D	declare x=$(git push)
+Bash	D	export X=$(git push)
+Bash	D	alias g=git; g push
+Bash	D	trap 'git push' EXIT
+Bash	D	git -c alias.p=push p
+Bash	D	git --git-dir=.git push
+Bash	D	git -C . push
+Bash	D	git send-pack origin
+Bash	D	git update-ref refs/heads/main HEAD
+Bash	D	git commit-tree HEAD^{tree}
+Bash	D	git notes add -m x
+Bash	D	git fetch origin main:main
+Bash	D	git remote add x ../x
+Bash	D	git config core.hooksPath x
+Bash	D	git submodule foreach git push
+Bash	D	git bisect run git push
+Bash	D	git rebase -x 'git push' HEAD~1
+Bash	D	git difftool -x 'git push'
+Bash	D	git -c core.pager='git push' log
+Bash	D	GIT_PAGER='psql -l' git log
+Bash	D	PAGER='git push' git log
+Bash	D	GIT_EXTERNAL_DIFF='psql' git diff
+Bash	D	GIT_SSH_COMMAND='psql' git fetch
+Bash	D	GIT_EDITOR='git push' git commit
+Bash	D	EDITOR='psql' git add -p
+Bash	D	git log --exec='git push'

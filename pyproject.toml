@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "twinlane"
-version = "0.1.2"
+version = "0.2.0"
 description = "Run Claude Code and Codex together on included subscriptions"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -21,4 +21,4 @@ Issues = "https://github.com/mmelqadi/twinlane/issues"
 twinlane = "twinlane.cli:main"
 
 [tool.setuptools.package-data]
-twinlane = ["policy.json"]
+twinlane = ["policy.json", "skill/SKILL.md"]

@@ -19,6 +19,8 @@ import time
 
 from . import common
 from . import meter as meter_mod
+from .worktrees import (  # noqa: F401 - shared with `twinlane wt`; board keeps the old names
+    BASE_BRANCHES, GIT_TIMEOUT_S, _activity, _base_branch, _gitdir, _parse_worktrees, _probe)
 
 ENGINES = ('claude', 'codex')
 LIVE = ('queued', 'running', 'orphaned', 'unknown')
@@ -30,8 +32,6 @@ LONG_RUN_FRACTION = 0.8
 OLD_JOB_S = ATTENTION_WINDOW_S + 4 * 3600  # a job created this long ago cannot have finished inside the window
 FINISHED_DEFAULT = 5
 CAPS = {'attention': 6, 'live': 6, 'batons': 5, 'worktrees': 6}
-BASE_BRANCHES = ('master', 'main')
-GIT_TIMEOUT_S = 8
 GIT_WORKERS = 8
 PROBE_LIMIT = 12                   # worktrees git is asked about by default (--all: every one)
 VERDICT_RE = re.compile(r'^[\s*#>_`-]*(MERGE AFTER FIXES|DO NOT MERGE|MERGE)\b[^\n]*')
@@ -493,75 +493,8 @@ def collect_batons() -> list[dict]:
 
 # ---------------------------------------------------------------- worktrees
 
-def _parse_worktrees(text: str) -> list[dict]:
-    out, cur = [], {}
-    for line in text.splitlines() + ['']:
-        if not line.strip():
-            if cur.get('path'):
-                out.append(cur)
-            cur = {}
-        elif line.startswith('worktree '):
-            cur['path'] = line[len('worktree '):].strip()
-        elif line.startswith('branch '):
-            cur['branch'] = re.sub(r'^refs/heads/', '', line[len('branch '):].strip())
-        elif line.startswith('HEAD '):
-            cur['head_full'] = line[5:].strip()
-            cur['head'] = cur['head_full'][:7]
-        elif line.strip() == 'detached':
-            cur['branch'] = '(detached)'
-        elif line.startswith('prunable'):
-            cur['prunable'] = True
-    return out
-
-
 def _norm(path) -> str:
     return common.canon_path(path)
-
-
-def _gitdir(path: str) -> str | None:
-    """A linked worktree's private git dir, from the `gitdir:` line of its .git file (no git call)."""
-    head = _read_head(os.path.join(path, '.git'), 1024)
-    if head.startswith('gitdir:'):
-        d = head[len('gitdir:'):].strip().splitlines()[0].strip() if head[len('gitdir:'):].strip() else ''
-        return d if os.path.isabs(d) else os.path.join(path, d)
-    return None
-
-
-def _activity(path: str) -> float:
-    """Last-activity stamp from file times alone (reflog and index of the worktree): git over hundreds of
-    branches takes seconds, a stat does not."""
-    gd = _gitdir(path)
-    stamps = [0.0]
-    for rel in (('logs', 'HEAD'), ('index',), ('HEAD',)):
-        try:
-            stamps.append(os.stat(os.path.join(gd, *rel)).st_mtime)
-        except (OSError, TypeError):
-            pass
-    return max(stamps)
-
-
-def _base_branch(root: str) -> str | None:
-    for b in BASE_BRANCHES:
-        rc, _ = common.git(root, 'rev-parse', '--verify', '-q', f'refs/heads/{b}', timeout=GIT_TIMEOUT_S)
-        if rc == 0:
-            return b
-    return None
-
-
-def _probe(w: dict, base: str | None) -> None:
-    """ahead/behind vs base, dirty count and merged flag for one worktree (two git calls)."""
-    w['checked'] = True
-    if base:
-        rc, counts = common.git(w['path'], 'rev-list', '--left-right', '--count', f'{base}...HEAD',
-                                timeout=GIT_TIMEOUT_S)
-        parts = counts.split()
-        if rc == 0 and len(parts) == 2 and all(p.isdigit() for p in parts):
-            w['behind'], w['ahead'] = int(parts[0]), int(parts[1])
-            w['merged'] = w['ahead'] == 0 and w['branch'] != base
-    rc, porcelain = common.git(w['path'], 'status', '--porcelain=v1', '--untracked-files=normal',
-                               timeout=GIT_TIMEOUT_S)
-    if rc == 0:
-        w['dirty'] = len([x for x in porcelain.splitlines() if x.strip()])
 
 
 def rank_worktree(w: dict):

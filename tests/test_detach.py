@@ -192,16 +192,20 @@ CHAIN_LAUNCHER = (
     'print(json.dumps(out), flush=True)\n'
     'time.sleep(120)\n')
 
-# The app's shell: starts the launcher (which writes to this stdout pipe) and waits, so a tree kill
-# of the shell reaches the launcher and everything still linked to it by parent pid.
-SHELL = 'import subprocess, sys; subprocess.Popen(sys.argv[1:]).wait()'
+# The app's shell starts the launcher and outlives its exit. The parent keeps stdin open:
+# after acknowledging launcher exit the shell blocks on that pipe, independently of its
+# child's lifetime. Only the fixture's explicit release/identity-checked kill ends it.
+# Otherwise taskkill can kill the launcher first and race the shell's automatic exit.
+SHELL = ('import subprocess, sys; subprocess.Popen(sys.argv[1:]).wait(); '
+         'print("launcher exited; shell held", flush=True); sys.stdin.buffer.read(1)')
 
 
 def _launch_chain(test, what, outer_mode, *extra):
     """(shell, launcher report). Every pid it reports is registered for identity-checked cleanup."""
     shell = subprocess.Popen([sys.executable, '-c', SHELL, sys.executable, '-c', CHAIN_LAUNCHER, ROOT, what,
                               outer_mode, test.tmp, *extra],
-                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8')
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True, encoding='utf-8')
     shell_created = common.process_created(shell.pid)
     shell.twinlane_created = shell_created
 
@@ -209,6 +213,7 @@ def _launch_chain(test, what, outer_mode, *extra):
         if shell.poll() is None and common.pid_alive(shell.pid, shell_created):
             common.kill_tree(shell.pid, shell_created)
         shell.wait(timeout=30)
+        shell.stdin.close()
         shell.stdout.close()
         shell.stderr.close()
     test.addCleanup(stop_shell)
@@ -258,6 +263,20 @@ class NestedJobChain(_Tmp):
     the original quit's exact termination trigger remains unknown.
     breakaway from a nested chain leaves only the jobs up to the first that forbids it, and keeps
     the launcher as parent. The --bg start (wmi) must survive both a job close and a tree kill."""
+
+    def test_outer_shell_lifetime_is_independent_of_launcher_exit(self):
+        shell, r = _launch_chain(self, 'raw', 'forbid')
+        _job_close_only(r)
+        # EOF with the old fixture proves that the shell exited with its child.
+        # The corrected fixture acknowledges child exit, then blocks on its owned pipe.
+        acknowledgement = shell.stdout.readline()
+        self.assertTrue(common.pid_alive(shell.pid, shell.twinlane_created),
+                        'outer fixture shell exited when its launcher ended')
+        self.assertEqual(acknowledgement.strip(), 'launcher exited; shell held')
+        self.assertTrue(_wait(lambda: not common.pid_alive(r['control'], r['control_created'])))
+        self.assertTrue(_wait(lambda: not common.pid_alive(r['pid'], r['created'])))
+        _tree_kill(shell)
+        self.assertFalse(common.pid_alive(shell.pid, shell.twinlane_created))
 
     def test_old_breakaway_stays_in_the_outer_job_and_dies_with_it(self):
         shell, r = _launch_chain(self, 'raw', 'forbid')

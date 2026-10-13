@@ -11,8 +11,21 @@ parses the command instead:
     no nested engine launch, no
     outbound sends (curl/wget/Invoke-WebRequest with a body or a non-GET method or to a non-local host,
     mail clients, ssh/scp/sftp/rsync to a host, gh writes including `gh api` with fields, az/aws/gcloud,
-    package publishing);
-  - words are split as a POSIX shell joins quoted pieces (`-c"code"` is `-c` plus code), and wrappers
+    package publishing), no database clients (psql, mysql, sqlcmd, ... also inside a container exec, and the
+    networked DB libraries in inline code), no twinlane command that dispatches or mutates (run, _job, land,
+    ship, resume, install, wt other than doctor, --best-of) however twinlane is invoked (twinlane[.cmd|.exe],
+    a full path, python -m twinlane, .../twinlane/cli.py, or a configured guard.self_aliases name);
+  - configuration (policy `guard` section, merged with the user config): deny_commands (program names, with
+    optional leading arguments, denied like the database clients), deny_text (regexes matched against the
+    raw, decoded and expanded command text), self_aliases and allow_subagents (default false: Agent/Task are
+    denied; true lets them pass in code, and in intel only when intel_allow lists them). A guard section that
+    is not valid (or cannot be read) denies every call of the job;
+  - words are split as a POSIX shell joins quoted pieces (`-c"code"` is `-c` plus code); an unquoted $'...'
+    is decoded and an unquoted brace expanded as bash does (over BRACE_CAP words is denied unread); the
+    bodies of $(...), `...`, <(...), >(...) and PowerShell (...)/@(...) are scanned as commands (also in an
+    unquoted heredoc, and the commands after a `case` pattern's `)`); a program name built at run time
+    (`g$x`, `git${IFS}push`, `& (Get-Command x)`, `. $x`) and an interpreter reading <(...) or /dev/stdin are
+    denied; a backslash in a program name is also read as bash reads it (`g\\it`); and wrappers
     (env, sudo, timeout, xargs, nice, exec, `&`, `.`, ...) are dropped together with their option values;
     `env -S STRING` is read as the command it runs and `env -C DIR` moves that command's cwd;
   - GIT_CONFIG_PARAMETERS and GIT_CONFIG_KEY_<n> (`git -c` through the environment) get the same alias
@@ -64,7 +77,7 @@ CODE_PASS_TOOLS = READ_ONLY_TOOLS | ALWAYS_READ_ONLY | {'KillShell', 'KillBash',
 # git global options that take a separate value (`git -C dir status`).
 GIT_OPTS_WITH_VALUE = {'-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path', '--super-prefix',
                        '--config-env', '--list-cmds'}
-DENY_GIT = {'commit', 'push', 'pull', 'clean', 'rebase', 'merge', 'cherry-pick', 'revert', 'am', 'filter-branch',
+DENY_GIT = {'commit', 'commit-tree', 'push', 'pull', 'clean', 'rebase', 'merge', 'cherry-pick', 'revert', 'am', 'filter-branch',
             'update-ref', 'symbolic-ref', 'send-email', 'send-pack', 'http-push', 'imap-send', 'replace', 'svn',
             'p4', 'fast-import'}
 # `git config` forms that only read; any other form writes a config file (a new alias, hook path or program).
@@ -85,6 +98,32 @@ GIT_EXEC_CONFIG = re.compile(r'^(alias\..+|pager\..+|core\.(pager|editor|sshcomm
                              r'protocol\.(.+\.)?allow|uploadpack\..+|remote\..+\.(uploadpack|receivepack|vcs)|'
                              r'.+\.(textconv|command|clean|smudge|process))$', re.I)
 ENGINE_WORDS = {'claude', 'codex', 'claude.exe', 'codex.exe', 'claude.cmd', 'codex.cmd'}
+SUBAGENT_TOOLS = {'Agent', 'Task'}  # denied unless guard.allow_subagents is true
+# Database clients: a worker never talks to a database server. Names are matched after the program name is
+# normalised (case, directory, .exe/.cmd/.bat/.com, a version suffix such as psql-16). Local file databases
+# (sqlite3) are not here: their file is confined like any other write target.
+DB_CLIENTS = ('sqlcmd', 'invoke-sqlcmd', 'osql', 'isql', 'bcp', 'mysql', 'mariadb', 'mysqladmin', 'mysqlimport',
+              'mysqldump', 'psql', 'pg_restore', 'pg_dump', 'pg_dumpall', 'pgcli', 'mycli', 'usql', 'mssql-cli',
+              'sqlpackage', 'sqlplus', 'mongo', 'mongosh', 'mongoimport', 'mongorestore', 'mongodump',
+              'mongoexport', 'litecli', 'redis-cli', 'cqlsh', 'clickhouse-client', 'cockroach', 'influx', 'db2')
+DB_CLIENT_NAME = re.compile(r'^(?:' + '|'.join(re.escape(n) for n in DB_CLIENTS) + r')(?:[-_.]?\d[\d.]*)?$')
+# Database client libraries and connection URLs in inline code (python -c, node -e, php -r, PowerShell).
+DB_CODE = re.compile(r'\b(pyodbc|pymssql|pg8000|pymongo|psycopg2?|asyncpg|aiomysql|mysql\.connector|MySQLdb|pymysql|cx_Oracle|'
+                     r'oracledb|sqlsrv_connect|mysqli|pg_connect|odbc_connect|oci_connect|mongo_?client|'
+                     r'SqlConnection|SqlClient|OleDbConnection|OdbcConnection|redis\.(Strict)?Redis)\b'
+                     r'|\brequire\s*\(\s*[\'"](?:pg|mysql2|mssql|tedious|mongodb)[\'"]\s*\)'
+                     r'|\b(postgres(ql)?|mysql|mariadb|mssql|sqlserver|mongodb(\+srv)?|redis|oracle)://'
+                     r'|\bnew\s+PDO\s*\(\s*[\'"](?!sqlite:)', re.I)
+# Container and environment runners whose arguments name the program they run (`docker exec db psql`).
+CONTAINER_EXEC = {'docker', 'docker-compose', 'podman', 'nerdctl', 'kubectl', 'oc', 'lxc', 'incus'}
+PROGRAM_RUNNERS = {'wsl', 'npx', 'bunx', 'pnpx', 'uvx', 'pipx', 'uv', 'poetry', 'pdm', 'hatch', 'conda', 'mamba',
+                   'pixi', 'rye', 'npm', 'pnpm', 'yarn', 'bundle', 'pipenv', 'mise', 'nix', 'nix-shell',
+                   'asdf', 'dotnet', 'cargo', 'go', 'runas', 'gsudo'}
+# twinlane itself: the commands that dispatch a job or change shared state are refused inside a job.
+SELF_NAME = 'twinlane'
+SELF_DENIED = {'run', '_job', 'land', 'ship', 'resume', 'install', 'stop', 'handoff', 'dispatch', 'job', 'best-of'}
+SELF_WT_ALLOWED = {'doctor'}  # `twinlane wt doctor` only reads; every other `wt` verb (prune, ...) is refused
+SELF_VERB_LITERAL = re.compile(r'[\'"](?:run|_job|land|ship|resume|install|stop|handoff|dispatch|job|prune)[\'"]|--best', re.I)
 # Flags that make an otherwise read-only command write a file or run a program.
 WRITE_FLAGS = re.compile(r'(^|\s)(--output(=|\s|$)|--ext-diff|--pre(=|\s|$))')
 WRITE_VERBS = re.compile(r'(^|[\s;&|(])(cp|mv|rm|rmdir|del|erase|copy|move|ren|rename|robocopy|xcopy|mkdir|md|touch|'
@@ -103,14 +142,20 @@ ABS_PATH = re.compile(r'(?<![\w/.:])([A-Za-z]:[\\/][^\s"\'|;&<>]*|' + _SLASH_ROO
                       r'\\' r'\\' r'[^\s"\'|;&<>]+)')
 DOTDOT = re.compile(r'(^|[\\/])\.\.([\\/]|$)')  # a `..` path component
 SEGMENT_SPLIT = re.compile(r'&&|\|\||[;|&\r\n]')  # a lone & (background) starts a new command too
-REDIRECT = re.compile(r'"[^"]*"|\'[^\']*\'|(?:\d|&|\*)?>>?\|?\s*("[^"]*"|\'[^\']*\'|[^\s;&|<>]+)')
+# A redirect target is one whole word: `> "sub"/../../x` is `sub/../../x`, `> $'..'/x` is `../x`.
+REDIRECT = re.compile(r"\$'(?:[^'\\" r"]|\\" r"[\s\S])*'|\"[^\"]*\"|'[^']*'|(?:\d|&|\*)?>>?\|?\s*("
+                      r"(?:\$'(?:[^'\\" r"]|\\" r"[\s\S])*'|\"[^\"]*\"|'[^']*'|[^\s;&|<>\"']|[\"'])+)")  # lone quote: cmd
 NULL_TARGETS = {'/dev/null', 'nul', 'nul:', '$null', '/dev/stdout', '/dev/stderr'}
 VAR_REF = re.compile(r'\$\{?[A-Za-z_]\w*\}?|\$env' r':\w+|%[A-Za-z_]\w*%|\$\(|`', re.I)
 CD_WORDS = {'cd', 'chdir', 'pushd', 'popd', 'set-location', 'sl', 'push-location', 'pop-location'}
 # Wrappers that run the command after them: `sudo git push`, `xargs -n1 rm`, `timeout 5 curl ...`, and
 # PowerShell's call operator `&` and dot-sourcing `. git commit`.
 WRAPPERS = {'env', 'command', 'exec', 'nohup', 'time', 'start', 'sudo', 'nice', 'ionice', 'stdbuf', 'builtin',
-            'busybox', 'toybox', 'call', 'xargs', 'timeout', 'watch', '&', '@', '.'}
+            'busybox', 'toybox', 'call', 'xargs', 'timeout', 'watch', '&', '@', '.', 'strace', 'setsid',
+            'doas', 'chroot', 'flock', 'unbuffer', 'firejail', 'nsenter', 'unshare', 'taskset', 'chrt',
+            'runuser', 'pkexec', 'systemd-run', 'fakeroot', 'proxychains', 'torsocks', 'valgrind',
+            'ltrace', 'faketime', 'catchsegv', 'gsudo'}
+SHELL_PREFIXES = {'then', 'do', 'else', 'elif', '!', 'coproc', 'time'}
 # Wrapper options that take a value (`env -u NAME git ...`): the value is never the program. Spelled
 # separately, attached (`-uNAME`, `-n1`) or as `--opt=value`.
 WRAPPER_VALUE_OPTS = {
@@ -181,7 +226,8 @@ DECODE_CODE = re.compile(r'b64decode|frombase64string|base64_decode|atob\s*\(|un
 # Code that starts a process. An underscore counts as a separator (create_subprocess_exec, posix_spawn).
 EXEC_CODE = re.compile(r'(?<![A-Za-z])(system|popen|spawn\w*|subprocess|exec\w*|eval|shell_exec|passthru|'
                        r'proc_open|child_process|Process\.Start|Start-Process|Invoke-Expression|iex|'
-                       r'Runtime\.getRuntime)(?![A-Za-z])|`', re.I)
+                       r'Runtime\.getRuntime|qx\s*[({]|%x\s*[({]|run_module|import_module|'
+                       r'InvokeScript|scriptblock\]::Create)(?![A-Za-z])|`', re.I)
 # (open(..., 'w') and open(..., mode='w') are read by _opens_to_write.)
 WRITE_CODE = re.compile(r'write_text|write_bytes|shutil\.|'
                         r'os\.(remove|unlink|rename|replace|makedirs|mkdir|rmdir|link|symlink)|'
@@ -240,9 +286,10 @@ def commands(command: str) -> list[tuple[str, str]]:
 HEREDOC = re.compile(r'(?<!<)<<(?!<)(-?)[ \t]*([\'"]?)([A-Za-z_][\w.-]*)\2')
 
 
-def heredocs(command: str) -> tuple[str, list[str]]:
+def heredocs(command: str, quoted: list | None = None) -> tuple[str, list[str]]:
     """Cut heredoc bodies out: (command with `<<HEREDOC#n` markers, bodies). A body runs to its delimiter
-    line; an opener without one is left in place (so its lines are still checked as commands)."""
+    line; an opener without one is left in place (so its lines are still checked as commands). `quoted`
+    gets, per body, whether its delimiter was quoted (then the shell expands nothing in it)."""
     lines, out, bodies, i = (command or '').split('\n'), [], [], 0
     at = {}  # stripped line -> the indexes of the lines that hold it, ascending
     if '<<' in (command or ''):
@@ -261,6 +308,8 @@ def heredocs(command: str) -> tuple[str, list[str]]:
                 break
             j = idx[k]
             bodies.append('\n'.join(lines[i:j]))
+            if quoted is not None:
+                quoted.append(bool(m.group(2)))
             marker = f'<<HEREDOC#{len(bodies) - 1}'
             line = line[:m.start()] + marker + line[m.end():]
             pos, i = m.start() + len(marker), j + 1
@@ -268,35 +317,93 @@ def heredocs(command: str) -> tuple[str, list[str]]:
     return '\n'.join(out), bodies
 
 
-WORD = re.compile(r'(?:[^\s"\']|"[^"]*"|\'[^\']*\'|["\'])+')
+ANSI_C_RE = r"\$'(?:[^'\\" r"]|\\" r"[\s\S])*'"  # bash $'...': a backslash escapes the next character, `\'` too
+WORD = re.compile(r'(?:' + ANSI_C_RE + r'|[^\s"\'$]+|\$|"[^"]*"|\'[^\']*\'|["\'])+')
 QUOTED = re.compile(r'"([^"]*)"|\'([^\']*)\'')
+# One quoted piece of a word, read left to right so a `$'` inside quotes is never taken for ANSI-C quoting.
+PIECE = re.compile(r"\$'((?:[^'\\" r"]|\\" r"[\s\S])*)'|\"([^\"]*)\"|'([^']*)'")
+ANSI_C_SIMPLE = {'n': '\n', 't': '\t', 'r': '\r', 'a': '\a', 'b': '\b', 'f': '\f', 'v': '\v', 'e': '\x1b',
+                 'E': '\x1b', '\\': '\\', "'": "'", '"': '"', '?': '?'}
+ANSI_C_ESCAPE = re.compile(r'\\(x[0-9A-Fa-f]{1,2}|u[0-9A-Fa-f]{1,4}|U[0-9A-Fa-f]{1,8}|[0-7]{1,3}|c.|.)', re.S)
+BRACE_CAP = 256  # words one word may expand to; more is denied, never checked in part
+BRACE_DEPTH = 32  # brace groups nested or side by side in one word that are followed
+EXPANDED_WORDS = 2048  # words brace expansion may add to one segment ...
+EXPANDED_CHARS = 256 * 1024  # ... and characters; past either the segment is too complex
+MAX_WORDS = 512  # includes the documented 256-word brace expansion plus command operands
+SEQUENCE = re.compile(r'^(?:(-?\d+)\.\.(-?\d+)|([^\\' r'])\.\.([^\\' r']))(?:\.\.(-?\d+))?$')
 
 
-def words(segment: str) -> list[str]:
+class Uninspectable(Exception):
+    """A word the guard cannot read in full (a brace expansion over its caps): the call is denied."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def words(segment: str, grown: list | None = None, expand: bool = True) -> list[str]:
     """Shell-ish split that keeps Windows backslashes (shlex would eat them). Quoted pieces next to each
     other or to bare text join into one word, as in a POSIX shell: `-c"code"` is `-ccode` and `g"it"` is
-    `git`. A lone unbalanced quote stays part of its word."""
-    out = []
+    `git`. A lone unbalanced quote stays part of its word. An unquoted $'...' is decoded and an unquoted
+    brace expanded, as bash does; a word brace expansion leaves empty is dropped. Raises Uninspectable past
+    BRACE_CAP/BRACE_DEPTH (one word) or EXPANDED_WORDS/EXPANDED_CHARS (the segment); `grown` (a one-item
+    list) gets the number of words expansion added, for the work budget. expand=False keeps braces as written."""
+    out, added, chars = [], 0, 0
     for w in WORD.findall(segment or ''):
-        if "$'" in w:  # bash ANSI-C quoting: $'\x2e\x2e/x' is ../x, so it is decoded as bash decodes it
-            w = ANSI_C.sub(lambda m: _ansi_c(m.group(1)), w)
-        out.append(QUOTED.sub(_unquote, w).strip('"\'') if '"' in w or "'" in w else w)
+        if '{' not in w or not expand:
+            out.append(_word_value(w))
+            if len(out) > MAX_WORDS:
+                raise Uninspectable(TOO_COMPLEX)
+            continue
+        forms = _brace_expand(w)
+        if forms is None:
+            raise Uninspectable(f'a brace expansion over {BRACE_CAP} words or {BRACE_DEPTH} groups cannot be '
+                                f'checked in full ({common.clip(w, 80)}); not allowed in a twinlane job')
+        added += len(forms) - 1
+        chars += sum(map(len, forms))
+        if added > EXPANDED_WORDS or chars > EXPANDED_CHARS:
+            raise Uninspectable(TOO_COMPLEX)
+        out += [_word_value(f) for f in forms if f]
+        if len(out) > MAX_WORDS:
+            raise Uninspectable(TOO_COMPLEX)
+    if grown is not None:
+        grown[0] += added
     return out
 
 
-ANSI_C = re.compile(r"\$'((?:[^'\\]|\\.)*)'", re.S)
-ANSI_C_SIMPLE = {'n': '\n', 't': '\t', 'r': '\r', 'a': '\a', 'b': '\b', 'f': '\f', 'v': '\v', 'e': '\x1b',
-                 'E': '\x1b', '\\': '\\', "'": "'", '"': '"', '?': '?'}
+def _unquote(m: re.Match) -> str:
+    return m.group(1) if m.group(1) is not None else m.group(2)
+
+
+def _word_value(w: str) -> str:
+    """One raw word with its quotes removed and each unquoted $'...' decoded."""
+    if '"' not in w and "'" not in w:
+        return w
+    parts, pos, ansi = [], 0, False
+    if "$'" in w:
+        for m in PIECE.finditer(w):
+            parts.append(w[pos:m.start()])
+            if m.group(1) is not None:
+                parts.append(_ansi_c(m.group(1)))
+                ansi = True
+            else:
+                parts.append(m.group(2) if m.group(2) is not None else m.group(3))
+            pos = m.end()
+    if not ansi:
+        return QUOTED.sub(_unquote, w).strip('"\'')
+    parts.append(w[pos:])
+    # A lone quote left at either end is dropped as for any other word; decoded text is kept as it is.
+    parts[0], parts[-1] = parts[0].lstrip('"\''), parts[-1].rstrip('"\'')
+    return ''.join(parts)
 
 
 def _ansi_c(body: str) -> str:
-    """The text bash makes of a $'...' body: \\xHH, \\NNN (octal), \\uHHHH, \\UHHHHHHHH, \\cX and the letter escapes."""
+    """The text bash makes of a $'...' body: \\xHH, \\NNN (octal), \\uHHHH, \\UHHHHHHHH, \\cX and the letter
+    escapes; an unknown escape keeps its backslash, and a NUL ends the text (bash strings are C strings)."""
     def one(m: re.Match) -> str:
         e = m.group(1)
         try:
-            if e[0] == 'x':
-                return chr(int(e[1:], 16))
-            if e[0] in 'uU':
+            if e[0] in 'xuU':
                 return chr(int(e[1:], 16))
             if e[0] in '01234567':
                 return chr(int(e, 8) & 0xFF)
@@ -305,11 +412,105 @@ def _ansi_c(body: str) -> str:
         except (ValueError, OverflowError):
             return '\\' + e
         return ANSI_C_SIMPLE.get(e, '\\' + e)
-    return re.sub(r'\\(x[0-9A-Fa-f]{1,2}|u[0-9A-Fa-f]{1,4}|U[0-9A-Fa-f]{1,8}|[0-7]{1,3}|c.|.)', one, body, flags=re.S)
+    return ANSI_C_ESCAPE.sub(one, body).split('\0', 1)[0]
 
 
-def _unquote(m: re.Match) -> str:
-    return m.group(1) if m.group(1) is not None else m.group(2)
+def _ansi_text(text: str) -> str:
+    """Text with each unquoted $'...' decoded and every other quote left as written (for the text rules)."""
+    if "$'" not in (text or ''):
+        return text or ''
+    return PIECE.sub(lambda m: _ansi_c(m.group(1)) if m.group(1) is not None else m.group(0), text)
+
+
+def _brace_marks(w: str) -> list[tuple[str, int, bool]]:
+    """(char, index, after an unquoted `$`) of each `{`, `,` and `}` of a raw word that is neither quoted
+    nor backslash-escaped. A lone quote is read as a literal character, so it cannot hide a brace."""
+    marks, i, dollar = [], 0, False
+    while i < len(w):
+        c = w[i]
+        if c == '\\':
+            i, dollar = i + 2, False
+            continue
+        m = PIECE.match(w, i) if c in '"\'$' else None
+        if m:
+            i, dollar = m.end(), False
+            continue
+        if c in '{,}':
+            marks.append((c, i, dollar))
+        dollar, i = c == '$', i + 1
+    return marks
+
+
+def _sequence(text: str) -> tuple[bool, list | None]:
+    """(is a sequence, its words or None when over BRACE_CAP) for the inside of {x..y} or {x..y..step}:
+    integers (zero-padded when an end is) or single characters; anything else is not a sequence."""
+    m = SEQUENCE.match(text) if len(text) <= 64 else None
+    if not m:
+        return False, None
+    step = abs(int(m.group(5))) if m.group(5) else 1
+    step = step or 1
+    if m.group(1) is not None:
+        ends = m.group(1), m.group(2)
+        lo, hi = int(ends[0]), int(ends[1])
+        width = max(map(len, ends)) if any(re.match(r'^-?0\d', e) for e in ends) else 0
+        conv = (lambda n: f'{n:0{width}d}') if width else str
+    else:
+        lo, hi, conv = ord(m.group(3)), ord(m.group(4)), chr
+    if abs(hi - lo) // step + 1 > BRACE_CAP:
+        return True, None
+    return True, [conv(n) for n in range(lo, hi + (1 if hi >= lo else -1), step if hi >= lo else -step)]
+
+
+def _brace_expand(w: str, depth: int = 0) -> list | None:
+    """bash brace expansion of one raw word, quotes kept (they are removed afterwards): the first unquoted
+    group with a top-level comma or a {x..y} sequence is expanded, then the alternatives and the rest of the
+    word recursively. `${...}` and everything inside it are not expanded; a group without a comma is literal
+    but the groups inside it are not. None past BRACE_CAP words or BRACE_DEPTH groups."""
+    if '{' not in w:
+        return [w]
+    if depth > BRACE_DEPTH:
+        return None
+    stack, groups = [], []
+    for c, i, dollar in _brace_marks(w):
+        if c == '{':
+            stack.append((i, dollar, []))
+        elif stack and c == ',':
+            stack[-1][2].append(i)
+        elif stack:
+            o, at_dollar, commas = stack.pop()
+            groups.append((o, i, at_dollar, commas))
+    skip_to = -1
+    for o, c, at_dollar, commas in sorted(groups):
+        if o < skip_to:
+            continue
+        if at_dollar:
+            skip_to = c
+            continue
+        if commas:
+            cuts = [o] + commas + [c]
+            alts, literal = [w[a + 1:b] for a, b in zip(cuts, cuts[1:])], False
+        else:
+            is_seq, alts = _sequence(w[o + 1:c])
+            if not is_seq:
+                continue
+            if alts is None:
+                return None
+            literal = True
+        posts = _brace_expand(w[c + 1:], depth + 1)
+        if posts is None:
+            return None
+        out = []
+        for alt in alts:
+            expanded = [alt] if literal else _brace_expand(alt, depth + 1)
+            if expanded is None:
+                return None
+            for e in expanded:
+                for p in posts:
+                    out.append(w[:o] + e + p)
+                    if len(out) > BRACE_CAP:
+                        return None
+        return out
+    return [w]
 
 
 @functools.lru_cache(maxsize=1024)
@@ -321,8 +522,9 @@ def _base(word: str) -> str:
 
 @functools.lru_cache(maxsize=1024)
 def _cmd_name(word: str) -> str:
-    """A full path such as `.../Git/cmd/git.exe` -> `git`, `python3.12` -> `python`."""
-    name = _base(word)
+    """A full path such as `.../Git/cmd/git.exe` -> `git`, `python3.12` -> `python`. cmd's caret escape is
+    dropped (`g^it` is `git` to cmd)."""
+    name = _base(word.replace('^', '') if '^' in word else word)
     for ext in ('.exe', '.cmd', '.bat', '.com'):
         if name.endswith(ext):
             name = name[:-len(ext)]
@@ -332,8 +534,9 @@ def _cmd_name(word: str) -> str:
 
 
 def git_subcommand(ws: list[str]) -> tuple[str | None, list[str]]:
-    """('commit', [args]) for `git -C x -c k=v commit -m y`; (None, []) when not a git call."""
-    if not ws or _base(ws[0]) not in ('git', 'git.exe'):
+    """('commit', [args]) for `git -C x -c k=v commit -m y`; (None, []) when not a git call. Every spelling
+    of the program counts: git.exe, git.cmd, GIT, a full path."""
+    if not ws or _cmd_name(ws[0]) != 'git':
         return None, []
     i = 1
     while i < len(ws):
@@ -368,16 +571,23 @@ def _drop_wrappers(ws: list[str], chdirs: list | None = None, split: list | None
     any other); the directories of `env -C DIR` and `sudo -D DIR` are appended to chdirs."""
     ws, i = [w for w in ws if w and not w.startswith('<<HEREDOC#')], 0
     while i < len(ws):
-        if re.match(r'^[A-Za-z_][A-Za-z0-9_]*=', ws[i]):
+        if ws[i].lower() in SHELL_PREFIXES:
+            i += 1
+            if i < len(ws) and ws[i - 1].lower() == 'coproc' and i + 1 < len(ws) and ws[i + 1] == '{':
+                i += 1  # optional coprocess name
+        elif re.match(r'^[A-Za-z_][A-Za-z0-9_]*=', ws[i]):
             i += 1
         elif re.match(r'^\$[\w:]+$', ws[i]) and i + 1 < len(ws) and ws[i + 1] in ('=', '+=', '-='):
             i += 2
         elif re.match(r'^\$[\w:]+=.', ws[i]):
             ws[i] = ws[i].split('=', 1)[1]
+        elif len(ws[i]) > 1 and ws[i][0] in '&@' and ws[i][1] not in '&>(':  # PowerShell `&"git" push`
+            ws[i] = ws[i][1:]
         elif _cmd_name(ws[i]) in WRAPPERS:
             name = _cmd_name(ws[i])
             vopts = WRAPPER_VALUE_OPTS.get(name, set())
             i += 1
+            operand_skipped = False
             while i < len(ws):
                 w = ws[i]
                 if w == '--':
@@ -392,8 +602,13 @@ def _drop_wrappers(ws: list[str], chdirs: list | None = None, split: list | None
                     elif name in ('env', 'sudo') and opt in ('-C' if name == 'env' else '-D', '--chdir') \
                             and chdirs is not None:
                         chdirs.append(value)
-                elif re.match(r'^\d+[smhd]?$', w):  # timeout 5, watch 2
+                elif re.match(r'^\d+(?:\.\d+)?[smhd]?$', w):  # timeout 5, watch 2
                     i += 1
+                    if name in ('taskset', 'chrt'):
+                        operand_skipped = True
+                elif name in ('chroot', 'flock', 'faketime', 'taskset', 'chrt') and not operand_skipped:
+                    i += 1  # these wrappers have a non-option root/lock/time/scheduler operand
+                    operand_skipped = True
                 else:
                     break
         else:
@@ -456,8 +671,26 @@ def git_hazard(ws: list[str]) -> str | None:
     if sub is None:
         return None
     flat = [a.lower() for a in args]
+    if RUN_TIME_WORD.search(sub):  # `git $X`, `git ${IFS}push`: the subcommand is only known at run time
+        return f'a git subcommand computed at run time ({common.clip(sub, 30)}) cannot be inspected in a twinlane job'
     if sub in DENY_GIT:
         return f'git {sub} is not allowed in a twinlane job'
+    if sub in ('checkout', 'switch') and args and not any(a == '--' for a in args):
+        return f'git {sub} changes the worktree; not allowed in a twinlane job'
+    if sub == 'fetch' and any(':' in a and not a.startswith('-') and
+                              a.rsplit(':', 1)[-1].lstrip('+').startswith(('refs/heads/', 'main'))
+                              for a in args):
+        return 'git fetch with a destination ref is not allowed in a twinlane job'
+    if sub == 'fetch' and any(re.match(r'^\+?[^:]+:[^:]+$', a) for a in args):
+        return 'git fetch with a destination ref is not allowed in a twinlane job'
+    if sub == 'gc' and any(a.startswith('--prune') for a in flat):
+        return 'git gc --prune is not allowed in a twinlane job'
+    if sub == 'reflog' and flat[:1] == ['expire']:
+        return 'git reflog expire is not allowed in a twinlane job'
+    if sub == 'bisect' and 'run' in flat:
+        return 'git bisect run is not allowed in a twinlane job'
+    if sub == 'difftool' and any(a in ('-x', '--extcmd') or a.startswith('--extcmd=') for a in flat):
+        return 'git difftool external commands are not allowed in a twinlane job'
     program = next((a for a in args if GIT_PROGRAM_OPTS.match(a)), None)
     if program or (sub in ('clone', 'fetch', 'ls-remote', 'archive') and '-u' in args):
         return f'git {sub} {common.clip(program or "-u", 20)} runs a program; not allowed in a twinlane job'
@@ -582,23 +815,351 @@ def net_hazard(ws: list[str]) -> str | None:
     return None
 
 
-def head_hazard(ws: list[str]) -> str | None:
-    """Rules on the command a segment runs: engines, git writes, outbound sends."""
+# ---------------------------------------------------------------- configuration (policy `guard` section)
+
+GUARD_KEYS = ('allow_subagents', 'self_aliases', 'deny_commands', 'deny_text')
+GUARD_LIST_MAX = 256  # entries per list
+GUARD_ENTRY_MAX = 512  # characters per entry
+
+
+class GuardConfigError(ValueError):
+    """The guard section of the policy/user config is not valid: the guard then denies every call."""
+
+
+def _norm_prog(word: str) -> str:
+    """A program word as a name to compare: `/opt/x/Twinlane.EXE` -> `twinlane`, `tl.py` -> `tl`,
+    `twinlane-script.py` -> `twinlane`."""
+    name = _cmd_name(word)
+    for ext in ('-script.pyw', '-script.py', '.pyw', '.py', '.ps1', '.sh'):
+        if name.endswith(ext) and len(name) > len(ext):
+            return name[:-len(ext)]
+    return name
+
+
+def _config_list(section: dict, key: str) -> list[str]:
+    value = section.get(key, [])
+    if not isinstance(value, list):
+        raise GuardConfigError(f'guard.{key} must be a list of strings')
+    if len(value) > GUARD_LIST_MAX:
+        raise GuardConfigError(f'guard.{key} has more than {GUARD_LIST_MAX} entries')
+    for item in value:
+        if not isinstance(item, str) or not item.strip() or len(item) > GUARD_ENTRY_MAX:
+            raise GuardConfigError(f'guard.{key} entries must be non-empty strings of at most '
+                                   f'{GUARD_ENTRY_MAX} characters ({common.clip(repr(item), 60)})')
+    return value
+
+
+@functools.lru_cache(maxsize=16)
+def _compile_config(key: str) -> dict:
+    section = json.loads(key)
+    if not isinstance(section, dict):
+        raise GuardConfigError('the guard section must be an object')
+    unknown = sorted(set(section) - set(GUARD_KEYS))
+    if unknown:
+        raise GuardConfigError(f'unknown guard key(s): {common.clip(", ".join(unknown), 80)}')
+    allow = section.get('allow_subagents', False)
+    if not isinstance(allow, bool):
+        raise GuardConfigError('guard.allow_subagents must be true or false')
+    names = {SELF_NAME}
+    for alias in _config_list(section, 'self_aliases'):
+        if re.search(r'\s', alias.strip()):
+            raise GuardConfigError(f'guard.self_aliases entries are single program names ({common.clip(alias, 60)})')
+        name = _norm_prog(alias.strip())
+        if not name or name in ('.', '..'):
+            raise GuardConfigError(f'guard.self_aliases entry names no program ({common.clip(alias, 60)})')
+        names.add(name)
+    deny_commands = []
+    for entry in _config_list(section, 'deny_commands'):
+        try:
+            ws = words(entry)
+        except Uninspectable:
+            ws = []
+        if not ws or not _norm_prog(ws[0]):
+            raise GuardConfigError(f'guard.deny_commands entry names no program ({common.clip(entry, 60)})')
+        deny_commands.append((_norm_prog(ws[0]), tuple(w.lower() for w in ws[1:]), entry.strip()))
+    deny_text = []
+    for pattern in _config_list(section, 'deny_text'):
+        if len(pattern) > 512:
+            raise GuardConfigError('guard.deny_text entries must be at most 512 characters')
+        # Nested unbounded repeats can make even the guard's bounded input take unbounded CPU time.
+        if re.search(r'\([^)]*(?:\+|\*|\{\d*,\})[^)]*\)(?:\+|\*|\{\d*,\})', pattern):
+            raise GuardConfigError('guard.deny_text contains nested unbounded quantifiers')
+        try:
+            deny_text.append(re.compile(pattern, re.I))
+        except (re.error, OverflowError, RecursionError) as e:
+            raise GuardConfigError(f'guard.deny_text entry is not a valid regex ({common.clip(pattern, 60)}: '
+                                   f'{common.clip(str(e), 60)})') from None
+    alt = '|'.join(re.escape(n) for n in sorted(names))
+    # A script path followed by a verb: `.../twinlane/cli.py land`, `twinlane.py run`, `tl.py ship`.
+    self_text = re.compile(r'(?<![\w.-])(?:' + alt + r')(?:[\\/](?:cli|__main__))?\.pyw?["\']?\s+["\']?'
+                           r'(?:run|_job|land|ship|resume|install|wt\s+["\']?prune)\b|(?:' + alt +
+                           r')[\\/](?:cli|__main__)\.pyw?["\']?\s.*--best', re.I)
+    return {'allow_subagents': allow, 'self_names': frozenset(names), 'deny_commands': tuple(deny_commands),
+            'deny_text': tuple(deny_text), 'self_text': self_text}
+
+
+def load_config(section, allow_none: bool = True) -> dict:
+    """The normalised guard configuration of a policy `guard` section (None means the defaults, unless
+    allow_none is False: a config that sets `"guard": null` is not valid). Raises GuardConfigError for anything
+    that is not exactly valid: an unknown key, a wrong type, an empty entry, an alias with spaces, a deny_text
+    regex that does not compile."""
+    if section is None:
+        if not allow_none:
+            raise GuardConfigError('the guard section is null')
+        section = {}
+    try:
+        key = json.dumps(section, sort_keys=True)
+    except (TypeError, ValueError) as e:
+        raise GuardConfigError(f'the guard section is not plain JSON ({type(e).__name__})') from None
+    return _compile_config(key)
+
+
+DEFAULT_CONFIG = load_config({})
+
+
+def _policy_config() -> dict:
+    """The guard configuration of the merged policy and user config; GuardConfigError when unreadable."""
+    try:
+        policy = common.load_policy()
+    except (Exception, SystemExit) as e:  # noqa: BLE001 - an unreadable config fails closed
+        raise GuardConfigError(f'the policy or user config cannot be read ({type(e).__name__})') from None
+    if not isinstance(policy, dict):
+        raise GuardConfigError('the policy is not an object')
+    return load_config(policy['guard'] if 'guard' in policy else {}, allow_none=False)
+
+
+# ---------------------------------------------------------------- program rules (engines, self, DB, config)
+
+RUN_TIME_WORD = re.compile(r'[`]|\$[({A-Za-z_0-9@*#?!$-]|%[A-Za-z_]\w*%')  # a word the shell computes
+
+
+def _module_name(mod: str) -> str:
+    low = mod.lower()
+    for suffix in ('.__main__', '.cli.main', '.cli'):
+        if low.endswith(suffix):
+            return low[:-len(suffix)]
+    return low
+
+
+def _self_at(ws: list[str], i: int, names) -> list[str] | None:
+    """The arguments of a twinlane invocation at ws[i], or None when ws[i] does not invoke twinlane: the
+    program itself (any path or suffix), a `.../twinlane/cli.py` or `__main__.py` script, a package
+    directory (`python twinlane`), or `-m twinlane[.cli]` (also `-mtwinlane`, `-Im twinlane`)."""
+    w = ws[i]
+    if _norm_prog(w) in names:
+        return ws[i + 1:]
+    path = w.replace('\\', '/').lower().rstrip('/')
+    for n in names:
+        if path in (f'{n}/cli.py', f'{n}/__main__.py') or path.endswith((f'/{n}/cli.py', f'/{n}/__main__.py')):
+            return ws[i + 1:]
+    m = re.match(r'^-[A-Za-z]*?m(.*)$', w)
+    if m:
+        mod, rest = (m.group(1), ws[i + 1:]) if m.group(1) else ((ws[i + 1], ws[i + 2:]) if i + 1 < len(ws)
+                                                                  else ('', []))
+        if _module_name(mod) in names:
+            return rest
+    return None
+
+
+def _self_reason(args: list[str], label: str) -> str | None:
+    """A reason when twinlane ARGS would dispatch work or change shared state."""
+    low = [a.lower() for a in args]
+    why = f'{label} {{}} dispatches work or changes shared state; not allowed in a twinlane job'
+    if any(a.startswith('--best') for a in low):
+        return why.format('--best-of')
+    if any(a in SELF_DENIED for a in low):
+        return why.format(next(a for a in low if a in SELF_DENIED))
+    pos = [a for a in low if not a.startswith('-')]
+    if not pos:
+        return None
+    if RUN_TIME_WORD.search(pos[0]):
+        return f'a {label} command computed at run time ({common.clip(pos[0], 30)}) cannot be inspected in a ' \
+               'twinlane job'
+    if pos[0] in SELF_DENIED:
+        return why.format(pos[0])
+    if pos[0] == 'wt' and (len(pos) < 2 or pos[1] not in SELF_WT_ALLOWED or 'prune' in pos or
+                           any(a in ('--prune', '--fix') for a in low)):
+        return why.format(' '.join(['wt'] + pos[1:2]))
+    return None
+
+
+def self_hazard(ws: list[str], cfg: dict | None = None) -> str | None:
+    """twinlane's own dispatching commands, however twinlane is invoked anywhere in the words."""
+    names = (cfg or DEFAULT_CONFIG)['self_names']
+    for i in _program_positions(ws):
+        args = _self_at(ws, i, names)
+        if args is not None:
+            why = _self_reason(args, SELF_NAME)
+            if why:
+                return why
+    return None
+
+
+def _program_positions(ws: list[str]) -> list[int]:
+    """Where a program name can stand: the command itself; every word after a program runner (npx, uvx,
+    uv run, wsl, ...) or a container exec (docker exec/run, kubectl exec, ...); an interpreter's script."""
+    if not ws:
+        return []
+    head = _cmd_name(ws[0])
+    # These commands consume their remaining words as data. In particular, searching for the name of
+    # a forbidden program must not turn a read-only grep/rg or a pytest -k expression into a launch.
+    if head in {'grep', 'egrep', 'fgrep', 'rg', 'echo', 'printf', 'cat', 'type', 'pytest', 'py.test'}:
+        return [0]
+    if head == 'git':
+        return [0]
+    if head in PROGRAM_RUNNERS or (head in CONTAINER_EXEC and any(a.lower() in ('exec', 'run', 'debug')
+                                                                    for a in ws[1:])):
+        return list(range(len(ws)))
+    # A segment can begin with any front-end, including one the guard has not catalogued yet. Inspect
+    # each later literal as a possible executable, but leave known data consumers above untouched.
+    out = list(range(len(ws)))
+    if head in INTERPRETERS or head in ('source', '.'):
+        script = _script_arg(ws) if head in INTERPRETERS else (ws[1] if len(ws) > 1 else None)
+        if script:
+            out += [i for i, w in enumerate(ws) if w == script][:1]
+    return out
+
+
+def _deny_command_match(ws: list[str], i: int, entry: tuple) -> bool:
+    """ws[i] is the denied program and the entry's argument words follow it in order (not necessarily
+    next to each other: `kubectl -n x delete` matches `kubectl delete`)."""
+    name, args, _text = entry
+    if _norm_prog(ws[i]) != name:
+        return False
+    rest, k = [w.lower() for w in ws[i + 1:]], 0
+    for a in args:
+        while k < len(rest) and rest[k] != a:
+            k += 1
+        if k == len(rest):
+            return False
+        k += 1
+    return True
+
+
+def program_hazard(ws: list[str], cfg: dict | None = None) -> str | None:
+    """Database clients and configured deny_commands, at every position a program can stand."""
+    cfg = cfg or DEFAULT_CONFIG
+    for i in _program_positions(ws):
+        name = _norm_prog(ws[i])
+        if DB_CLIENT_NAME.match(name):
+            return f'database clients ({common.clip(name, 30)}) are not allowed in a twinlane job'
+        if i and name in ('claude', 'codex'):
+            return f'nested engine launch ({name}) is not allowed in a twinlane job'
+        for entry in cfg['deny_commands']:
+            if _deny_command_match(ws, i, entry):
+                return f'{common.clip(entry[2], 60)} is denied by guard.deny_commands in a twinlane job'
+    return None
+
+
+def _head_rules(ws: list[str], cfg: dict) -> str | None:
+    if _base(ws[0]) in ENGINE_WORDS or _cmd_name(ws[0]) in ('claude', 'codex'):
+        return f'nested engine launch ({_base(ws[0])}) is not allowed in a twinlane job'
+    return git_hazard(ws) or net_hazard(ws) or _operation_hazard(ws)
+
+
+def _operation_hazard(ws: list[str]) -> str | None:
+    """Known CLI entrypoints that run migrations or attach a remote database."""
+    head, args = _cmd_name(ws[0]), [a.lower() for a in ws[1:]]
+    migrations = {'dbt': {'run', 'build', 'seed', 'snapshot'}, 'flyway': {'migrate'},
+                  'liquibase': {'update'}, 'alembic': {'upgrade', 'downgrade'},
+                  'prisma': {'migrate', 'db'}, 'artisan': {'migrate'},
+                  'rails': {'db:migrate'}, 'manage.py': {'migrate'}}
+    if head in migrations and any(a in migrations[head] for a in args):
+        return f'{head} may change a database; not allowed in a twinlane job'
+    if head == 'duckdb' and any('attach' in a.lower() for a in ws) and \
+            any(re.search(r'postgres|mysql|mssql|mongodb', a, re.I) for a in ws):
+        return 'duckdb attaches a remote database; not allowed in a twinlane job'
+    return None
+
+
+def head_hazard(ws: list[str], cfg: dict | None = None) -> str | None:
+    """Rules on the command a segment runs: engines, twinlane's own commands, database clients, configured
+    deny_commands, git writes, outbound sends. A backslash inside the program name is also read as bash
+    reads it (`g\\it` is `git`)."""
     if not ws:
         return None
-    head = _base(ws[0])
-    if head in ENGINE_WORDS or (head in ('twinlane', 'twinlane.cmd') and len(ws) > 1 and ws[1] in ('run', '_job')):
-        return f'nested engine launch ({head}) is not allowed in a twinlane job'
-    return git_hazard(ws) or net_hazard(ws)
+    cfg = cfg or DEFAULT_CONFIG
+    positions = _program_positions(ws)
+    reason = self_hazard(ws, cfg) or program_hazard(ws, cfg)
+    if not reason:
+        reason = next((r for i in positions if (r := _head_rules(ws[i:], cfg))), None)
+    if not reason and '\\' in ws[0]:
+        bare = ws[0].replace('\\', '')
+        if bare and bare != ws[0]:
+            reason = head_hazard([bare] + ws[1:], cfg)
+    return reason
 
 
-def _text_hazard(text: str) -> str | None:
-    low = (text or '').lower()
-    if re.search(r'twinlane[\\/]cli\.py["\']?\s+(run|_job)\b', low):
-        return 'nested twinlane run is not allowed in a twinlane job'
-    if re.search(r'new-object\s+(system\.)?net\.(webclient|mail\.|sockets\.)|\[(system\.)?net\.(webclient|mail\.'
-                 r'|sockets\.|http\.httpclient|webrequest)', low):
+NET_TEXT = re.compile(r'new-object\s+(system\.)?net\.(webclient|mail\.|sockets\.)|\[(system\.)?net\.(webclient|mail\.'
+                      r'|sockets\.|http\.httpclient|webrequest)')
+DB_TEXT = re.compile(r'(?:system\.)?data\.(?:sqlclient|odbc|oledb|oracleclient)|microsoft\.data\.sqlclient|'
+                     r'mysql\.data\.mysqlclient|npgsql|oracle\.manageddataaccess|'
+                     r'new-object\s+-comobject\s+adodb', re.I)
+PS_FILE_CALL = re.compile(r'\[(?:System\.)?IO\.(?:File|Directory)\]::(Write\w*|Copy|Move|Delete)\s*\(\s*'
+                          r'([\'"][^\'"]*[\'"]|\([^)]*\)|[^,)]+)', re.I)
+PS_PATH_WRITERS = {'out-file', 'set-content', 'add-content', 'export-csv', 'export-clixml',
+                   'start-transcript', 'tee-object'}
+
+
+def _powershell_hazard(ws: list[str], seg: str, root: str | None, base: str | None) -> str | None:
+    """PowerShell launch APIs and write targets that are not ordinary shell operands."""
+    low = seg.lower()
+    if re.search(r'\[(?:system\.)?diagnostics\.process\]::start|\binvokecommand\.invokescript\s*\(|'
+                 r'\[scriptblock\]::create\s*\(|\bnew-object\s+system\.diagnostics\.process\b', low):
+        return 'PowerShell starts code through a process or scriptblock that cannot be inspected'
+    if re.search(r'\b(?:invoke-expression|iex)\s*\(?\s*(?:\(|\[|\$)', low):
+        return 'PowerShell evaluates a computed command that cannot be inspected'
+    if re.search(r'\bnew-object\s*(?:-typename\s+)?(?:\(|[\'"])?(?:system\.)?data\.(?:sqlclient|odbc)',
+                 low) or re.search(r'new-object\s+-comobject\s+adodb', low):
+        return 'PowerShell opens a database client; not allowed in a twinlane job'
+    if "'+'" in seg or "\"+\"" in seg:
+        joined = re.sub(r'[\'"]\s*\+\s*[\'"]', '', seg)
+        if DB_TEXT.search(joined):
+            return 'PowerShell constructs a database client; not allowed in a twinlane job'
+    if root:
+        for m in PS_FILE_CALL.finditer(seg):
+            path = m.group(2).strip().strip('"\'')
+            if m.group(1).lower() != 'copy' and (path.startswith('(') or _outside(path, root, base)):
+                return 'PowerShell file API writes outside the job worktree or to a computed path'
+            if m.group(1).lower() in ('copy', 'move'):
+                second = re.match(r'\s*,\s*([\'"][^\'"]*[\'"]|\([^)]*\)|[^,)]+)', seg[m.end():])
+                if second is None:
+                    return 'PowerShell file API destination cannot be inspected'
+                dest = second.group(1).strip().strip('"\'')
+                if dest.startswith('(') or _outside(dest, root, base):
+                    return 'PowerShell file API writes outside the job worktree or to a computed path'
+        head = _cmd_name(ws[0]) if ws else ''
+        if head in PS_PATH_WRITERS:
+            for i, w in enumerate(ws[1:], 1):
+                if w.lower() in ('-path', '-literalpath', '-filepath') and i + 1 < len(ws):
+                    path = ws[i + 1]
+                    if path.startswith('(') or _outside(path, root, base):
+                        return 'PowerShell writes outside the job worktree or to a computed path'
+                if w.lower().startswith(('-path:', '-literalpath:', '-filepath:')):
+                    path = w.split(':', 1)[1]
+                    if path.startswith('(') or _outside(path, root, base):
+                        return 'PowerShell writes outside the job worktree or to a computed path'
+    return None
+
+
+def _text_hazard(text: str, cfg: dict | None = None) -> str | None:
+    """Rules on the raw command text: twinlane's script run with a dispatching verb, configured deny_text,
+    .NET network and database clients."""
+    cfg = cfg or DEFAULT_CONFIG
+    text = text or ''
+    low = text.lower()
+    if cfg['self_text'].search(low):
+        return 'twinlane commands that dispatch work or change shared state are not allowed in a twinlane job'
+    if cfg['deny_text']:
+        plain = _unquoted(text)
+        for rx in cfg['deny_text']:
+            if rx.search(text) or rx.search(plain):
+                return f'the command matches guard.deny_text ({common.clip(rx.pattern, 60)}); not allowed in a ' \
+                       'twinlane job'
+    if NET_TEXT.search(low):
         return '.NET network clients are not allowed in a twinlane job'
+    if DB_TEXT.search(low):
+        return '.NET database clients are not allowed in a twinlane job'
     return None
 
 
@@ -638,14 +1199,15 @@ def inline_code(ws: list[str]) -> tuple[str, str] | None:
     if head in ('powershell', 'pwsh'):
         low = [a.lower() for a in args]
         if any(a in ('-file', '-f') for a in low):
-            return None
+            return 'opaque', ''
         rest, i = [], 0
         while i < len(args):
             a = low[i]
             if a in ('-e', '-ec') or (len(a) >= 3 and 'encodedcommand'.startswith(a[1:])):
                 return 'opaque', ''
             if a.startswith('-c') and 'command'.startswith(a[1:]):
-                return 'shell', ' '.join(args[i + 1:])
+                code = ' '.join(args[i + 1:])
+                return ('opaque', '') if code.strip() == '-' else ('shell', code)
             if a.startswith(PS_VALUE_PARAMS) or any(p.startswith(a) and len(a) > 3 for p in PS_VALUE_PARAMS):
                 i += 2
                 continue
@@ -731,6 +1293,39 @@ def _inside(path: str, root: str) -> bool:
     return p == r or p.startswith(r.rstrip('\\/') + os.sep)
 
 
+_UNEXPANDED_PATH = re.compile(r'^~|\$|%[^%]*%|^[A-Za-z]:(?![\\/])')
+_GIT_NAME = re.compile(r'\.git|git~\d+')
+
+
+def _file_write_reason(tool: str, path: str, root: str) -> str | None:
+    """Deny reason for a file-tool path that _inside() judged as inside, or None.
+
+    A path the tool may expand (`~`, $VAR, %VAR%) or resolve against another directory (C:name) could
+    land somewhere other than where it was judged. A `.git` entry is the worktree's link to its
+    repository: rewriting it, or a hook under it, points later git commands at another repository.
+    Windows drops trailing dots and spaces, accepts 8.3 names and ignores a ::$DATA stream suffix,
+    so each of those spellings is the same `.git`."""
+    if _UNEXPANDED_PATH.search(path) or re.match(r'^[A-Za-z][A-Za-z0-9+.-]+:/', path):
+        return f'{tool}: the path {common.clip(path, 120)} is not literal (~, $VAR, %VAR%, C:name or a URL); ' \
+               f'use a plain path'
+    if _in_git_entry(os.path.join(root, _native(path)), root):
+        return f'{tool} into the worktree\'s .git ({common.clip(path, 120)}); git state is changed by git commands'
+    return None
+
+
+def _in_git_entry(full: str, root: str) -> bool:
+    """True when full, inside root, is or lies under a `.git` entry in any Windows spelling of it."""
+    try:
+        rel = os.path.relpath(os.path.normcase(os.path.normpath(full)), os.path.normcase(os.path.normpath(root)))
+    except ValueError:  # another drive: _inside already judged it
+        return False
+    for part in re.split(r'[\\/]', rel):
+        name = part.split(':')[0].rstrip(' .').lower()
+        if name and _GIT_NAME.fullmatch(name):
+            return True
+    return False
+
+
 def _expand(word: str) -> str | None:
     """`~` and $VAR/%VAR% expanded, or None when something stays unresolved."""
     w = (word or '').strip().strip('"\'')
@@ -748,36 +1343,14 @@ def _expand(word: str) -> str | None:
 def _path_candidates(word: str, head: str = '') -> list:
     """Every path a word can name, quotes removed: the word itself, a value after `=` or `:`, a short option's
     attached value (`-d../x`), and every value a flag cluster could carry (`-xvC../x`). A POSIX shell drops a
-    backslash before an ordinary character (`.\\./x` is `../x`), so that reading is a candidate too."""
+    backslash before an ordinary character (`.\\./x` is `../x`), so that reading is a candidate too. (Brace
+    expansion already happened in words(), where quotes still show which braces bash expands.)"""
     w = (word or '').replace('"', '').replace("'", '')
     unescaped = re.sub(r'\\([^\\/])', r'\1', w)
     forms = [w] if unescaped == w else [w, unescaped]
     out = []
     for form in forms:
-        expanded = _brace_expand(form)  # `{..,b}/x` is `../x` and `b/x`
-        if expanded is None:
-            return [TOO_MANY_EXPANSIONS]
-        for e in expanded:
-            out += [_glob_dotdot(c) for c in _candidates_of(e, head)]
-    return out
-
-
-TOO_MANY_EXPANSIONS = '\0brace-expansion-over-cap'  # a candidate no path equals: path_hazard denies it
-BRACE_CAP = 256
-
-
-def _brace_expand(w: str, cap: int = BRACE_CAP) -> list | None:
-    """bash brace expansion of comma lists (`{..,b}/x` -> `../x`, `b/x`); ranges are left as written. None when
-    the word expands to more than `cap` words: an expansion the guard cannot read in full is denied, never cut."""
-    m = re.search(r'\{([^{}]*,[^{}]*)(?:\}|$)', w)  # a closing `}` at the end may already be cut as a group close
-    if not m:
-        return [w]
-    out = [w]
-    for part in m.group(1).split(','):
-        sub = _brace_expand(w[:m.start()] + part + w[m.end():], cap)
-        if sub is None or len(out) + len(sub) > cap:
-            return None
-        out += sub
+        out += [_glob_dotdot(c) for c in _candidates_of(form, head)]
     return out
 
 
@@ -837,13 +1410,15 @@ def _resolve_dir(word: str, base: str | None) -> str | None:
 
 
 def _redirect_targets(seg: str) -> list[str]:
-    return [m.group(1) for m in REDIRECT.finditer(seg or '') if m.group(1)]
+    """Each redirect target as the shell reads it: quotes removed, $'...' decoded and braces expanded (bash
+    refuses a target that expands to several words; each is checked anyway)."""
+    return [t for m in REDIRECT.finditer(seg or '') if m.group(1) for t in words(m.group(1)) or ['']]
 
 
 def path_hazard(ws: list[str], seg: str, root: str, base: str | None, stack: list,
-                raw: list[str] | None = None) -> tuple[str | None, str | None]:
+                raw: list[str] | None = None, ps: bool = False) -> tuple[str | None, str | None]:
     """(new base, reason): follows cd/pushd/popd, then checks the write targets of one command. raw is
-    words(seg) before wrappers were dropped."""
+    words(seg) before wrappers were dropped; ps is True for PowerShell text (a backslash escapes nothing)."""
     head = _cmd_name(ws[0]) if ws else ''
     if head in CD_WORDS:
         if head in ('popd', 'pop-location'):
@@ -860,8 +1435,15 @@ def path_hazard(ws: list[str], seg: str, root: str, base: str | None, stack: lis
     if head in WRITE_VERB_NAMES or (head in ('sed', 'perl') and any(w.startswith('-i') for w in ws[1:])):
         written, sources = _verb_targets(head, ws)
         targets += written
+        if '{' in seg:
+            # A brace word in a write position writes every one of its forms, also the ones bash places
+            # before it (`cp a {..,b}/x` is `cp a ../x b/x`): the words as written are read for targets too.
+            flat = _drop_wrappers(words(seg, expand=False))
+            if flat and _cmd_name(flat[0]) == head:
+                for t in _verb_targets(head, flat)[0]:
+                    targets += [_word_value(f) for f in (_brace_expand(t) or [t])]
     sub, _args = git_subcommand(ws)
-    if sub is not None and sub not in GIT_READ:
+    if sub is not None:
         for i, w in enumerate(ws[1:], 1):
             if w in ('-C', '--git-dir', '--work-tree') and i + 1 < len(ws):
                 targets.append(ws[i + 1])
@@ -874,8 +1456,27 @@ def path_hazard(ws: list[str], seg: str, root: str, base: str | None, stack: lis
     for t in targets:
         if _outside(t, root, base):
             return base, f'a writing command names a path outside the job worktree ({common.clip(t, 120)})'
+        literal = _native(_expand((t or '').strip().strip('"\'')) or '')
+        if literal and _in_git_entry(os.path.join(base or root, literal), root):
+            return base, f'a writing command targets the worktree\'s .git ({common.clip(t, 120)}); ' \
+                         f'git state is changed by git commands'
     writing = '>' in seg or WRITE_VERBS.search(seg)
-    for path in ABS_PATH.findall(seg):
+    reads_only = _reads_only(head, ws)
+    # A word the shell computes at run time splits into words of unknown number and content (`$(echo ..)/x`
+    # is read as `$(echo` and `..)/x`, and can carry options), so where it lands cannot be proved: a redirect
+    # to such a word, and such a word anywhere in a command that may write (a known writer, git, an HTTP
+    # client, sed/perl, or any command that is not known to only read), is denied. Text commands (echo) print
+    # it; their redirect target is still checked.
+    redirect = next((m.group(0) for m in REDIRECT.finditer(seg) if m.group(1) and
+                     _runtime(seg[m.start():m.end()], ps)), None)
+    writes = head in WRITE_VERB_NAMES or head in HTTP_CLIENTS or sub is not None or head in ('sed', 'perl') \
+        or ((writing or not reads_only) and head not in TEXT_WORDS)
+    dynamic = redirect or (_runtime(seg, ps) if writes else None)
+    if dynamic:
+        return base, f'a command that may write names a path or option computed at run time ' \
+                     f'({common.clip(dynamic, 60)}); compute it first and pass it literally'
+    text_seg = _ansi_text(seg)  # `$'\x2f'c/x` names /c/x as surely as the literal does
+    for path in ABS_PATH.findall(text_seg):
         if not _inside(path, root) and not path.lower().startswith(('/dev/null', 'nul')) \
                 and not any(path in s for s in sources) and writing:
             return base, f'a writing command names a path outside the job worktree ({common.clip(path, 120)})'
@@ -885,7 +1486,6 @@ def path_hazard(ws: list[str], seg: str, root: str, base: str | None, stack: lis
     why = _archive_env_hazard(seg)
     if why:
         return base, why
-    reads_only = _reads_only(head, ws)
     if not reads_only:  # an output option is a write target for any command (gcc -o, cargo --target-dir)
         for t in _generic_output_targets(ws):
             if _outside(t, root, base):
@@ -902,13 +1502,7 @@ def path_hazard(ws: list[str], seg: str, root: str, base: str | None, stack: lis
         for w in rest:
             if _cmd_switch(head, w, powershell):  # `del /Q` is a switch, not the root path /Q
                 continue
-            if not text and RUNTIME_PATH.search(w):
-                return base, f'a command that may write names a path built at run time ({common.clip(w, 120)}); ' \
-                             f'compute it first and pass the literal path'
             for cand in _path_candidates(w, head):
-                if cand == TOO_MANY_EXPANSIONS:
-                    return base, f'a brace expansion over {BRACE_CAP} words cannot be checked in full ' \
-                                 f'({common.clip(w, 80)}); denied in a twinlane job'
                 if cand in sources or not (DOTDOT.search(cand) or (not text and HOME_LED.match(cand))
                                            or (writing and not text and ROOTED.match(cand))):
                     continue
@@ -1027,10 +1621,25 @@ def _generic_output_targets(ws: list) -> list:
 
 
 TEXT_WORDS = {'echo', 'printf', 'write-output', 'write-host', 'write', 'echo.'}
-# A word whose text the shell computes when it runs: command substitution, or a parameter expansion with an
-# operator (`${X:-..}`, `${PWD%/*}`, `${p/a/..}`). Its value is unknown here, so for a command that may write
-# it is denied rather than assumed to stay inside. A plain `$VAR`/`${VAR}` is resolved like any rooted path.
-RUNTIME_PATH = re.compile(r'\$\(|`|\$\{[^}]*[:%#/^,@]|<\(|>\(')
+# Text the shell computes when it runs: command substitution ($(...) or any backtick: a PowerShell escape
+# counts too), process substitution, any parameter form except an exact scalar ${NAME} (`${X:-..}`,
+# `${X=..}`, `${!ref}`, `${a[0]}`), and the positional/special parameters ($1, $@, $*, $#, $?, $$, $!, $-).
+# Its value is unknown here, so for a command that may write it is denied rather than assumed to stay inside.
+# A plain `$VAR`/`${VAR}` is resolved like any rooted path.
+RUNTIME = re.compile(r'\$\(|`|<\(|>\(|\$\{(?![A-Za-z_]\w*\})|\$[0-9@*#?!$-]')
+
+
+def _runtime(text: str, ps: bool = False) -> str | None:
+    """The first run-time computed part of shell text, or None. Single-quoted and $'...' text is literal; a
+    double-quoted $(...) still runs, and process substitution is active only outside quotes. In bash an
+    escaped dollar (`\\$(`, odd backslashes) is literal; PowerShell (ps) has no backslash escape, so there
+    every `$(` counts."""
+    masked = PIECE.sub(lambda m: re.sub(r'[<>]\(', "''", m.group(0))
+                       if m.group(2) is not None else "''", text or '')
+    if not ps:
+        masked = re.sub(r'\\(?:\\|[$`])', "''", masked)  # escaped backslash pairs first: odd/even parity
+    m = RUNTIME.search(masked)
+    return m.group(0) if m else None
 ROOTED = re.compile(r'^(~|\$|%|[\\/]|[A-Za-z]:)')  # home, a variable, a root or a drive: resolved, never assumed
 
 
@@ -1227,6 +1836,12 @@ def _git_env_targets(raw: list[str]) -> list[str]:
 def git_env_config_hazard(raw: list[str]) -> str | None:
     """GIT_CONFIG_PARAMETERS ('key=value' ...) and GIT_CONFIG_KEY_<n> are `git -c` given through the
     environment: the same alias and program keys are refused, wherever the variable is set."""
+    git_present = any(_cmd_name(w) == 'git' for w in raw)
+    if git_present:
+        for w in raw:
+            m = re.match(r'^(GIT_EXTERNAL_DIFF|GIT_SSH_COMMAND|GIT_PAGER|GIT_EDITOR|EDITOR|VISUAL|PAGER)=', w, re.I)
+            if m:
+                return f'{m.group(1)} may run a program during git; not allowed in a twinlane job'
     for name, value in _git_env(raw):
         if name == 'GIT_CONFIG_PARAMETERS':
             keys = re.findall(r"([A-Za-z][\w.-]*)'?\s*=", value)
@@ -1346,21 +1961,39 @@ def _code_reason(code: str, ctx: dict, depth: int) -> str | None:
     """Inline interpreter code: git writes and sends named as words or argument lists, network libraries,
     non-local URLs, decode-then-exec payloads, command strings it runs and (code profile) file writes
     outside the worktree."""
+    cfg = ctx.get('cfg') or DEFAULT_CONFIG
     runs = EXEC_CODE.search(code or '')
+    if re.search(r'\bqx\s*[({]|%x\s*[({]|\bopen\s*\([^)]*[\'"]\|[-\w]|\bBun\.spawn', code or '', re.I):
+        return 'inline code launches a command that cannot be inspected'
+    if re.search(r'\bgetattr\s*\(\s*__import__|from\s+twinlane\.cli\s+import\s+main', code or '', re.I):
+        return 'inline code constructs a command or self dispatch that cannot be inspected'
+    if runs and re.search(r'(?:\'[^\']*\'|"[^"]*")\s*\+|\bchr\s*\(|\[::-1\]|\bgetattr\s*\(', code or ''):
+        return 'inline code builds an executable command at run time; not allowed in a twinlane job'
+    if runs and re.search(r'\b(?:run_module|import_module|process\.binding)\s*\(', code or '', re.I):
+        return 'inline code launches a module or native process that cannot be inspected'
+    if re.search(r'\b(?:system|exec|spawn|popen|qx)\s*\(|%x\s*[({]|\b(?:system|exec)\s*\{',
+                 code or '', re.I) and not runs:
+        return 'inline code launches a command that cannot be inspected'
     # Words only count as a command when the code starts a process: `d['claude']` is not a launch, but
     # subprocess.run(['git', 'commit']) is.
     toks = re.findall(r'[^\s\'"`\[\](){},;=]+', code or '') if runs else []
     for i, t in enumerate(toks):
-        name = _cmd_name(t)
-        if name == 'git' or name in NET_HEADS or _base(t) in ENGINE_WORDS:
+        if _program_word(toks, i, cfg):
             if not _spend(ctx, '', 4):
                 return TOO_COMPLEX
             window = toks[i:i + CODE_WINDOW]  # a command and its first arguments
-            reason = head_hazard(window)
+            reason = head_hazard(window, cfg)
             if reason:
                 return f'{reason} (inline code)'
             if i + CODE_WINDOW < len(toks) and not _window_judged(window):
                 return TOO_COMPLEX  # the window ends before the arguments that decide
+    db = DB_CODE.search(code or '')
+    if db:
+        return f'inline code uses a database client ({common.clip(db.group(0), 40)}); not allowed in a twinlane job'
+    names = '|'.join(re.escape(n) for n in sorted(cfg['self_names']))
+    if re.search(r'(?<![\w.-])(?:' + names + r')(?![\w-])', code or '', re.I) and SELF_VERB_LITERAL.search(code or ''):
+        return 'inline code that uses twinlane together with a dispatching verb (run, land, ship, ...) is not ' \
+               'allowed in a twinlane job'
     m = NET_CODE.search(code or '')
     data = None
     for args in _call_args(code or '', r'urlopen\('):
@@ -1397,6 +2030,18 @@ def _code_reason(code: str, ctx: dict, depth: int) -> str | None:
             if writes:
                 return f'inline code writes a path outside the job worktree ({common.clip(outside, 120)})'
     return None
+
+
+def _program_word(toks: list[str], i: int, cfg: dict) -> bool:
+    """toks[i] names a program some rule judges: git, an outbound client, an engine, a database client, a
+    deny_commands program or twinlane itself."""
+    t = toks[i]
+    name = _cmd_name(t)
+    if name == 'git' or name in NET_HEADS or _base(t) in ENGINE_WORDS or name in ('claude', 'codex'):
+        return True
+    prog = _norm_prog(t)
+    return bool(DB_CLIENT_NAME.match(prog)) or any(prog == e[0] for e in cfg['deny_commands']) or \
+        _self_at(toks, i, cfg['self_names']) is not None
 
 
 def _window_judged(window: list[str]) -> bool:
@@ -1459,10 +2104,97 @@ def _url_send(code: str) -> str | None:
 
 def _command_reason(ws: list[str], seg: str, op: str, body: str | None, ctx: dict, depth: int) -> str | None:
     head = _cmd_name(ws[0])
+    cfg = ctx.get('cfg') or DEFAULT_CONFIG
+    if ctx.get('ps'):
+        reason = _powershell_hazard(ws, seg, ctx['root'], ctx['base'])
+        if reason:
+            return reason
+    if head in ('register-scheduledtask', 'new-service', 'crontab', 'at') or \
+            head == 'schtasks' and any(a.lower() == '/create' for a in ws[1:]) or \
+            head in ('sc', 'reg') and any(a.lower() in ('create', 'add') for a in ws[1:]):
+        return 'persistence command is not allowed in a twinlane job'
+    if head in ('start-process', 'saps', 'invoke-expression', 'iex'):
+        return f'{head} launches code that the guard cannot inspect'
+    if head in ('set-itemproperty', 'new-itemproperty') and any(re.match(r'^(?:HKCU|HKLM):', w, re.I)
+                                                           for w in ws[1:]):
+        return 'PowerShell registry write is not allowed in a twinlane job'
+    if head == 'alias' and any('=' in a for a in ws[1:]):
+        return 'a shell alias can hide a command; not allowed in a twinlane job'
+    if head == 'trap' and len(ws) > 1:
+        return _scan(ws[1], ctx, depth + 1)
+    if head in ('awk', 'gawk') and any(re.search(r'\bsystem\s*\(|\|\s*getline', w) for w in ws[1:]):
+        return 'awk runs a shell command; not allowed in a twinlane job'
+    if head == 'sed' and any(re.search(r'(?:^|[;\s\d])e\s+|s[^\s]([^\s]*?)\1[^\s]*\1[eE](?:\b|$)', w)
+                             for w in ws[1:] if not w.startswith('-')):
+        return 'sed executes a shell command; not allowed in a twinlane job'
+    if head in ('vi', 'vim', 'nvim', 'less') and any('!' in w and (w.startswith(('!', '+')) or
+                                                   (i and ws[i - 1] == '-c'))
+                                                  for i, w in enumerate(ws[1:], 1)):
+        return f'{head} executes a shell command; not allowed in a twinlane job'
+    if head in ('tclsh', 'lua', 'rscript', 'deno', 'bun', 'ipython') and any(
+            re.search(r'\b(?:exec|execute|system|spawn\w*|Command)\b|!git|!psql', w, re.I) for w in ws[1:]):
+        return f'{head} inline code may launch a command; not allowed in a twinlane job'
+    if head in ('su', 'script'):
+        for i, arg in enumerate(ws[1:], 1):
+            if arg in ('-c', '--command', '-qc') and i + 1 < len(ws):
+                return _scan(ws[i + 1], ctx, depth + 1)
+        if head == 'script':
+            for arg in ws[1:]:
+                if arg.startswith('-qc') and len(arg) > 3:
+                    return _scan(arg[3:], ctx, depth + 1)
+    if head == 'parallel' and ':::' in ws:
+        n = ws.index(':::')
+        if n == 1:
+            return next((r for arg in ws[n + 1:] if (r := _scan(arg, ctx, depth + 1))), None)
+        return _scan(' '.join(ws[1:n] + ws[n + 1:]), ctx, depth + 1)
+    if ('xargs' in [_cmd_name(w) for w in words(seg)] and
+            any(_cmd_name(w) in ('git', 'sh', 'bash', 'zsh', 'cmd', 'pwsh', 'powershell') for w in ws)):
+        return 'xargs supplies command arguments from input that the guard cannot inspect'
+    if head in PROGRAM_RUNNERS | CONTAINER_EXEC:
+        for i in _program_positions(ws):
+            if i and _cmd_name(ws[i]) in SHELLS:
+                nested = inline_code(ws[i:])
+                if nested is not None:
+                    kind, code = nested
+                    if kind == 'opaque':
+                        return 'a nested shell command cannot be inspected'
+                    reason = _scan(code, ctx, depth + 1) if kind == 'shell' else _code_reason(code, ctx, depth + 1)
+                    if reason:
+                        return reason
+    if head in INTERPRETERS and re.search(r'(?<!<)<(?!<)\s*\S+', seg):
+        return f'{head} reads code from a redirected file that the guard cannot inspect'
+    if '<<' in seg and body is None:
+        return 'an incomplete heredoc cannot be inspected in a twinlane job'
     # `$(echo git) push`, `& $exe commit`, %COMSPEC% /c ...: the program is only known at run time. A bare
-    # `$LASTEXITCODE` (PowerShell prints it) and the `%` alias of ForEach-Object stay allowed.
-    if ws[0][:1] == '`' or (ws[0][:1] in ('$', '%') and ws[0] != '%' and (len(ws) > 1 or op == '&')):
+    # `$LASTEXITCODE` (PowerShell prints it) and the `%` alias of ForEach-Object stay allowed. A name with
+    # a substitution, a variable or a backtick inside (`g$x`, `git${IFS}push`, PowerShell's g`it) is too.
+    if ws[0][:1] == '`' or (ws[0][:1] in ('$', '%') and ws[0] != '%' and (len(ws) > 1 or op == '&')) \
+            or (ws[0][:1] not in ('$', '%') and RUN_TIME_WORD.search(ws[0][1:])) \
+            or ws[0].startswith(('&(', '.(', '<(', '>(')):
         return f'a command name built at run time ({common.clip(ws[0], 40)}) cannot be inspected in a twinlane job'
+    if ws[0][:1] in ('$', '%', '(', '@') and ws[0] != '%':
+        # A lone `$x` or `(expr)` is allowed (PowerShell prints it, `$n = (Get-Date)` assigns it), but not behind
+        # a wrapper that runs it (`. $x`, `& (Get-Command x)`, `exec $x`, `sudo $x`).
+        every = words(seg)
+        pre = every[:len(every) - len(ws)] if len(every) >= len(ws) else every
+        if any(_cmd_name(p) in WRAPPERS or p in ('&', '.') for p in pre):
+            return f'a command name built at run time ({common.clip(ws[0], 40)}) cannot be inspected in a ' \
+                   'twinlane job'
+    if head == 'source' or head in INTERPRETERS:
+        script = (ws[1] if len(ws) > 1 else None) if head == 'source' else _script_arg(ws)
+        if script and (script.startswith(('<(', '>(')) or
+                       re.match(r'^/(dev/(stdin|fd/)|proc/self/fd/)', script.replace('\\', '/'))):
+            return f'{head} reading its code from {common.clip(script, 30)} cannot be inspected in a twinlane job'
+    if head == 'case' or re.match(r'^[^\s()]*\)', seg):
+        # A case clause `case x in a) git push;;` or a later pattern `b) git push`: the command follows a `)`.
+        # Every `)` is tried (a quoted or substituted `)` may come first), so none of them can hide it.
+        parts = seg.split(')')[1:]
+        if len(parts) > 32:
+            return TOO_COMPLEX
+        for part in parts:
+            reason = _scan(part, ctx, depth + 1) if part.strip() else None
+            if reason:
+                return reason
     bare = re.sub(r'"[^"]*"|\'[^\']*\'', '""', seg)  # braces inside quotes are data (JSON, awk)
     if '{' in bare:  # a PowerShell scriptblock or a shell group: its body is commands too
         inner = bare.split('{', 1)[1]
@@ -1470,6 +2202,14 @@ def _command_reason(ws: list[str], seg: str, op: str, body: str | None, ctx: dic
         if reason:
             return reason
     inline = inline_code(ws)
+    if inline is None and '--' in ws:
+        tail = ws[ws.index('--') + 1:]
+        if tail and _cmd_name(tail[0]) in SHELLS:
+            inline = inline_code(tail)
+            if inline is not None:
+                head = _cmd_name(tail[0])
+    if head == 'cmd' and any(a.lower() == '/v:on' for a in ws[1:]):
+        return 'cmd delayed expansion builds commands at run time and cannot be inspected'
     if inline is None and body is not None and head in INTERPRETERS:
         inline = ('shell' if head in SHELLS else 'code'), body
     if op == '|' and head in INTERPRETERS and (inline is None and _script_arg(ws) in (None, '-')
@@ -1479,10 +2219,12 @@ def _command_reason(ws: list[str], seg: str, op: str, body: str | None, ctx: dic
         kind, text = inline
         if kind == 'opaque':
             return f'{head}: an encoded or run-time-built command cannot be inspected in a twinlane job'
-        reason = _scan(text, ctx, depth + 1) if kind == 'shell' else _code_reason(text, ctx, depth + 1)
+        # PowerShell text is read as PowerShell from here down (a backslash escapes nothing); never switched back.
+        inner = dict(ctx, ps=True) if head in ('powershell', 'pwsh') else ctx
+        reason = _scan(text, inner, depth + 1) if kind == 'shell' else _code_reason(text, inner, depth + 1)
         if reason:
             return reason
-    return head_hazard(ws) or head_hazard(_strip_env_prefix(ws))
+    return head_hazard(ws, cfg) or head_hazard(_strip_env_prefix(ws), cfg)
 
 
 def _spend(ctx: dict, text: str, units: int = 1) -> bool:
@@ -1491,35 +2233,160 @@ def _spend(ctx: dict, text: str, units: int = 1) -> bool:
     return ctx['budget'][0] >= 0
 
 
+def _ungroup(seg: str) -> str:
+    """A segment without the grouping around it: leading `(` and `{ ` (not the `{` of a brace expansion such
+    as `{a,b}`), trailing `)`, and a trailing `}` only while it closes no unquoted `{` of the segment."""
+    s = seg.strip()
+    while s and (s[0] == '(' or (s[0] == '{' and (len(s) == 1 or s[1].isspace()))):
+        s = s[1:].lstrip()
+    bare = re.sub(r'"[^"]*"|\'[^\']*\'', '', s)
+    extra = bare.count('}') - bare.count('{')
+    while s and s[-1] in ')}':
+        if s[-1] == '}':
+            if extra <= 0:
+                break
+            extra -= 1
+        s = s[:-1].rstrip()
+    return s
+
+
+SUBST_MAX = 64  # command substitutions read from one text; more is too complex
+
+
+def _substitutions_one(text: str, ps: bool) -> list[str]:
+    """The bodies of $(...), <(...), >(...) and `...` (bash, ps False) or $(...), @(...) and (...) (PowerShell,
+    ps True) in text, outermost first. Single quotes hide them; double quotes do not. A body whose `)` is not
+    found, and a body holding a `case` (whose `x)` patterns close nothing), runs to the end of the text."""
+    bodies, stack, dq, i, n = [], [], False, 0, len(text)
+    while i < n:
+        c = text[i]
+        if (c == '\\' and not ps) or (c == '`' and ps):
+            i += 2
+            continue
+        if c == "'" and not dq:
+            if not ps and i and text[i - 1] == '$':  # $'...': a backslash escapes the next character
+                j = i + 1
+                while j < n and text[j] != "'":
+                    j += 2 if text[j] == '\\' else 1
+            else:
+                j = text.find("'", i + 1)
+            if 0 <= j < n:  # an unclosed quote hides nothing: read on as if it were a plain character
+                i = j + 1
+                continue
+        elif c == '"':
+            dq = not dq
+        elif c == '`':  # bash only (PowerShell's backtick was skipped above)
+            if stack and stack[-1][0] == 'tick':
+                _kind, start, dq = stack.pop()
+                bodies.append((start, i))
+            else:
+                stack.append(('tick', i + 1, dq))
+                dq = False
+        elif c == '(' and not dq or c == '(' and i and text[i - 1] == '$':
+            sub = (i and text[i - 1] in '$<>') or (ps and (not i or text[i - 1] in '@$' or not dq))
+            stack.append(('sub' if sub else 'paren', i + 1, dq))
+            dq = False
+        elif c == ')' and not dq and stack and stack[-1][0] != 'tick':
+            kind, start, dq = stack.pop()
+            if kind == 'sub':
+                bodies.append((start, i))
+        i += 1
+        if len(bodies) > SUBST_MAX:
+            break  # the caller sees more than SUBST_MAX and denies
+    bodies += [(start, n) for kind, start, _dq in stack if kind != 'paren']
+    out = []
+    for start, end in sorted(bodies):
+        body = text[start:end]
+        out.append(text[start:] if re.search(r'\bcase\b', body) else body)
+    return out
+
+
+def _substitutions(text: str) -> list[str] | None:
+    """Every command substitution body of text read both as bash and as PowerShell (the union: either
+    reading may be the one that runs); None when there are more than SUBST_MAX."""
+    if not re.search(r'[`(]', text or ''):
+        return []
+    out, seen = [], set()
+    for ps in (False, True):
+        found = _substitutions_one(text, ps)
+        if len(found) > SUBST_MAX:
+            return None
+        for body in found:
+            if body.strip() and body not in seen:
+                seen.add(body)
+                out.append(body)
+    return out if len(out) <= SUBST_MAX else None
+
+
+def _subst_reason(text: str, ctx: dict, depth: int) -> str | None:
+    """Scan the commands of every substitution body of text as commands of their own."""
+    bodies = _substitutions(text)
+    if bodies is None:
+        return TOO_COMPLEX
+    for body in bodies:
+        reason = _scan(body, ctx, depth + 1)
+        if reason:
+            return reason
+    return None
+
+
 def _scan_split(split: list[tuple[str, str]], bodies: list[str], ctx: dict, depth: int) -> str | None:
     base, stack, memo = ctx['base'], [], ctx['memo']
-    for op, seg in split:
-        seg = seg.strip().lstrip('({').rstrip(')}').strip()
+    cfg = ctx.get('cfg') or DEFAULT_CONFIG
+    for op, whole in split:
+        seg = _ungroup(whole)
+        if not seg:
+            continue
+        # PowerShell `& (Get-Command x)` and `&('a'+'b')` call a program computed at run time.
+        if op == '&' and whole.lstrip()[:1] == '(':
+            return f'a command name built at run time ({common.clip(whole.strip(), 40)}) cannot be inspected in a ' \
+                   'twinlane job'
         m = re.search(r'<<HEREDOC#(\d+)', seg)
         body = bodies[int(m.group(1))] if m and int(m.group(1)) < len(bodies) else None
         # Both splits mostly yield the same segments: a (segment, cwd, depth) is judged once per call, except
         # pushd/popd, whose result depends on the directory stack.
-        key = ('seg', op if op in ('|', '&') else '', seg, body, base, depth)
+        key = ('seg', op if op in ('|', '&') else '', seg, whole.strip(), body, base, depth, ctx.get('ps'))
         if key not in memo:
             if not _spend(ctx, seg):
                 return TOO_COMPLEX
-            raw, chdirs, split = words(seg), [], []
-            ws = _drop_wrappers(raw, chdirs, split)
-            raw = raw + split  # `env -S "GIT_CONFIG_...=... git ..."` sets the same environment
-            # `env -C DIR cmd` (or `sudo -D DIR cmd`) runs cmd in DIR while the shell's redirects stay in base: the path checks run
-            # against both, and the shell's cwd does not change.
-            cmd_base = base
-            for d in chdirs:
-                cmd_base = _resolve_dir(d, cmd_base)
-            reason, new_base = git_env_config_hazard(raw), base
-            if ws and not reason:
-                reason = _command_reason(ws, seg, op, body, dict(ctx, base=cmd_base), depth)
-                if not reason and ctx['profile'] == 'code' and ctx['root']:
-                    new_base, reason = path_hazard(ws, seg, ctx['root'], base, list(stack) if chdirs else stack,
-                                                   raw)
-                    if chdirs:
-                        new_base = base
-                        reason = reason or path_hazard(ws, seg, ctx['root'], cmd_base, [], raw)[1]
+            ws, new_base = [], base
+            try:
+                grown, chdirs, split_words = [0], [], []
+                raw = words(seg, grown)
+                # Brace expansion multiplies the words every rule reads: 16 added words cost one segment.
+                if grown[0] and not _spend(ctx, '', grown[0] // 16):
+                    return TOO_COMPLEX
+                ws = _drop_wrappers(raw, chdirs, split_words)
+                raw = raw + split_words  # `env -S "GIT_CONFIG_...=... git ..."` sets the same environment
+                # `env -C DIR cmd` (or `sudo -D DIR cmd`) runs cmd in DIR while the shell's redirects stay in
+                # base: the path checks run against both, and the shell's cwd does not change.
+                cmd_base = base
+                for d in chdirs:
+                    cmd_base = _resolve_dir(d, cmd_base)
+                # The text rules read the words as the shell passes them too: `rel{e,x}ase.sh` and `"rel"ease.sh`
+                # name release.sh once braces are expanded and quotes removed.
+                reason = _text_hazard(' '.join(raw), cfg) or git_env_config_hazard(raw)
+                if not reason:  # $(git push) inside any word runs, whatever the command around it is
+                    reason = _subst_reason(whole.strip(), dict(ctx, base=cmd_base), depth)
+                if ws and not reason:
+                    variants = [ws]
+                    if '\\' in ws[0] and ws[0].replace('\\', '') and ws[0].replace('\\', '') != ws[0]:
+                        variants.append([ws[0].replace('\\', '')] + ws[1:])  # bash reads `r\m` as rm
+                    # The path rules read the name as written: an unknown program (`c\p`) is checked as a
+                    # possible writer of every path, which is stricter than reading it as cp.
+                    for cand in variants:
+                        reason = _command_reason(cand, seg, op, body, dict(ctx, base=cmd_base), depth)
+                        if reason:
+                            break
+                    if not reason and ctx['profile'] == 'code' and ctx['root']:
+                        ps = ctx.get('ps', False)
+                        new_base, reason = path_hazard(ws, seg, ctx['root'], base, list(stack) if chdirs else stack,
+                                                       raw, ps)
+                        if chdirs:
+                            new_base = base
+                            reason = reason or path_hazard(ws, seg, ctx['root'], cmd_base, [], raw, ps)[1]
+            except Uninspectable as e:  # a word that cannot be read in full: deny, never check the rest
+                return e.reason
             if ws and _cmd_name(ws[0]) in ('pushd', 'popd', 'push-location', 'pop-location'):
                 base = new_base
                 if reason:
@@ -1537,14 +2404,27 @@ def _scan(command: str, ctx: dict, depth: int = 0) -> str | None:
     `python -c "a; b"` whole) and quote-blind (so an unbalanced quote cannot hide a command)."""
     if depth > MAX_DEPTH:
         return 'commands nested this deeply cannot be inspected in a twinlane job'
-    key = ('scan', command, ctx['base'], depth)
+    key = ('scan', command, ctx['base'], depth, ctx.get('ps'))
     if key in ctx['memo']:
         return ctx['memo'][key]
     if not _spend(ctx, command, 4):  # a scan has a fixed cost of about four segments
         return TOO_COMPLEX
-    reason = _text_hazard(command)
+    cfg = ctx.get('cfg') or DEFAULT_CONFIG
+    reason = _text_hazard(command, cfg)
+    if not reason and "$'" in command:  # rel$'\x65'ase.sh is release.sh
+        reason = _text_hazard(_ansi_text(command), cfg)
+    text, bodies, quoted = '', [], []
     if not reason:
-        text, bodies = heredocs(command)
+        text, bodies = heredocs(command, quoted)
+        # Substitutions anywhere in the command (also across `;`, which the splits below cut through) and in
+        # the body of a heredoc whose delimiter is unquoted (the shell expands those) run as commands.
+        reason = _subst_reason(text, ctx, depth)
+        for k, body in enumerate(bodies):
+            if reason:
+                break
+            if not (k < len(quoted) and quoted[k]):
+                reason = _subst_reason(body, ctx, depth)
+    if not reason:
         for split in (commands(text), [('', s) for s in segments(text)]):
             reason = _scan_split(split, bodies, ctx, depth)
             if reason:
@@ -1553,13 +2433,23 @@ def _scan(command: str, ctx: dict, depth: int = 0) -> str | None:
     return reason
 
 
-def _ctx(profile: str | None, root: str | None, base: str | None) -> dict:
-    return {'profile': profile, 'root': root, 'base': base, 'memo': {}, 'budget': [MAX_WORK]}
+def _ctx(profile: str | None, root: str | None, base: str | None, cfg: dict | None = None,
+         ps: bool = False) -> dict:
+    return {'profile': profile, 'root': root, 'base': base, 'memo': {}, 'budget': [MAX_WORK],
+            'cfg': cfg or DEFAULT_CONFIG, 'ps': ps}
 
 
-def shell_hazard(command: str) -> str | None:
-    """A reason when a shell command does something no twinlane worker may do, else None."""
-    return _scan(command or '', _ctx(None, None, None))
+def _shell_scan(command: str, ctx: dict) -> str | None:
+    try:
+        return _scan(command or '', ctx)
+    except Uninspectable as e:  # raised outside a segment (it never is today): still a deny
+        return e.reason
+
+
+def shell_hazard(command: str, config: dict | None = None, ps: bool = False) -> str | None:
+    """A reason when a shell command does something no twinlane worker may do, else None. config is a
+    policy `guard` section (None: the defaults); ps is True for PowerShell text."""
+    return _shell_scan(command or '', _ctx(None, None, None, load_config(config), ps))
 
 
 # ---------------------------------------------------------------- intel allow-list
@@ -1597,7 +2487,8 @@ def intel_violation(tool: str, tool_input: dict, allow: list[str]) -> str | None
 
 # ---------------------------------------------------------------- code-profile confinement
 
-def code_violation(tool: str, tool_input: dict, cwd: str | None, shell_cwd: str | None = None) -> str | None:
+def code_violation(tool: str, tool_input: dict, cwd: str | None, shell_cwd: str | None = None,
+                   cfg: dict | None = None) -> str | None:
     """Fails closed: a tool the code profile does not know, a write or shell call without a known worktree,
     and a call whose path or command is missing or not a string are all denied, never waved through."""
     tool_input = tool_input if isinstance(tool_input, dict) else {}
@@ -1613,34 +2504,51 @@ def code_violation(tool: str, tool_input: dict, cwd: str | None, shell_cwd: str 
             return f'{tool} without a file path cannot be confined; denied in a twinlane job'
         if not _inside(path, cwd):
             return f'{tool} outside the job worktree ({common.clip(path, 120)})'
-        return None
+        return _file_write_reason(tool, path, cwd)
     command = tool_input.get('command')
     if not isinstance(command, str):
         return f'{tool} without a command string cannot be inspected; denied in a twinlane job'
-    return _scan(command, _ctx('code', cwd, shell_cwd if isinstance(shell_cwd, str) and shell_cwd else cwd))
+    return _shell_scan(command, _ctx('code', cwd, shell_cwd if isinstance(shell_cwd, str) and shell_cwd else cwd,
+                                     cfg, tool == 'PowerShell'))
 
 
 # ---------------------------------------------------------------- decision
 
+_LOAD = object()  # evaluate(config=...) default: read the guard section of the merged policy and user config
+
+
 def evaluate(tool: str, tool_input: dict, profile: str, cwd: str | None, allow: list[str],
-             shell_cwd: str | None = None) -> str | None:
+             shell_cwd: str | None = None, config=_LOAD) -> str | None:
     """Deny reason for one tool call inside a twinlane job, or None to let the normal rules decide.
-    shell_cwd is the shell's current directory when the hook knows it (relative paths resolve there)."""
+    shell_cwd is the shell's current directory when the hook knows it (relative paths resolve there).
+    config is the policy `guard` section; by default it is read from the policy and user config. A guard
+    configuration that cannot be read or is not valid denies every call."""
     tool_input = tool_input if isinstance(tool_input, dict) else {}
-    if tool in ('Agent', 'Task'):
-        return 'nested agent launch is not allowed in a twinlane job'
+    try:
+        cfg = _policy_config() if config is _LOAD else load_config(config, allow_none=False)
+    except GuardConfigError as e:
+        return f'the guard configuration is not valid ({common.clip(str(e), 160)}); every call is denied in a ' \
+               'twinlane job'
+    if tool in SUBAGENT_TOOLS:
+        if not cfg['allow_subagents']:
+            return 'nested agent launch is not allowed in a twinlane job (guard.allow_subagents is false)'
+        if profile == 'intel' and tool not in (allow or []):
+            return f'{tool} is not allowed in the read-only intel profile'
+        return None
     if tool in SHELL_TOOLS:
         if not isinstance(tool_input.get('command'), str):
             return f'{tool} without a command string cannot be inspected; denied in a twinlane job'
         if len(tool_input['command']) > MAX_COMMAND_CHARS:
             return f'command too long to inspect (over {MAX_COMMAND_CHARS // 1024} KB); not allowed in a twinlane job'
         # The code-profile scan below runs every shell rule too, so a code job with a cwd scans once.
-        reason = None if profile == 'code' and cwd else shell_hazard(str(tool_input.get('command') or ''))
-        if reason:
-            return reason
+        if not (profile == 'code' and cwd):
+            reason = _shell_scan(str(tool_input.get('command') or ''),
+                                 _ctx(None, None, None, cfg, tool == 'PowerShell'))
+            if reason:
+                return reason
     if profile == 'intel':
         return intel_violation(tool, tool_input, allow)
-    return code_violation(tool, tool_input, cwd, shell_cwd)
+    return code_violation(tool, tool_input, cwd, shell_cwd, cfg)
 
 
 def _deny(reason: str) -> None:
@@ -1661,9 +2569,19 @@ def main(stdin=None) -> int:
         profile = os.environ.get('TWINLANE_ENGINE_PROFILE') or 'intel'
         cwd = os.environ.get('TWINLANE_ENGINE_CWD') or data.get('cwd')
         shell_cwd = data.get('cwd') if isinstance(data.get('cwd'), str) else None
-        allow = (common.load_policy().get('claude') or {}).get('intel_allow') or []
+        try:
+            policy = common.load_policy()
+        except (Exception, SystemExit) as e:  # noqa: BLE001 - an unreadable config denies every call
+            _deny(f'the policy or user config cannot be read ({type(e).__name__}); every call is denied in a '
+                  'twinlane job')
+            return 0
+        if not isinstance(policy, dict):
+            _deny('the policy is not an object; every call is denied in a twinlane job')
+            return 0
+        allow = (policy.get('claude') or {}).get('intel_allow') or []
+        guard_section = policy['guard'] if 'guard' in policy else {}
         reason = evaluate(str(data.get('tool_name') or ''), data.get('tool_input') or {}, profile, cwd, allow,
-                          shell_cwd)
+                          shell_cwd, config=guard_section)
         if reason:
             _deny(reason)
     except BaseException as e:  # noqa: BLE001 - fail closed inside a twinlane job

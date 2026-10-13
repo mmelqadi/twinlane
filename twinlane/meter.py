@@ -573,6 +573,21 @@ def refresh_blocker() -> str | None:
             '(twinlane meter --record-claude <get_usage json>), or renew the CLI login yourself')
 
 
+def refresh_report(creds_path=None) -> dict:
+    """For `meter --dry-run`: would `meter --refresh` renew the token right now, and why. Makes no model call."""
+    expired = token_expired_at(creds_path)
+    if not expired:
+        return {'would_refresh': False, 'token_expired_at': None,
+                'report': 'dry run: the CLI token is not expired (or absent); --refresh would make no model call'}
+    blocked = refresh_blocker()
+    if blocked:
+        return {'would_refresh': False, 'token_expired_at': expired,
+                'report': f'dry run: the CLI token expired; --refresh would NOT renew it ({blocked})'}
+    return {'would_refresh': True, 'token_expired_at': expired,
+            'report': 'dry run: the CLI token expired and extra usage is recorded OFF; --refresh would renew it '
+                      'with one tiny Haiku call. This dry run made no model call.'}
+
+
 def read_claude_raw(refresh: bool = False, creds_path=None, _http=None, _run=None) -> dict:
     reading, why = _try_oauth(creds_path, _http)
     if reading:
@@ -1345,6 +1360,11 @@ def cli(argv) -> int:
     ap = argparse.ArgumentParser(prog='twinlane meter', description='Usage meters for Claude Code and Codex.')
     ap.add_argument('--json', action='store_true')
     ap.add_argument('--fresh', action='store_true', help='ignore the 120 s meter cache')
+    ap.add_argument('--refresh', action='store_true',
+                    help='if the Claude OAuth token expired, renew it with one tiny Haiku call '
+                         '(only when the recorded extra usage state is OFF)')
+    ap.add_argument('--dry-run', action='store_true',
+                    help='report whether --refresh would renew the token and why; makes no model call and renews nothing')
     ap.add_argument('--record-claude', metavar='JSON',
                     help='store a Claude reading: OAuth or desktop get_usage JSON, @file, or - for stdin')
     ap.add_argument('--source', choices=('desktop', 'statusline'), help='writer name for --record-claude')
@@ -1361,6 +1381,12 @@ def cli(argv) -> int:
             return common.EXIT_USAGE
         common.emit(sec, a.json, _fmt_engine('claude', sec, common.now()))
         return common.EXIT_OK
-    m = read(fresh=a.fresh, policy=policy)
+    if a.dry_run:
+        m = read(fresh=a.fresh, policy=policy)
+        plan = refresh_report()
+        m = dict(m, refresh_dry_run=plan)
+        common.emit(m, a.json, '\n'.join([format_line(m), plan['report']]))
+        return common.EXIT_OK
+    m = read(fresh=a.fresh, refresh_claude=a.refresh, policy=policy)
     common.emit(m, a.json, format_line(m))
     return common.EXIT_OK

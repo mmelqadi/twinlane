@@ -20,10 +20,11 @@ LIMIT_MARKERS = ('usage_limit', 'rate_limit', 'quota', 'limit reached', 'usage l
 
 
 def command(binary: str, brief: str, cwd: str, model: str, effort: str, write: bool,
-            final_path: str) -> list[str]:
+            final_path: str, exec_config=()) -> list[str]:
     launch = [sys.executable, binary] if binary.lower().endswith('.py') else [binary]
+    extra = [part for item in exec_config for part in ('-c', item)]
     return launch + ['exec', '--json', '--model', model,
-            '--config', 'model_reasoning_effort=' + json.dumps(effort),
+            '--config', 'model_reasoning_effort=' + json.dumps(effort)] + extra + [
             '--sandbox', 'workspace-write' if write else 'read-only',
             '--cd', cwd, '--output-last-message', final_path, '-']
 
@@ -37,6 +38,8 @@ def run(argv=None) -> int:
     p.add_argument('--out', required=True)
     p.add_argument('--timeout', type=float, required=True)
     p.add_argument('--write', action='store_true')
+    p.add_argument('--exec-config', action='append', default=[], metavar='KEY=VALUE',
+                   help='passed to codex exec as -c KEY=VALUE (repeatable)')
     a = p.parse_args(argv)
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -45,7 +48,7 @@ def run(argv=None) -> int:
     result_path = out / 'result.txt'
     stderr_path = out / 'stderr.log'
     binary = os.environ.get('TWINLANE_CODEX_BIN') or 'codex'
-    args = command(binary, a.brief, a.cd, a.model, a.effort, a.write, str(final_path))
+    args = command(binary, a.brief, a.cd, a.model, a.effort, a.write, str(final_path), a.exec_config)
     try:
         prompt = Path(a.brief).read_text(encoding='utf-8')
         with events_path.open('wb') as events, stderr_path.open('wb') as errors:

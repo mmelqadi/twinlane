@@ -56,6 +56,7 @@ KILL_GRACE_S = 15          # how long a killed engine gets to be reaped before i
 SESSION_SCAN_S = 3.0       # wall-clock budget of the --resume session-owner lookup
 SESSION_EVENTS_BYTES = 65536  # how much of each events file the --resume lookup reads for session ids
 NO_WINDOW = common.CREATE_NO_WINDOW if common.IS_WIN else 0
+CALLER_BRIEF = 'caller-brief.md'  # jobs/<id>/: the brief as the caller wrote it, before contract or continue-job context
 
 
 # ---------------------------------------------------------------- paths / small io
@@ -314,18 +315,25 @@ def guard_settings(job_dir_path: str, deny: list[str] | None = None) -> str:
     return path
 
 
+def worker_env(env: dict, job_id: str) -> dict:
+    """`env` with this worker's lineage: TWINLANE_ENGINE_JOB is the new job."""
+    env = dict(env)
+    env['TWINLANE_ENGINE_JOB'] = job_id
+    return env
+
+
 def claude_env(job_id: str, profile: str | None = None, cwd: str | None = None,
-               stripped: list | None = None) -> dict:
-    """The worker's env. A code-profile worker also loses every secret-named variable; their NAMES are
-    appended to `stripped` for the receipt."""
+               stripped: list | None = None, extra_secret_patterns: list | None = None) -> dict:
+    """The worker's env. A code-profile worker also loses every secret-named variable (and any that match
+    policy secrets.extra_env_name_patterns); their NAMES are appended to `stripped` for the receipt."""
     extra = {'TWINLANE_ENGINE_JOB': job_id}
     if profile:
         extra['TWINLANE_ENGINE_PROFILE'] = profile
     if cwd:
         extra['TWINLANE_ENGINE_CWD'] = cwd
-    env = common.clean_claude_env(extra)
+    env = worker_env(common.clean_claude_env(extra), job_id)
     if profile == 'code':
-        env, names = common.strip_secret_env(env)
+        env, names = common.strip_secret_env(env, extra_secret_patterns)
         if stripped is not None:
             stripped.extend(names)
     return env
@@ -350,6 +358,12 @@ def codex_args(params: dict, policy: dict, brief_path: str, cwd: str, out_dir: s
         args += ['--effort', params['effort']]
     if params['profile'] == 'code':
         args.append('--write')
+    if not common.CODEX_RUN:  # an adapter gets codex.exec_config from the environment instead (see _run_codex)
+        try:
+            for item in common.codex_exec_config(policy):
+                args += ['--exec-config', item]
+        except ValueError:  # _run_codex refuses the attempt with the reason before anything starts
+            pass
     return args + ['--out', out_dir, '--timeout', str(params['timeout_s'])]
 
 
@@ -865,7 +879,8 @@ def _attempt_files(job_id: str, n: int) -> dict:
     sfx = '' if n == 1 else f'-a{n}'
     return {'events': _p(job_id, f'events{sfx}.jsonl'), 'stderr': _p(job_id, f'stderr{sfx}.log'),
             'final': _p(job_id, f'final-a{n}.md'), 'codex_out': _p(job_id, f'codex{sfx}'),
-        'codex_log': _p(job_id, f'codex-adapter{sfx}.log')}
+        'codex_log': _p(job_id, f'codex-adapter{sfx}.log'),
+        'codex_log_legacy': _p(job_id, f'codex-run{sfx}.log')}  # the name an earlier tool gave the same log
 
 
 def run_attempt(job_id: str, n: int, params: dict, brief_path: str, spec: dict, policy: dict,
@@ -886,7 +901,7 @@ def run_attempt(job_id: str, n: int, params: dict, brief_path: str, spec: dict, 
         a.update(_run_claude(job_id, argv, spec, params, brief_path, files, policy))
     else:
         a['argv'] = argv
-        a.update(_run_codex(job_id, argv, spec['cwd'], params['timeout_s'] + CODEX_GRACE_S, files, params))
+        a.update(_run_codex(job_id, argv, spec['cwd'], params['timeout_s'] + CODEX_GRACE_S, files, params, policy))
     a['ended_at'] = common.iso(common.now())
     a['duration_s'] = round((common.now() - started).total_seconds(), 1)
     text = a.pop('final_text', '') or ''
@@ -923,7 +938,7 @@ def _run_claude(job_id, argv, spec, params, brief_path, files, policy) -> dict:
     stream, errors, stripped = ClaudeStream(), [], []
     timed_out = False
     cwd, timeout_s = spec['cwd'], params['timeout_s']
-    env = claude_env(job_id, params['profile'], cwd, stripped)
+    env = claude_env(job_id, params['profile'], cwd, stripped, common.extra_secret_patterns(policy))
     proc = None
     try:
         common.write_json(_p(job_id, CHILD_STARTING), {'engine': 'claude'})
@@ -1054,20 +1069,55 @@ def _claude_status(s: dict, rc, timed_out: bool) -> str:
     return 'failed'
 
 
-def _run_codex(job_id, argv, cwd, timeout_s, files, params) -> dict:
+# What Codex prints when its sandbox helper could not set up: its commands then fail while the run still
+# ends with a normal-looking message.
+SANDBOX_SETUP_MARKER = 'setup refresh had errors'
+
+
+def _sandbox_setup_failed(files: dict) -> bool:
+    paths = [os.path.join(files['codex_out'], 'events.jsonl'), os.path.join(files['codex_out'], 'stderr.log'),
+             files['codex_log']]
+    for path in paths:
+        try:
+            with open(path, encoding='utf-8', errors='replace') as stream:
+                if any(SANDBOX_SETUP_MARKER in line for line in stream):
+                    return True
+        except OSError:
+            continue
+    return False
+
+
+def _run_codex(job_id, argv, cwd, timeout_s, files, params, policy=None) -> dict:
     timed_out = False
     # preflight() (codex_credit_refusal) is what keeps credits from being spent; the adapter flag is belt and braces.
-    env = dict(os.environ, TWINLANE_ENGINE_JOB=job_id)
+    env = worker_env(os.environ, job_id)
     if common.CODEX_RUN:
         env['TWINLANE_CODEX_ADAPTER_STRICT_CREDITS'] = '1'
+    cx = (policy or {}).get('codex') or {}
+    try:
+        exec_config = common.codex_exec_config(policy)
+        extra_secrets = common.extra_secret_patterns(policy)
+        if common.CODEX_RUN and exec_config:
+            env['TWINLANE_CODEX_EXEC_CONFIG'] = json.dumps(exec_config)
+    except ValueError as e:
+        return {'status': 'failed', 'exit_code': common.EXIT_USAGE, 'error': f'codex policy refused: {e}'}
     stripped = None
     if params.get('profile') == 'code':  # a writing worker gets no secret-named variables (names go in the receipt)
-        env, stripped = common.strip_secret_env(env)
-    binary = os.environ.get('TWINLANE_CODEX_BIN') or shutil.which('codex')
-    if not common.CODEX_RUN and not binary:
-        return {'status': 'failed', 'exit_code': common.EXIT_MISSING, 'error': 'no codex CLI on PATH'}
-    if binary:
-        env['TWINLANE_CODEX_BIN'] = binary
+        env, stripped = common.strip_secret_env(env, extra_secrets)
+    # Fail closed: never "whatever codex is first on PATH" unless codex.binary_source allows it. The lease covers
+    # lookup to child start; after that Windows refuses to delete the running codex.exe. A child whose kill
+    # failed keeps its lease.
+    try:
+        binary, why, lease = common.acquire_codex_binary(cx.get('binary_source') or 'auto')
+    except (OSError, RuntimeError, ValueError) as e:
+        binary, why, lease = None, f'lookup failed: {common.clip(str(e) or type(e).__name__, 200)}', None
+    if not binary:
+        return {'status': 'failed', 'exit_code': common.EXIT_MISSING, 'error': f'no usable codex CLI: {why}'}
+    too_old = common.codex_version_refusal(binary, cx.get('min_cli_version'))
+    if too_old:
+        common.release_codex(lease)
+        return {'status': 'failed', 'exit_code': common.EXIT_MISSING, 'error': f'codex CLI refused: {too_old}'}
+    env['TWINLANE_CODEX_BIN'] = binary
     child_alive = False
     proc = None
     try:
@@ -1101,6 +1151,8 @@ def _run_codex(job_id, argv, cwd, timeout_s, files, params) -> dict:
         return {'status': 'failed', 'exit_code': common.EXIT_MISSING, 'error': f'codex launch or bookkeeping failed: {e}'}
     finally:
         _clear_child_starting(job_id, proc)
+        if not child_alive:
+            common.release_codex(lease)
     c = parse_codex_out(files['codex_out'])
     served = [c['model']] if c['model'] else ([params['model']] if params.get('model') else [])
     out = {'session_id': c['session_id'], 'served_models': served, 'served_models_note':
@@ -1113,6 +1165,12 @@ def _run_codex(job_id, argv, cwd, timeout_s, files, params) -> dict:
     tokens = _codex_tokens(c['session_id'], out['events_path'], c['tokens'])
     if tokens:
         out['token_usage'] = tokens
+    if why:  # an older copy, the PATH, or an explicit binary instead of the current app build
+        out['codex_note'] = f'codex CLI: {why}'
+    if _sandbox_setup_failed(files):
+        out['codex_note'] = common.clip(f"{out.get('codex_note', 'codex CLI:')} | the Codex sandbox could not set up "
+                                        f"('{SANDBOX_SETUP_MARKER}'): its commands may not have run, so treat the "
+                                        'result as unverified', 600)
     if child_alive:
         out['codex_note'] = common.clip(f"{out.get('codex_note', 'codex CLI:')} | the child survived its kill; its "
                                         'copy stays leased', 600)
@@ -1328,6 +1386,29 @@ def run_job(job_id: str) -> dict:
             # Finished (or stopped/refused before this runner started): never run it again.
             return {**done, 'duplicate_runner': True,
                     'notes': [f'job {job_id} already has a receipt ({done.get("status")}); this runner exits']}
+        if spec.get('coordination'):
+            from . import coordination
+            try:
+                coordination.validate_runner(spec, job_id)
+            except coordination.Refusal as e:
+                status = common.read_json(_p(job_id, 'status.json'), {}) or {}
+                if _engine_state(job_id, status) != common.DEAD \
+                        or os.path.exists(_p(job_id, 'result.json')):
+                    return {'id': job_id, 'status': 'running', 'duplicate_runner': True,
+                            'notes': ['coordination refused; existing/unknown engine or receipt preserved']}
+                # A dead engine is not proof that no attempt ever started. Preserve
+                # its lost/recoverable evidence rather than inventing a new receipt.
+                if any(status.get(key) for key in ('attempt', 'started_at', 'child_pid', 'child_created')) \
+                        or os.path.exists(_p(job_id, SURVIVOR)):
+                    return {'id': job_id, 'status': status.get('status') or 'lost',
+                            'duplicate_runner': True, 'coordination_refused': True,
+                            'notes': ['coordination refused; prior attempt evidence preserved']}
+                receipt = {'id': job_id, 'engine': spec['engine'], 'status': 'refused',
+                           'exit_code': common.EXIT_REFUSED, 'error': str(e),
+                           'notes': ['no engine started; coordination admission refused']}
+                common.write_json(_p(job_id, 'result.json'), receipt)
+                _write_status(job_id, 'refused', engine=spec['engine'])
+                return receipt
         try:
             writer = _claim_writer(spec)
         except (Refusal, OSError) as error:
@@ -1752,6 +1833,12 @@ def _run_parser() -> argparse.ArgumentParser:
     ap.add_argument('--urgent', action='store_true')
     ap.add_argument('--name')
     ap.add_argument('--baton')
+    ap.add_argument('--task-id', help='opt-in stable CLI coordination task identity')
+    ap.add_argument('--dispatch-id', help='idempotent request identity within --task-id')
+    ap.add_argument('--actor', help='sender identity in the recorded delegation lineage')
+    ap.add_argument('--recipient', help='implementation/worker identity receiving this dispatch')
+    ap.add_argument('--parent-dispatch', help='recorded predecessor within the same task')
+    ap.add_argument('--transition-receipt', help='host-recorded accepted review/handoff receipt identity')
     ap.add_argument('--failover', action=argparse.BooleanOptionalAction, default=None)
     ap.add_argument('--dry-run', action='store_true')
     ap.add_argument('--json', action='store_true')
@@ -1775,7 +1862,11 @@ def plan_run(args, policy: dict) -> dict:
         raise Refusal(common.EXIT_USAGE, f'--cd {cwd} {leftover}; pass an existing repo or worktree')
     if not os.path.isfile(args.brief):
         raise Refusal(common.EXIT_USAGE, f'brief not found: {args.brief}')
-    brief = _read_text(args.brief)
+    # Coordinated CLI admission pins the caller text before replay/routing.
+    # Continue-job transforms this same snapshot below, without rereading its source.
+    brief = getattr(args, '_coordination_brief_snapshot', None)
+    if brief is None:
+        brief = _read_text(args.brief)
     if not brief.strip():
         raise Refusal(common.EXIT_USAGE, f'brief is empty: {args.brief}')
     problem = brief_problem(brief)
@@ -1802,6 +1893,7 @@ def plan_run(args, policy: dict) -> dict:
     params = engine_params(engine, kind, d, policy, profile, args.model, args.effort, args.tier, args.timeout,
                            args.max_turns)
     notes, resume, resume_jobs = [], args.resume, []
+    caller_brief = brief  # before any continue-job context is appended: `twinlane resume` re-runs from this
     if resume and engine == 'claude':  # a codex run ignores --resume, so only a Claude resume needs the guard
         resume_jobs, truncated = _session_owners(resume)
         for jid in resume_jobs:
@@ -1842,7 +1934,7 @@ def plan_run(args, policy: dict) -> dict:
         resume = None
     failover = args.failover if args.failover is not None else args.engine == 'auto'
     return {'kind': kind, 'cwd': cwd, 'brief_src': os.path.abspath(args.brief), 'brief_text': brief,
-            'decision': d, 'meter_before': meter, 'engine': engine, 'profile': profile, 'primary': params,
+            'caller_brief': caller_brief, 'decision': d, 'meter_before': meter, 'engine': engine, 'profile': profile, 'primary': params,
             'resume': resume, 'resume_jobs': resume_jobs, 'continue_job': prior['id'] if prior else None,
             'failover': failover,
             'write': bool(args.write), 'urgent': bool(args.urgent), 'baton': args.baton,
@@ -2055,7 +2147,8 @@ def _attempt_file_numbers(job_id: str) -> tuple[list[int], list[str]]:
             continue
         n = int(match.group(2))
         files = _attempt_files(job_id, n)
-        allowed = {os.path.basename(files[k]) for k in ('events', 'stderr', 'final', 'codex_out', 'codex_log')}
+        allowed = {os.path.basename(files[k]) for k in ('events', 'stderr', 'final', 'codex_out', 'codex_log',
+                                                        'codex_log_legacy')}
         if 1 <= n <= MAX_ATTEMPTS and name in allowed:
             seen.append(n)
         else:
@@ -2103,7 +2196,7 @@ def _attempt_events(job_id: str, n: int, engine: str | None) -> tuple[str | None
 def _attempt_output(job_id: str, n: int) -> bool:
     """Whether attempt n left ANY non-empty runner file: events, stderr, final, or the Codex logs."""
     files = _attempt_files(job_id, n)
-    paths = [files[k] for k in ('events', 'stderr', 'final', 'codex_log')]
+    paths = [files[k] for k in ('events', 'stderr', 'final', 'codex_log', 'codex_log_legacy')]
     for root, _, names in os.walk(files['codex_out']):
         paths += [os.path.join(root, x) for x in names]
     for path in paths:
@@ -2274,10 +2367,45 @@ def _context_block(prior: dict, resumed: bool) -> tuple[str, list[str], bool]:
     return out, parts, trimmed
 
 
+def _coordination_parent():
+    """job.json of the job this process works for (None outside a worker); refuses when custody is unknown.
+
+    Both the current and the predecessor lineage variable are read. When they name two different jobs
+    the parent is unknown; that is tolerated only when neither job is coordinated (the answer would be
+    the same whichever is the parent), and a coordinated dispatch still refuses in coordination.py."""
+    from . import coordination
+    try:
+        parents = coordination.worker_parents()
+    except coordination.Refusal as e:
+        raise Refusal(common.EXIT_REFUSED, str(e)) from e
+    if not parents:
+        return None
+    if len(parents) > 1 and any(spec.get('coordination') is not None for _, spec in parents):
+        raise Refusal(common.EXIT_REFUSED, 'worker lineage is ambiguous: the current and the predecessor '
+                      'job variables name different jobs; custody is unknown')
+    return parents[0][1]
+
+
 def create_job(plan: dict) -> str:
+    parent_spec = _coordination_parent()
+    if plan.get('coordination') is None:
+        if parent_spec is not None and parent_spec.get('coordination') is not None:
+            raise Refusal(common.EXIT_REFUSED, 'coordinated workers cannot drop task identity on child dispatch')
+        return _create_job(plan)
+    from . import coordination
+    try:
+        return coordination.allocate(plan, lambda jid: _create_job(plan, jid))
+    except coordination.Refusal as e:
+        raise Refusal(common.EXIT_REFUSED, str(e)) from e
+
+
+def _create_job(plan: dict, reserved_id: str | None = None) -> str:
     os.makedirs(common.JOBS, exist_ok=True)
-    for _ in range(20):
-        jid = f"{common.stamp()}-{plan['engine']}-{secrets.token_hex(2)}"
+    for _ in range(1 if reserved_id else 20):
+        if reserved_id:
+            jid = reserved_id
+        else:
+            jid = f"{common.stamp()}-{plan['engine']}-{secrets.token_hex(2)}"
         try:
             os.makedirs(job_dir(jid))
             break
@@ -2287,6 +2415,8 @@ def create_job(plan: dict) -> str:
         raise RuntimeError('could not allocate a job id')
     spec = dict(plan, id=jid, created_at=common.iso(common.now()), writer_reservation_version=1)
     common.write_text(_p(jid, 'brief.md'), compose_brief(jid, plan['engine'], plan['profile'], plan['brief_text']))
+    if isinstance(plan.get('caller_brief'), str):
+        common.write_text(_p(jid, CALLER_BRIEF), plan['caller_brief'])
     common.write_json(_p(jid, 'job.json'), spec)
     common.write_json(_p(jid, 'status.json'), {'status': 'queued', 'pid': None, 'engine': plan['engine'],
                                                'created_at': spec['created_at']})
@@ -2309,14 +2439,62 @@ def dry_run_view(plan: dict, policy: dict) -> dict:
 
 # ---------------------------------------------------------------- CLI commands
 
+# What a coordinated caller asked for, fingerprinted before routing. Frozen with the version-1 registry:
+# a changed field set would make every recorded dispatch refuse its own replay.
+CALLER_INTENT_FIELDS = ('kind', 'engine', 'model', 'effort', 'tier', 'timeout', 'max_turns',
+                        'resume', 'continue_job', 'write', 'urgent', 'failover', 'baton')
+
+
+def _coordination_intent(args, envelope):
+    if not os.path.isfile(args.brief):
+        raise Refusal(common.EXIT_USAGE, f'brief not found: {args.brief}')
+    intent = {name: getattr(args, name) for name in CALLER_INTENT_FIELDS}
+    intent.update(cwd=os.path.abspath(args.cd) if args.cd else None,
+                  brief_text=_read_text(args.brief), coordination=envelope)
+    return intent
+
+
+def _coordination_replay_result(jid, as_json):
+    receipt = common.read_json(_p(jid, 'result.json'))
+    status = receipt.get('status') if isinstance(receipt, dict) else job_status(jid)
+    common.emit({'id': jid, 'replayed': True, 'status': status, 'receipt': receipt,
+                 'notes': ['existing dispatch preserved; no runner submitted or admission bypassed']}, as_json)
+    return EXIT_BY_STATUS.get(status, common.EXIT_RUNNING)
+
+
 def cmd_run(argv) -> int:
     args = _parse(_run_parser(), argv)
     if isinstance(args, int):
         return args
-    envhandoff.sweep(common.JOBS, HANDOFF)
-    policy = common.load_policy()
     try:
+        parent = _coordination_parent()
+        values = (args.task_id, args.dispatch_id, args.actor, args.recipient,
+                  args.parent_dispatch, args.transition_receipt)
+        envelope = intent = None
+        if any(value is not None for value in values):
+            if not all(values[:4]):
+                raise Refusal(common.EXIT_REFUSED, 'coordination requires task, dispatch, actor and recipient')
+            envelope = dict(task=args.task_id, dispatch=args.dispatch_id, actor=args.actor,
+                            recipient=args.recipient, parent=args.parent_dispatch, receipt=args.transition_receipt)
+            intent = _coordination_intent(args, envelope)
+            args._coordination_brief_snapshot = intent['brief_text']
+            if not args.dry_run:
+                from . import coordination
+                existing = coordination.replay({'coordination': envelope, 'caller_intent': intent})
+                if existing:
+                    return _coordination_replay_result(existing, args.json)
+        elif parent is not None and parent.get('coordination') is not None:
+            raise Refusal(common.EXIT_REFUSED, 'coordinated workers cannot drop task identity')
+        envhandoff.sweep(common.JOBS, HANDOFF)
+        policy = common.load_policy()
         plan = plan_run(args, policy)
+        if envelope is not None:
+            plan.update(coordination=envelope, caller_intent=intent)
+    except ValueError as e:
+        common.emit({'refused': True, 'exit': common.EXIT_REFUSED, 'reason': str(e)}, args.json)
+        if not args.json:
+            print(f'twinlane run: {e}', file=sys.stderr)
+        return common.EXIT_REFUSED
     except Refusal as r:
         common.emit({'refused': True, 'exit': r.code, 'reason': r.message, **r.extra}, args.json)
         if not args.json:
@@ -2338,7 +2516,17 @@ def cmd_run(argv) -> int:
             for n in plan['notes']:
                 print('note: ' + n)
         return common.EXIT_OK if view['argv'] else common.EXIT_MISSING
-    jid = create_job(plan)
+    try:
+        jid = create_job(plan)
+        if plan.get('coordination'):
+            from . import coordination
+            if not coordination.claim_launch(plan, jid):
+                return _coordination_replay_result(jid, args.json)
+    except (Refusal, ValueError) as e:
+        common.emit({'refused': True, 'exit': common.EXIT_REFUSED, 'reason': str(e)}, args.json)
+        if not args.json:
+            print(f'twinlane run: {e}', file=sys.stderr)
+        return common.EXIT_REFUSED
     if args.bg:
         return _start_background(jid, plan, args.json)
     _write_status(jid, 'queued', engine=plan['engine'])
@@ -2386,7 +2574,9 @@ def _start_background(jid: str, plan: dict, as_json: bool) -> int:
 
 def _refuse_background(jid: str, plan: dict, as_json: bool, e: Exception) -> int:
     """No runner exists and none can start: a terminal 'refused' receipt."""
-    reason = f'--bg refused: {e}. Run without --bg (inline), or start twinlane from a normal terminal.'
+    advice = ('Launch identity retained; report this refusal to the task coordinator, do not replay inline.'
+              if plan.get('coordination') else 'Run without --bg (inline), or start twinlane from a normal terminal.')
+    reason = f'--bg refused: {e}. {advice}'
     common.write_json(_p(jid, 'result.json'), {'id': jid, 'status': 'refused', 'engine': plan['engine'],
                                                'error': reason, 'attempts': [], 'notes': [reason]})
     common.emit({'id': jid, 'refused': True, 'reason': reason}, as_json)

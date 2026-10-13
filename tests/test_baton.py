@@ -136,6 +136,44 @@ class BatonTestBase(unittest.TestCase):
         return rc, out.getvalue(), err.getvalue()
 
 
+class LegacyKeyTests(BatonTestBase):
+    """Batons written by the predecessor tool carry task.asana_gid (a tracker id) and may carry keys this
+    version does not know. They must keep working, and saving must never drop any of that data."""
+
+    def write_legacy(self, slug='old'):
+        b = baton.empty_baton(slug)
+        b['task'].pop('tracker_id')
+        b['task'].update({'asana_gid': 'LEGACY-100', 'title': 'Old task', 'goal': 'finish it',
+                          'future_field': {'keep': ['me']}})
+        b['unknown_top'] = {'note': 'written by a newer tool'}
+        with open(baton.baton_path(slug), 'w', encoding='utf-8') as h:
+            json.dump(b, h)
+        return slug
+
+    def test_legacy_asana_gid_shows_as_tracker(self):
+        slug = self.write_legacy()
+        b = baton.load(slug)
+        self.assertEqual(b['task']['tracker_id'], 'LEGACY-100')
+        self.assertIn('(tracker LEGACY-100)', ' '.join(baton.render_baton_section(b)))
+        # a tracker_id that is already set wins over the legacy key
+        b['task']['tracker_id'] = 'NEW-7'
+        baton.save(b, 'user')
+        self.assertEqual(baton.load(slug)['task']['tracker_id'], 'NEW-7')
+
+    def test_save_keeps_legacy_and_unknown_task_keys(self):
+        slug = self.write_legacy()
+        b = baton.load(slug)
+        baton.save(baton.apply_set(b, _set_args(next='carry on', decision='keep old keys', why='no data loss')), 'user')
+        with open(baton.baton_path(slug), encoding='utf-8') as h:
+            raw = json.load(h)
+        self.assertEqual(raw['task']['asana_gid'], 'LEGACY-100')
+        self.assertEqual(raw['task']['future_field'], {'keep': ['me']})
+        self.assertEqual(raw['unknown_top'], {'note': 'written by a newer tool'})
+        self.assertEqual(raw['task']['tracker_id'], 'LEGACY-100')
+        self.assertEqual(raw['progress']['next_action'], 'carry on')
+        self.assertEqual(baton.validate(raw), [])
+
+
 class SlugAndPathTests(unittest.TestCase):
     def test_slug_rules(self):
         for ok in ('a', 'example-repo', 'x' * 60, '2026-10-08-fix'):

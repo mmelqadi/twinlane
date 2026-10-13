@@ -1,0 +1,82 @@
+# --- unlisted wrappers
+Bash	D	strace git push
+Bash	D	strace -f psql -c x
+Bash	D	setsid git push
+Bash	D	doas git push
+Bash	D	chroot / git push
+Bash	D	flock /tmp/l git push
+Bash	D	unbuffer git push
+Bash	D	firejail git push
+Bash	D	nsenter -t 1 git push
+Bash	D	unshare -r git push
+Bash	D	taskset 1 git push
+Bash	D	chrt 1 git push
+Bash	D	su -c "git push"
+Bash	D	runuser -u x -- git push
+Bash	D	pkexec git push
+Bash	D	systemd-run git push
+Bash	D	script -c "git push" /dev/null
+Bash	D	script -qc "git push"
+Bash	D	watch -n1 git push
+Bash	D	parallel git ::: push
+Bash	D	parallel ::: "git push"
+Bash	D	fakeroot git push
+Bash	D	proxychains git push
+Bash	D	torsocks git push
+Bash	D	valgrind git push
+Bash	D	gdb -batch -ex run --args git push
+Bash	D	ltrace git push
+Bash	D	faketime now git push
+Bash	D	catchsegv git push
+Bash	D	busybox sh -c "git push"
+Bash	D	nice -n 5 ionice -c3 stdbuf -oL git push
+Bash	D	time -p git push
+Bash	D	command -p git push
+Bash	D	sudo -E git push
+Bash	D	sudo -s git push
+Bash	D	sudo -i git push
+Bash	D	sudo --preserve-env=PATH git push
+Bash	D	env -i PATH=/usr/bin git push
+Bash	D	env -- git push
+Bash	D	env -0 git push
+Bash	D	env --ignore-environment git push
+Bash	D	env -vS "git push"
+Bash	D	timeout --preserve-status 5 git push
+Bash	D	timeout -v 5s git push
+Bash	D	timeout 1.5 git push
+Bash	D	xargs -0 git push
+Bash	D	xargs -r git push
+Bash	D	xargs -i git push
+Bash	D	xargs --replace={} git push
+Bash	D	xargs -n 1 -P 4 git push
+Bash	D	echo push | xargs git
+Bash	D	echo git push | xargs -L1 sh -c
+Bash	D	echo "git push" | sh
+Bash	D	echo "git push" | bash -s
+Bash	D	echo "psql -l" | bash
+Bash	D	printf "git push" | sh
+Bash	D	sh < script.sh
+Bash	D	bash <<< "git push"
+Bash	D	bash <<EOF
+git push
+EOF
+Bash	D	E:bash <<EOF
+git push
+EOF
+Bash	D	E:sh <<'EOF'
+git push
+EOF
+Bash	D	E:python <<EOF
+import os; os.system("git push")
+EOF
+Bash	D	E:cat <<-EOF
+	$(git push)
+	EOF
+Bash	D	E:cat <<"EOF"
+$(git push)
+EOF
+git push
+Bash	D	find . -exec git push \;
+Bash	D	find . -execdir git push \;
+Bash	D	find . -name x -exec psql -l \;
+Bash	D	find . -ok git push \;

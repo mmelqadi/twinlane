@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.2.0 - 2026-10-13
+
+### New commands
+- `land`: a per-repository first-in-first-out queue and one integrator lock (token, heartbeat; a dead holder is broken only with `--break --reason`). Landing is fast-forward only, runs the project's `land.gate` on the tree that will land, and appends the exact landed range to a ledger. `--rebase` rebases a linear branch; `--dry-run` takes no lock.
+- `ship plan` / `ship run`: a manifest of the exact files, deletions and commits of a landed range, with superseded and foreign commits flagged. `ship run` is a dry run by default; `--execute` needs a fresh matching dry-run receipt and a confirm code (the first 8 hex digits of the manifest sha256), and manifests are accepted only in the exact canonical bytes `plan` writes. twinlane runs only the command you configure; it never deploys by itself.
+- `wt doctor` / `wt prune`: a health report for linked worktrees; prune is a dry run by default, unlinks junctions and symlinks first without following them, deletes branches with `git branch -d` only, and records `prune.jsonl`.
+- `run --best-of` and `compare`: the same brief on several engines in separate worktrees, then a side-by-side comparison, optionally running the project's test command.
+- `resume`: lists jobs lost to a reboot or app quit with the likely cause, and with `--yes` continues each once. Never automatic.
+
+### Configuration
+- Per-project settings in the `projects` map of the user config only, never read from repository content: argv-list commands with the placeholders `{repo}`, `{worktree}`, `{branch}`, `{slug}`, `{target}`, `{manifest}`, `{source_commit}` and `{base}`. Values with line breaks are refused; `.bat` and `.cmd` commands receive only plain values.
+- Codex: `codex.binary_source` (`auto`, `app-copy`, `path`), `codex.min_cli_version` and `codex.exec_config`.
+- Installer: `install --check`, `--unhook`, `--hook-command`, `--alias` and `--skill`; the packaged `SKILL.md` ships with the package.
+
+### Guard
+- Denies database clients, configurable `guard.deny_commands` and `guard.deny_text`, program runners and nested shells, git ref writes, PowerShell execution and persistence commands, and twinlane commands that dispatch or mutate; `guard.allow_subagents` controls sub-agents. A `guard` policy that is not an object fails closed.
+- A job cannot write its worktree's `.git`, and file-tool paths must be literal (`~`, `$VAR` and URLs are refused).
+- Still a deny-list and defense in depth, not a sandbox; see LIMITS.md.
+
 ## 0.1.2 - 2026-10-11
 
 ### Guard

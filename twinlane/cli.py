@@ -6,6 +6,12 @@
   twinlane meter [--json] [--fresh]
   twinlane route <kind> [--urgent] [--engine claude|codex] [--json]
   twinlane run --brief F --cd DIR [--kind K] [--engine auto|claude|codex] [--write] [--bg] ...
+  twinlane run --best-of ENGINE[,ENGINE...] --brief F --cd DIR [--kind K] ...   (same brief on several engines)
+  twinlane compare GROUP [--wait] [--test] [--json|--md]                        (compare a --best-of group)
+  twinlane land enqueue|status|next|run|release|dequeue|log ...   (land finished worktree branches, one at a time)
+  twinlane ship plan|run ...                                      (release manifest for landed work)
+  twinlane wt doctor|prune ...                                    (inspect and prune linked worktrees)
+  twinlane resume [JOB ...] [--all-lost] [--yes]                  (restart jobs lost to a host restart)
   twinlane jobs | wait JOB... [--any] [--timeout S] | result JOB [--full] | stop JOB
   twinlane baton new|set|snap|show|list ...
   twinlane handoff (SLUG | --cd DIR | --session ID) [--to claude|codex] [--out F]
@@ -74,6 +80,11 @@ def fail_open(name):
         return 0
 
 
+def wants_best_of(args):
+    """True when a `run` argument list asks for the multi-engine form (`--best-of X` or `--best-of=X`)."""
+    return any(a == '--best-of' or a.startswith('--best-of=') for a in args)
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     if argv and argv[0] in ('hook', 'guard'):
@@ -95,9 +106,27 @@ def main(argv=None):
     if cmd == 'route':
         from twinlane import route
         return route.cli(rest)
+    if cmd == 'run' and wants_best_of(rest):
+        from twinlane import bestof
+        return bestof.cli(['run'] + rest)
     if cmd in ('run', 'jobs', 'wait', 'result', 'stop', '_job'):
         from twinlane import jobs
         return jobs.cli(cmd, rest)
+    if cmd == 'compare':
+        from twinlane import bestof
+        return bestof.cli(['compare'] + rest)
+    if cmd == 'land':
+        from twinlane import land
+        return land.cli(rest)
+    if cmd == 'ship':
+        from twinlane import ship
+        return ship.cli(rest)
+    if cmd == 'wt':
+        from twinlane import worktrees
+        return worktrees.cli(rest)
+    if cmd == 'resume':
+        from twinlane import resume
+        return resume.cli(rest)
     if cmd == 'sessions':
         from twinlane import sessions
         return sessions.cli(rest)

@@ -1,0 +1,112 @@
+Bash	A	bash x.sh
+Bash	A	./x.sh
+Bash	A	make deploy
+PowerShell	D	[Data.SqlClient.SqlConnection]::new('x')
+PowerShell	D	$c = [Data.SqlClient.SqlConnection]'x'
+PowerShell	D	New-Object -TypeName Data.Odbc.OdbcConnection
+PowerShell	D	New-Object -ComObject ADODB.Connection
+Bash	D	python -c "import pyodbc"
+Bash	D	python -c "import sqlalchemy; sqlalchemy.create_engine('postgresql+psycopg://x')"
+Bash	D	python -c "import pg8000"
+Bash	D	python -c "import psycopg; psycopg.connect('x')"
+Bash	D	python -c "import pymongo"
+Bash	D	python -c "import redis; redis.Redis()"
+Bash	D	node -e "require('pg').Client"
+Bash	D	node -e "require('mysql2')"
+Bash	D	node -e "require('mssql')"
+Bash	D	node -e "require('tedious')"
+Bash	D	python -c "import sqlalchemy as s; s.create_engine('mssql+pyodbc://x')"
+Bash	D	python -c "import sqlalchemy as s; s.create_engine('postgresql://x')"
+Bash	D	pg_dump -h db x
+Bash	D	pg_dumpall
+Bash	D	mysqldump x
+Bash	D	mongodump
+Bash	D	mongoexport
+Bash	D	sqlite3 ../../x.db "drop table x"
+Bash	D	duckdb -c "ATTACH 'postgres:dbname=x' AS p"
+Bash	D	usql pg://x
+Bash	D	pgcli x
+Bash	D	mycli x
+Bash	D	litecli x
+Bash	D	mssql-cli -S x
+Bash	D	sqlpackage /a:Publish
+Bash	D	dbt run
+Bash	D	flyway migrate
+Bash	D	liquibase update
+Bash	D	alembic upgrade head
+Bash	D	prisma migrate deploy
+Bash	D	npx prisma db push
+Bash	D	php artisan migrate
+Bash	D	rails db:migrate
+Bash	D	python manage.py migrate
+Bash	D	psql-16 -l
+Bash	D	psql_16 -l
+Bash	D	psql16.exe -l
+Bash	D	PSQL.EXE -l
+Bash	D	E:"\x43:\x5cProgram Files\x5cPostgreSQL\x5c16\x5cbin\x5cpsql.exe" -l
+Bash	D	/usr/lib/postgresql/16/bin/psql -l
+Bash	D	ps\ql -l
+Bash	D	p"s"ql -l
+Bash	D	p''sql -l
+Bash	D	$'\x70sql' -l
+Bash	D	{psql,x} -l
+Bash	D	ps{q,}l -l
+Bash	D	psql${x} -l
+Bash	D	command psql -l
+Bash	D	docker compose exec db psql
+Bash	D	docker-compose exec db psql
+Bash	D	docker container exec db psql
+Bash	D	kubectl exec pg-0 -- bash -c "psql -l"
+Bash	D	ssh db psql
+Bash	D	nix run nixpkgs#postgresql -- psql
+Bash	D	nix-shell -p postgresql --run psql
+Bash	D	mise exec -- psql
+Bash	D	asdf exec psql
+Bash	D	pipenv run psql
+Bash	D	bundle exec psql
+Bash	D	npm exec psql
+Bash	D	pnpm exec psql
+Bash	D	pnpm dlx psql
+Bash	D	yarn dlx psql
+Bash	D	npm x psql
+Bash	D	dotnet tool run psql
+Bash	D	cargo run --bin psql
+Bash	D	go run x psql
+Bash	D	runas /user:x psql
+Bash	D	gsudo psql
+Bash	D	sudo.exe psql
+Bash	D	wsl -e psql
+Bash	D	wsl.exe -- psql
+Bash	D	bash.exe -c psql
+Bash	D	E:"\x43:\x5cWindows\x5cSystem32\x5ccmd.exe" /c psql
+Bash	D	cmd /c psql.exe -l
+Bash	D	start /b psql
+Bash	D	start "" psql
+Bash	D	call psql
+Bash	D	twinlane.exe run x
+Bash	D	TWINLANE run x
+Bash	D	twinlane RUN x
+Bash	D	twinlane -v run x
+Bash	D	twinlane --project x run y
+Bash	D	twinlane --config=c.json land t
+Bash	D	python -m twinlane.cli.main run
+Bash	D	python -m twinlane.__main__ run
+Bash	D	python -X dev -m twinlane run
+Bash	D	python -W ignore -m twinlane run
+Bash	D	python -Wignore -mtwinlane run
+Bash	D	python -IBm twinlane run
+Bash	D	python -c "import twinlane.cli as c; c.main(['run'])"
+Bash	D	python -c "import twinlane.cli as c; c.main(['RUN'])"
+Bash	D	pipx run twinlane run
+Bash	D	uv tool run twinlane run
+Bash	D	tl.exe run
+Bash	D	tl.cmd land t1
+Bash	D	tl-script.py run
+Bash	D	twinlane wt prune --dry-run
+Bash	D	twinlane wt rm x
+Bash	D	twinlane wt doctor --fix
+Bash	D	twinlane best-of 2
+Bash	D	twinlane --best-of=2 x
+Bash	D	twinlane -b 2 run
+Bash	D	twinlane dispatch x
+Bash	D	twinlane job x

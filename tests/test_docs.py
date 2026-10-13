@@ -99,5 +99,51 @@ class DocumentedBoundaries(unittest.TestCase):
         self.assertIn('TWINLANE_CODEX_ADAPTER_STRICT_CREDITS', readme)
 
 
+    def test_new_subcommands_are_documented(self):
+        readme = doc('README.md')
+        for command in ('twinlane land enqueue', 'twinlane land run', 'twinlane land release --break --reason',
+                        'twinlane ship plan', 'twinlane ship run', '--execute --confirm',
+                        'twinlane wt doctor', 'twinlane wt prune', 'twinlane run --best-of',
+                        'twinlane compare GROUP', '`twinlane resume`', '`projects`'):
+            self.assertIn(command, readme)
+        for heading in ('## Landing finished work', '## Shipping landed work', '## Worktree health',
+                        '## Best-of runs', '## Resuming lost jobs', '## Per-project configuration'):
+            self.assertIn(heading, readme)
+
+    def test_project_config_boundary_and_placeholders(self):
+        readme, design = doc('README.md'), doc('DESIGN.md')
+        self.assertIn('user** config', readme)
+        self.assertIn('never read from the repository itself', readme)
+        self.assertIn('never from repository content', design)
+        for placeholder in ('{repo}', '{worktree}', '{branch}', '{slug}', '{target}', '{manifest}',
+                            '{source_commit}', '{base}'):
+            self.assertIn('`' + placeholder + '`', readme)
+
+    def test_new_commands_do_not_overclaim(self):
+        readme, limits, design, method = doc('README.md'), doc('LIMITS.md'), doc('DESIGN.md'), doc('METHODOLOGY.md')
+        self.assertIn('`twinlane ship` never ships by default', readme)
+        self.assertIn('never deploys by itself', limits)
+        self.assertIn('never deletes an unmerged branch', limits)
+        self.assertIn('`git branch -d`', design)
+        self.assertIn('a deny-list and defense in depth, not a sandbox', limits)
+        self.assertIn('Real confinement comes from', limits)
+        self.assertIn('twinlane land run', method)
+        self.assertIn('twinlane ship plan', method)
+
+    def test_changelog_has_current_release(self):
+        changes = doc('CHANGELOG.md')
+        self.assertIn('## 0.2.0', changes)
+        for token in ('`land`', '`ship plan`', '`wt doctor`', '`run --best-of`', '`resume`'):
+            self.assertIn(token, changes)
+        self.assertLess(changes.index('## 0.2.0'), changes.index('## 0.1.2'))
+
+    def test_version_files_agree(self):
+        import re
+        init = (ROOT / 'twinlane' / '__init__.py').read_text(encoding='utf-8')
+        toml = (ROOT / 'pyproject.toml').read_text(encoding='utf-8')
+        self.assertEqual(re.search(r"__version__ = '([^']+)'", init).group(1),
+                         re.search(r'(?m)^version = "([^"]+)"', toml).group(1))
+
+
 if __name__ == '__main__':
     unittest.main()

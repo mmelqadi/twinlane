@@ -563,6 +563,73 @@ def codex_lease():
         release_codex(lease)
 
 
+CODEX_SOURCES = ('auto', 'app-copy', 'path')
+
+
+def acquire_codex_binary(source: str = 'auto') -> tuple[str | None, str, str | None]:
+    """(binary, why, lease) for policy codex.binary_source, failing closed (binary None) when nothing qualifies.
+    TWINLANE_CODEX_BIN, when set, is the user's explicit choice in every mode. Otherwise:
+      app-copy  a leased private copy of the desktop app's newer CLI (acquire_codex); never the PATH.
+      path      the `codex` on PATH.
+      auto      the app copy when there is one, else the `codex` on PATH (named in `why`).
+    Run the result under its lease and release_codex() it after the child exits."""
+    if source not in CODEX_SOURCES:
+        raise ValueError(f'codex.binary_source must be one of {", ".join(CODEX_SOURCES)}, not {source!r}')
+    env = os.environ.get('TWINLANE_CODEX_BIN')
+    why = ''
+    if source != 'path':
+        binary, why, lease = acquire_codex()
+        if binary or source == 'app-copy':
+            return binary, why, lease
+    if env:
+        return env, f'TWINLANE_CODEX_BIN as set: {env}', None
+    found = shutil.which('codex')
+    if not found:
+        return None, (f'{why}; ' if why else '') + 'no codex on PATH', None
+    return found, (f'{why}; using the codex on PATH: {found}' if why else f'binary_source=path: {found}'), None
+
+
+# Per-job settings twinlane passes itself: exec_config may not override them.
+CODEX_OWNED_CONFIG = ('model', 'model_reasoning_effort', 'sandbox_mode', 'approval_policy')
+_CONFIG_KEY = re.compile(r'[A-Za-z_][A-Za-z0-9_.\-]*')
+
+
+def codex_exec_config(policy: dict | None) -> list[str]:
+    """policy codex.exec_config: 'key=value' strings handed to `codex exec` as -c key=value pairs, for example
+    'features.apps=false'. ValueError when an entry is malformed or sets something twinlane owns per job (the
+    model, its effort, the sandbox, the approval policy)."""
+    raw = ((policy or {}).get('codex') or {}).get('exec_config')
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ValueError('codex.exec_config must be a list of "key=value" strings')
+    for item in raw:
+        key, sep, value = item.partition('=') if isinstance(item, str) else ('', '', '')
+        if not sep or not _CONFIG_KEY.fullmatch(key.strip()) or not value.strip()                 or any(ord(c) < 32 for c in item):
+            raise ValueError(f'codex.exec_config entry {item!r} is not "key=value"')
+        if key.strip().lower() in CODEX_OWNED_CONFIG:
+            raise ValueError(f'codex.exec_config may not set {key.strip()}: twinlane sets it for each job')
+    return list(raw)
+
+
+def codex_version_refusal(binary: str, minimum) -> str | None:
+    """Why `binary` is older than policy codex.min_cli_version (None when it is new enough or no minimum is
+    set). A version that cannot be read is a refusal too: the minimum could not be shown to hold."""
+    if minimum is None or minimum == '':
+        return None
+    want = codex_version_key(minimum) if isinstance(minimum, str) else None
+    if want is None:
+        return f'codex.min_cli_version {minimum!r} is not a version number (use X.Y.Z)'
+    version = _read_codex_version(binary)
+    got = codex_version_key(version)
+    if got is None:
+        return f'cannot read the version of {binary} (codex --version), so codex.min_cli_version {minimum} is unproven'
+    if got < want:
+        return (f'codex CLI {version} at {binary} is older than codex.min_cli_version {minimum}; '
+                'point TWINLANE_CODEX_BIN at a newer build or set codex.binary_source to app-copy')
+    return None
+
+
 def codex_bin() -> str | None:
     """The codex CLI resolve_codex() picks, with the lookup's housekeeping. Unleased: code that RUNS it must
     use acquire_codex() / codex_lease() instead."""
@@ -937,9 +1004,29 @@ SECRET_ENV_NAME = re.compile(r'TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|API_?KEY|
 SECRET_ENV_KEEP: frozenset = frozenset()
 
 
-def strip_secret_env(env: dict) -> tuple[dict, list[str]]:
-    """(env without secret-named variables, the stripped NAMES sorted). Values are never returned."""
-    names = sorted(k for k in env if SECRET_ENV_NAME.search(k) and k.upper() not in SECRET_ENV_KEEP)
+def extra_secret_patterns(policy: dict | None) -> list[str]:
+    """policy secrets.extra_env_name_patterns: regexes (matched case-insensitively with search) for variable
+    names a code worker must also lose, for example a store's API prefix. ValueError when it is not a list of
+    valid patterns: a pattern that silently matched nothing would leak the variable it was meant to hide."""
+    raw = ((policy or {}).get('secrets') or {}).get('extra_env_name_patterns')
+    if raw is None:
+        return []
+    if not isinstance(raw, list) or not all(isinstance(p, str) and p for p in raw):
+        raise ValueError('secrets.extra_env_name_patterns must be a list of non-empty regex strings')
+    for pattern in raw:
+        try:
+            re.compile(pattern, re.I)
+        except re.error as e:
+            raise ValueError(f'secrets.extra_env_name_patterns: invalid pattern {pattern!r}: {e}') from None
+    return list(raw)
+
+
+def strip_secret_env(env: dict, extra_patterns: list[str] | None = None) -> tuple[dict, list[str]]:
+    """(env without secret-named variables, the stripped NAMES sorted). Values are never returned.
+    `extra_patterns` (see extra_secret_patterns) add to the built-in name pattern."""
+    extra = [re.compile(p, re.I) for p in extra_patterns or ()]
+    names = sorted(k for k in env if k.upper() not in SECRET_ENV_KEEP
+                   and (SECRET_ENV_NAME.search(k) or any(x.search(k) for x in extra)))
     return {k: v for k, v in env.items() if k not in names}, names
 
 

@@ -525,6 +525,47 @@ class RefreshGateTests(TempState):
             self.assertEqual(self.calls, [], extra)
             self.assertIn('refresh not run', r['note'])
 
+    def run_cli(self, *args):
+        """twinlane meter ARGS with the network, the Codex reader and the model call all faked."""
+        refresh = mock.Mock(return_value='refresh call rc=0')
+        out = io.StringIO()
+        with mock.patch.object(meter, '_refresh_token', refresh), mock.patch.object(
+                meter, 'read_codex_raw', return_value=codex_raw(30)), mock.patch.object(
+                meter, '_http_get', return_value=(500, '')), redirect_stdout(out):
+            rc = meter.cli(list(args))
+        return rc, out.getvalue(), refresh
+
+    def test_meter_refresh_flag_needs_extra_usage_known_off(self):
+        for extra, want in ((True, 0), (None, 0), (False, 1)):
+            with self.subTest(extra=extra):
+                self.write_creds(-60)
+                self.seed(extra)
+                rc, _out, refresh = self.run_cli('--refresh')
+                self.assertEqual(rc, 0)
+                self.assertEqual(refresh.call_count, want)
+        # without the flag the CLI never renews, whatever extra usage says
+        self.write_creds(-60)
+        self.seed(False)
+        _rc, _out, refresh = self.run_cli()
+        self.assertEqual(refresh.call_count, 0)
+
+    def test_meter_refresh_flag_dry_reports(self):
+        for extra, would in ((True, False), (None, False), (False, True)):
+            with self.subTest(extra=extra):
+                self.write_creds(-60)
+                self.seed(extra)
+                rc, out, refresh = self.run_cli('--refresh', '--dry-run', '--json')
+                self.assertEqual(rc, 0)
+                self.assertEqual(refresh.call_count, 0)  # a dry run never makes the model call
+                plan = json.loads(out)['refresh_dry_run']
+                self.assertIs(plan['would_refresh'], would)
+                self.assertTrue(plan['token_expired_at'])
+                self.assertIn('renew it' if would else 'NOT renew', plan['report'])
+        self.write_creds(3600)  # a valid token: nothing to renew
+        _rc, out, refresh = self.run_cli('--dry-run')
+        self.assertEqual(refresh.call_count, 0)
+        self.assertIn('not expired', out)
+
     def test_a_blocked_refresh_keeps_the_expiry_claimable(self):
         self.write_creds(-60)
         self.seed(None)

@@ -191,10 +191,11 @@ class InterpreterInlineCode(unittest.TestCase):
                     'python - <<\'EOF\'\nimport json\nprint(json.load(open("policy.json"))["claude"])\nEOF',
                     'cat > t.py <<\'EOF\'\nos.system("git commit")\nEOF',  # a heredoc into a file is data
                     'git diff | python -m json.tool', 'perl -pe "s/a/b/" a.txt', 'bash build.sh',
-                    'powershell -NoProfile -File build.ps1', 'powershell -NoProfile -Command "Get-ChildItem"',
+                    'powershell -NoProfile -Command "Get-ChildItem"',
                     'Get-ChildItem | % { $_.Name }', 'npm test; $LASTEXITCODE', '$r = git status',
                     'grep -rn "git commit" .', 'rg "curl -X POST" tests'):
             self.assertIsNone(code(cmd), cmd)
+        self.assertIsNotNone(code('powershell -NoProfile -File build.ps1'))
 
 
 class GitWrites(unittest.TestCase):
@@ -235,9 +236,10 @@ class RelativePathEscapes(unittest.TestCase):
     def test_allowed(self):
         for cmd in ('cp a b', 'mkdir -p build/x && cp a build/x/', 'cd tests && touch x', 'cd sub/.. && cp a b',
                     'echo hi > out.txt', 'php -l a.php > /dev/null 2>&1', 'python x.py 2>$null', 'echo x > nul',
-                    'cp a sub/../b', 'cat ../other/file', 'ls ../', 'git -C ../task-b log -3',
+                    'cp a sub/../b', 'cat ../other/file', 'ls ../',
                     'pushd sub && cp a b && popd && cp c d', f'cd {WT}/sub && cp a b'):
             self.assertIsNone(code(cmd), cmd)
+        self.assertIsNotNone(code('git -C ../task-b log -3'))
 
     # Every escape spelling under every way a command can take a path. A guard fix that closes one cell and
     # misses its neighbour fails here, not in the next review.
@@ -302,7 +304,7 @@ class RelativePathEscapes(unittest.TestCase):
 
     def test_read_only_commands_and_inside_paths_stay_allowed(self):
         for cmd in ('cat ../other/file', 'ls ../', 'grep -rn foo ../other', 'find .. -name x', 'diff a ../b',
-                    'git -C ../task-b log -3', 'head -5 ~/notes.txt', 'Get-Content ..\\x.txt', 'chmod +x sub/../run.sh',
+                    'head -5 ~/notes.txt', 'Get-Content ..\\x.txt', 'chmod +x sub/../run.sh',
                     'gcc -Iinclude -o build/a a.c', 'go build -o bin/app ./cmd/app', 'cargo build --target-dir target',
                     'python -m venv .venv', 'npm install --prefix ./tools', 'make $TARGET', 'npm run $SCRIPT',
                     'sed -i s/a/b/ src/x.py', 'perl -pi -e s/a/b/ src/x', 'python tools/x.py', 'echo $HOME > out.txt'):
@@ -318,9 +320,10 @@ class RelativePathEscapes(unittest.TestCase):
                     'git grep -O../x.sh foo', 'git grep --open-files-in-pager=../x foo', 'git diff --output=../x'):
             self.assertIsNotNone(code(cmd), cmd)
         for cmd in ('xxd ../x', 'xxd a | head', 'tree -L 2 ..', 'file ../x', 'fd -tx foo', 'fd -H foo ..',
-                    'rg foo ../sibling', 'git log ../x', 'git diff ../a ../b', 'git -C ../task-b status',
+                    'rg foo ../sibling', 'git log ../x', 'git diff ../a ../b',
                     'git -c color.ui=never log -3', 'grep -o foo src/a'):
             self.assertIsNone(code(cmd), cmd)
+        self.assertIsNotNone(code('git -C ../task-b status'))
 
     def test_brace_and_glob_expansions_that_reach_dotdot_are_resolved(self):
         for cmd in ('cp a {..,b}/x', 'cp a -t{..,b}', 'tar -xf a -C{..,b}', 'cp a {.,x}./y', 'cp a .?/x',
@@ -540,6 +543,202 @@ class ReviewRound3Inputs(unittest.TestCase):
     def test_the_same_shapes_inside_the_worktree_stay_allowed(self):
         for cmd in ('env -S "git status"', 'sudo -D . cp a b', "python - <<'EOF'\nopen('out','w').write('x')\nEOF"):
             self.assertIsNone(code(cmd), cmd)
+
+
+BS = chr(92)
+# A configured guard section for the tests of configured rules: twinlane ships none of these names.
+SCRIPT_CONFIG = {'deny_text': [r'release-prod\.ps1', r'sql[\\/]+run_\w+\.php', r'agent-run\.sh']}
+
+
+def code_with(cmd, config, tool='Bash'):
+    return guard.evaluate(tool, bash(cmd), 'code', WT, ALLOW, config=config)
+
+
+class AnsiCQuoting(unittest.TestCase):
+    """Regression: bash decodes $'...' (ANSI-C quoting), so `git $'push'` is `git push`. Only
+    an unquoted $'...' is decoded; inside single or double quotes `$'` is literal text."""
+
+    def test_encoded_verbs_paths_and_switches_are_denied(self):
+        for cmd in ("git $'push' origin x", "git $'" + BS + "x70ush' origin x", "git $'" + BS + "160ush'",
+                    "git $'" + BS + "u0070ush'", "$'git' push", "$'" + BS + "x67it' commit -m x",
+                    "git p$'us'h", "git \"pu\"$'sh'", "git $'pu'sh", "git $'commit' -m x",
+                    "cp a $'" + BS + "x2e" + BS + "x2e/x'", "cp a $'..'/x", "cp a .$'.'/x",
+                    "touch $'" + BS + "056" + BS + "056/x'", "echo hi > $'" + BS + "x2e" + BS + "x2e'/x",
+                    "echo hi > \"sub\"/../../x", "GIT_DIR=$'" + BS + "x2e" + BS + "x2e/x' git add .",
+                    "env --ch$'dir'=.. cp a b", "env -$'" + BS + "x43' .. cp a b",
+                    "git -c $'alias.x=commit' x", "git $'--work-tree'=../x checkout .",
+                    "bash -c $'git" + BS + "x20push'"):
+            self.assertIsNotNone(code(cmd), cmd)
+        # a deploy-script text rule is a configured deny_text in twinlane
+        cmd = "powershell -File scripts/release-prod$'" + BS + "x2e'ps1"
+        self.assertIsNotNone(code_with(cmd, SCRIPT_CONFIG), cmd)
+        self.assertIsNotNone(code(cmd), cmd)
+
+    def test_quoted_dollars_and_harmless_ansi_c_stay_allowed(self):
+        for cmd in ("cp a \"$'..'/x\"", "git log --grep \"$'push'\" -3", "printf '%s' $'a" + BS + "tb'",
+                    "echo $'hello" + BS + "n' > out.txt", "cp a $'sub/b.txt'", "echo 'cost: $' > out.txt",
+                    "git $'status'", f"cp a $'{WT}/b'"):
+            self.assertIsNone(code(cmd), cmd)
+        # twinlane stays stricter than a quote-removal-only reading here: a `$` left in a destination after quote removal is read as
+        # a variable it cannot resolve, so these literal names are still denied (never weakened).
+        for cmd in ("cp a \"$'" + BS + "x2e" + BS + "x2e'\"/y", "cp a '$'" + BS + "x2e" + BS + "x2e'/y'"):
+            self.assertIsNotNone(code(cmd), cmd)
+
+
+class BraceExpansion(unittest.TestCase):
+    """Regression: bash expands an unquoted {a,b} before the command runs, so a brace can hide
+    a `../` or a git verb. Every word is expanded as bash does; over BRACE_CAP words is denied, never checked
+    in part."""
+
+    def test_brace_hidden_targets_and_verbs_are_denied(self):
+        for cmd in ('cp a {x,../y}', 'cp a {x,{y,../z}}', 'cp a {x,y}{,/../../q}', 'echo hi > {x,../y}',
+                    'mv {a,../b}', 'git {push,status}', 'git {pu,}sh', 'touch {.,..}/x',
+                    'mv a {{x,y},{../z,w}}/f', "cp a {x,$'" + BS + "x2e" + BS + "x2e'}/f"):
+            self.assertIsNotNone(code(cmd), cmd)
+
+    def test_over_the_cap_is_denied_unchecked(self):
+        many = 'cp a {' + ','.join(f'w{i}' for i in range(300)) + ',../out}'
+        for cmd in ('cp a ' + '{a,b}' * 9 + '/x', many, 'cp a ' + '{a,b,c,d,e,f,g,h}' * 3 + '{..,z}/x',
+                    'touch f{1..300}', 'cp a ' + '{x,' * 80 + 'y' + '}' * 80, 'echo ' + '{a,b}' * 40):
+            self.assertIn('brace expansion', code(cmd) or '', cmd[:80])
+        self.assertIn('brace expansion', guard.shell_hazard('git ' + '{a,b}' * 9) or '')
+
+    def test_quoted_braces_and_inside_the_worktree_stay_allowed(self):
+        for cmd in ('cp src/{a,b,c}.py out/', 'mkdir -p build/{x,y}/z', 'cp a.txt {b,c}.txt',
+                    'echo {a,b}', 'touch file{1..5}.txt', 'touch {a..e}.log',
+                    "git log --format='{%H,%s}' -3", 'echo ${HOME},x',
+                    f'cp -r src/{{a,b}} {WT}/out', 'cp a {b}', 'echo {a', "awk '{print $1,$2}' a.txt",
+                    'cp a {' + ','.join(f'w{i}' for i in range(256)) + '}/x', 'git stash list',
+                    'git show HEAD@{1}'):
+            self.assertIsNone(code(cmd), cmd)
+        # twinlane stays strict: a quoted brace in a write position is still expanded for the
+        # target check (its literal name has no `..` component, but the old rule denied it; kept).
+        for cmd in ("cp a '{x,../y}'", 'cp a "{x,../y}"'):
+            self.assertIsNotNone(code(cmd), cmd)
+        if os.name == 'nt':  # and the backslash left of `\;` is the drive root to the path check (kept from 0.1)
+            self.assertIsNotNone(code('find . -name x -exec rm {} \\;'))
+
+    def test_expansion_is_charged_to_the_work_budget(self):
+        # 8 words per brace, many braces: the expansion counts against MAX_WORK and denies as too complex.
+        wide = '{' + ','.join('abcdefgh') + '}'
+        many = ' '.join(['ls ' + wide * 2 + '/x'] * 400)  # 64 words each, 25 600 in all
+        self.assertLess(len(many), guard.MAX_COMMAND_CHARS)
+        self.assertIn('too complex to inspect', code(many) or '')
+        self.assertIsNone(code('; '.join(['ls ' + wide * 2 + '/x'] * 4)))
+        with mock.patch.object(guard, '_spend', wraps=guard._spend) as spend:
+            self.assertIsNone(code('ls ' + wide * 2 + '/x'))
+        self.assertIn(63 // 16, [c.args[2] for c in spend.call_args_list if len(c.args) > 2 and c.args[1] == ''])
+
+    def test_words_expands_as_bash_does(self):
+        self.assertEqual(guard.words('cp a{b,c{d,e}}f g'), ['cp', 'abf', 'acdf', 'acef', 'g'])
+        self.assertEqual(guard.words('x {1..3} {a..c..2} {,y}'), ['x', '1', '2', '3', 'a', 'c', 'y'])
+        self.assertEqual(guard.words("'{a,b}' \"{c,d}\" ${e,f} {g}"), ['{a,b}', '{c,d}', '${e,f}', '{g}'])
+        self.assertEqual(guard.words("$'a" + BS + "x41" + BS + "101" + BS + "'b' '$'x'y'"), ["aAA'b", '$xy'])
+
+
+class ScriptNamesInExpandedWords(unittest.TestCase):
+    """Regression: the text rules (configured deny_text and twinlane's own script) read the
+    words too, after brace expansion, quote removal and $'...' decoding, so a brace that bash expands into a
+    denied script name is caught."""
+
+    def test_brace_built_script_names_are_denied(self):
+        for cmd in ('powershell -File release-pro{d,x}.ps1', 'powershell -File release-prod{.,_}ps1',
+                    'php sql/ru{n,x}_1149_customer.php', 'bash ~/tools/agent-ru{n,x}.sh --tier small',
+                    'sudo env X=1 powershell -File release-pro{d,x}.ps1',
+                    'timeout 5 php sql{/,_}ru{n,x}_1.php', 'bash -c "php sql/ru{n,x}_1.php"',
+                    "cmd /c \"powershell -File release-pro{d,x}.ps1\"", "bash <<'EOF'\nbash agent-ru{n,x}.sh\nEOF",
+                    "powershell -File release-pro$'" + BS + "x64'{,x}.ps1", 'pwsh -File \x43:/a/{x,release-prod}.ps1',
+                    'powershell -File "release-pro"d.ps1'):
+            self.assertIsNotNone(code_with(cmd, SCRIPT_CONFIG), cmd)
+            self.assertIsNotNone(guard.shell_hazard(cmd, SCRIPT_CONFIG), cmd)
+        for cmd in ('python \x43:/x/twinlane/cli.py {run,status} --brief b', 'python src/twinlane/cli.py {land,jobs} t1'):
+            self.assertIsNotNone(code(cmd), cmd)
+            self.assertIsNotNone(guard.shell_hazard(cmd), cmd)
+
+    def test_quoted_braces_and_other_scripts_stay_allowed(self):
+        for cmd in ('php sql/check_{a,b}.php', 'php -l sql/ru{n,x}.txt',
+                    'bash scripts/te{st,sts}.sh', 'python twinlane/cli.py {status,jobs}', "rg 'release-pro{d,x}' docs",
+                    'cp src/{a,b}.ps1 build/'):
+            self.assertIsNone(code_with(cmd, SCRIPT_CONFIG), cmd)
+        for cmd in ("powershell -File 'release-pro{d,x}.ps1'", 'powershell -File "release-prod{.,_}ps1"',
+                    'powershell -File build{,-all}.ps1'):
+            self.assertIsNotNone(code_with(cmd, SCRIPT_CONFIG), cmd)
+
+
+class RunTimePaths(unittest.TestCase):
+    """Regression: `cp a $(echo ..)/x` was allowed, because the words split the substitution
+    into `$(echo` and `..)/x` and only the harmless-looking tail was checked. A writing command whose words
+    the shell computes at run time (command or process substitution, an operator parameter expansion) cannot
+    be confined, so it is denied; literal quoted text and static writes stay allowed."""
+
+    def test_writing_commands_with_run_time_words_are_denied(self):
+        for cmd in ('cp a $(echo ..)/x', 'cp a $(echo ..)/{x,y}', 'cp a "$(echo ..)"/x', 'cp a `echo ..`/x',
+                    'cp a ${X:-x ..}/y', 'cp $(echo -t ..) a', 'mv a $(echo ..)', 'touch $(echo ../x)',
+                    'echo x > >(tee ../log)', 'echo x >(tee ../log)', 'echo hi > $(echo ..)/x',
+                    'echo hi >> "$(dirname $PWD)"/x', 'Copy-Item a -Destination $(echo ..)',
+                    'git $(echo push)', 'git log $(git merge-base HEAD main)..HEAD', 'git -C $(echo ..) add x',
+                    'curl -o $(echo ../x) http://127.0.0.1/', 'sed -i s/a/b/ $(echo ../f)',
+                    'bash -c "cp a $(echo ..)/x"'):
+            self.assertIsNotNone(code(cmd), cmd)
+
+    def test_parameter_operators_without_colon_cannot_hide_write_targets(self):
+        for op in ('+', '-', '=', '?', ':+', ':-', ':=', ':?'):
+            with self.subTest(operator=op):
+                cmd = 'cp a ${X' + op + 'x ..}/y'
+                self.assertIsNotNone(code(cmd), cmd)
+        for cmd in ("cp '${X+x ..}/y' out/", "echo '${X-x ..}'", 'cp a b'):
+            self.assertIsNone(code(cmd), cmd)
+
+    def test_non_scalar_parameters_cannot_hide_write_targets(self):
+        for cmd in ('ref=HOME; cp a ${!ref}/x', 'cp a ${1}/x', 'cp a $1/x',
+                    'cp a ${a[ 0 ]}/x', 'cp a $@/x', 'cp a $*/x', 'cp a $#/x',
+                    'cp a $?/x', 'cp a $$/x', 'cp a $!/x', 'cp a $-/x'):
+            with self.subTest(command=cmd):
+                self.assertIsNotNone(code(cmd), cmd)
+        for cmd in ("cp '${!ref}/x' out/", "echo '$@'", 'cp "${SRC}"/a out/'):
+            self.assertIsNone(code(cmd), cmd)
+
+    def test_computed_git_options_are_denied_and_escaped_dollars_are_literal(self):
+        self.assertIsNotNone(code("git log $(echo --ou''tput) $(echo ..)/out.txt"))
+        self.assertIsNotNone(code('git log $(git merge-base HEAD main)..HEAD'))
+        self.assertIsNone(code('cp "file' + BS + '$(date).txt" out/'))
+        for n in (1, 2, 3, 4):
+            for expression in ('$(date)', '`date`'):
+                literal = (BS * n) + expression
+                if expression.startswith('`'):
+                    literal = (BS * n) + '`date' + (BS * n) + '`'
+                cmd = 'cp "file' + literal + '.txt" out/'
+                with self.subTest(backslashes=n, expression=expression):
+                    if n % 2:
+                        self.assertIsNone(code(cmd), cmd)
+                    else:
+                        self.assertIsNotNone(code(cmd), cmd)
+        self.assertIsNone(code('cp "file<(date).txt" out/'))
+        self.assertIsNone(code('cp "file>(date).txt" out/'))
+
+    def test_computed_sed_perl_options_cannot_hide_inplace_writes(self):
+        for cmd in ('sed $(printf -- -%s i) s/a/b/ $(echo ..)/x',
+                    'perl $(printf -- -%s i) -pe 1 $(echo ..)/x'):
+            self.assertIsNotNone(code(cmd), cmd)
+        for cmd in ('sed s/a/b/ file.txt', 'perl -pe 1 file.txt'):
+            self.assertIsNone(code(cmd), cmd)
+        # twinlane stays strict: sed (its `w` command) and perl can write, so `..` stays denied.
+        for cmd in ('sed -n 1p ../x', 'perl -ne 1 ../x'):
+            self.assertIsNotNone(code(cmd), cmd)
+
+    def test_literal_text_reads_and_static_writes_stay_allowed(self):
+        for cmd in ("cp '$(echo ..)/x' out/", "cp '`x`' out/", "cp $'$(echo ..)' out/", 'echo $(date) > out.txt',
+                    'echo "built $(git rev-parse HEAD)" > build/version.txt', 'printf "%s" `date` >> log.txt',
+                    'ls $(git rev-parse --show-toplevel)', 'diff <(ls a) <(ls b)', 'cp a b', 'cp "${SRC}"/a out/',
+                    f'cp a {WT}/b', 'cat ../x'):
+            self.assertIsNone(code(cmd), cmd)
+        if os.name == 'nt':
+            self.assertIsNone(code('cp \x43:' + BS + 'Users' + BS + 'alice' + BS + 'x.txt sub' + BS + 'x.txt'))
+        # twinlane stays strict: the arguments of a script are unknown, so a run-time word in a
+        # command that may write is denied even when the redirect itself is static.
+        self.assertIsNotNone(code('python x.py $(cat args.txt) > out.txt'))
+        # and a redirect makes the line a writer, so its `..` operand is checked too (kept from 0.1)
+        self.assertIsNotNone(code('cat ../x > out.txt'))
 
 
 class HookProtocol(unittest.TestCase):

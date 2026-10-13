@@ -20,3 +20,7 @@
 ^twinlane/guard[.]py:high-entropy:(?:commit/push/[a-z/-]+|GIT_[A-Z_]+(?:/GIT_[A-Z_]+)+)$
 # reason: The README CI badge links this repository's own public Actions workflow page.
 ^(?:history@99a588e:)?README\.md:high-entropy:c[o]m/mmelqadi/twinlane/act(?:)ions/workflows/ci$
+# reason: SHA-256 digests of fixed public fixture strings (a task id and dispatch fingerprints) pinned in the predecessor-registry replay tests; they are content hashes, not credentials.
+^tests/test_coordination\.py:high-entropy:(?:c2ad|89e7|a5ca|0d15)[0-9a-f]{60}$
+# reason: a random holder id for the land lock record (uuid4 hex), a lock identity and not a credential.
+^twinlane/land\.py:generic-secret-assign(?:)ment:uuid[.]uuid4[(][)][.]hex$

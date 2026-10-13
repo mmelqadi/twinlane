@@ -268,7 +268,23 @@ def _merge_defaults(baton: dict) -> dict:
         elif isinstance(v, dict) and isinstance(baton[k], dict):
             for kk, vv in v.items():
                 baton[k].setdefault(kk, vv)
+    _legacy_tracker(baton)
     return baton
+
+
+# Task keys that earlier tools wrote for the tracker id. They are read as task.tracker_id when that is empty,
+# and they stay in the file untouched: a baton is never rewritten with fewer keys than it was loaded with.
+LEGACY_TRACKER_KEYS = ('asana_gid',)
+
+
+def _legacy_tracker(baton: dict) -> None:
+    task = baton.get('task')
+    if not isinstance(task, dict) or task.get('tracker_id'):
+        return
+    for key in LEGACY_TRACKER_KEYS:
+        if task.get(key):
+            task['tracker_id'] = task[key]
+            return
 
 
 def load(slug: str) -> dict | None:
