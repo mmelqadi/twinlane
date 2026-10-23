@@ -297,6 +297,35 @@ def _owners(main_root: str) -> dict:
     return {sha: sorted(slugs) for sha, slugs in owners.items()}
 
 
+def _check_unverified(main_root: str, base: str, source: str) -> None:
+    """Foreign-work overrides cannot authorize an unresolved, unverified landing."""
+    events = land.read_ledger(main_root)
+    commits = set(_rev_list(main_root, base, source))
+    for index, event in enumerate(events):
+        if event.get('event') != 'landed-unverified':
+            continue
+        start, end = event.get('from'), event.get('to')
+        if not commits.intersection(_rev_list(main_root, start, end)):
+            continue
+        # A later gate on the target may verify a fix-forward containing the unverified work.
+        # It only clears manifests that actually include that verified result.
+        resolved = False
+        for later in events[index + 1:]:
+            if later.get('event') != 'landed' or later.get('target') != event.get('target'):
+                continue
+            gate, regate = later.get('gate'), later.get('regate')
+            verified = (isinstance(regate, dict) and regate.get('rc') == 0) or (
+                isinstance(gate, dict) and gate.get('rc') == 0 and later.get('tree_matches') is True)
+            tip = later.get('to')
+            if verified and tip and _is_ancestor(main_root, end, tip) and _is_ancestor(main_root, tip, source):
+                resolved = True
+                break
+        if not resolved:
+            raise ShipError(f"{event.get('slug')} has an unresolved landed-unverified range {start}..{end}; "
+                            'a verified landing or a fix-forward on the target is needed',
+                            details={'unverified_landing': event})
+
+
 def _superseded(log_after: list, manifest_paths: set) -> list:
     """[{path, by: [sha], subjects: [subject]}]: manifest paths that commits after the source changed again."""
     by = {}
@@ -382,6 +411,7 @@ def build_manifest(target_arg: str, repo: str | None = None, landing_no: int | N
                             f'{base[:12]}')
         base_ref = baseline_commit
 
+    _check_unverified(main_root, base_ref, source)
     files, deleted = collect_files(main_root, base, source)
     manifest_paths = {e['path'] for e in files} | {e['path'] for e in deleted}
     owners = _owners(main_root)
@@ -570,6 +600,7 @@ def verify_manifest(main_root: str, m: dict) -> dict:
     head = _commit(main_root, 'refs/heads/' + m['target'])
     if not _is_ancestor(main_root, source, head):
         raise ShipError(f"{source[:12]} is no longer on {m['target']} (head {head[:12]}); plan again")
+    _check_unverified(main_root, m['flags'].get('baseline') or base, source)
     files, deleted = collect_files(main_root, base, source)
     if files != m['files'] or deleted != m['deleted']:
         want = {e['path']: e for e in files}

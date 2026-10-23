@@ -295,6 +295,15 @@ class Prune(WtBase):
         self.assertEqual(res['removed'], 0)
         self.assertTrue(os.path.isdir(held))
 
+    def test_nonmatching_job_folder_blocks_all_pruning(self):
+        held = self.merged('legacy-protected')
+        os.mkdir(os.path.join(common.JOBS, 'legacy-worker'))
+        res = worktrees.prune(self.repo, yes=True, policy=self.policy())
+        self.assertEqual(res['removed'], 0)
+        self.assertIn('nonmatching job folder legacy-worker',
+                      '; '.join(self.rows(res)['legacy-protected']['blockers']))
+        self.assertTrue(os.path.isdir(held))
+
     def test_prune_unlinks_inner_links_first_and_target_survives(self):
         shared = self.ws.path('shared')
         os.makedirs(shared)

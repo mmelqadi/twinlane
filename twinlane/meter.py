@@ -15,6 +15,7 @@ import math
 import os
 import queue
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -941,21 +942,25 @@ def _exchange_reading(argv: list[str], timeout: float) -> tuple[dict | None, str
 def read_app_server(_argv=None, timeout: float = APP_SERVER_TIMEOUT_S) -> tuple[dict | None, str]:
     if _argv is not None:
         return _exchange_reading(_argv, timeout)
-    # The private copy is leased for the exchange, so no prune removes it mid-read. No usable codex (twinlane never
-    # runs the app's own exe or the PATH one) or a failed lookup leaves the caller to the rollouts.
+    # Share dispatch's policy and best-app discovery, holding any copy lease
+    # during the exchange. A meter lookup never exports its choice to jobs.
+    lease = None
     try:
-        with common.codex_lease() as (binary, why):
-            if not binary:
-                return None, f'codex binary not found: {why}'
-            reading, err = _exchange_reading([binary, 'app-server'], timeout)
-            if why:  # an older copy or explicit binary: show it in `twinlane status` via the reading's note
-                if reading:
-                    reading['note'] = _join(reading.get('note'), f'codex CLI: {why}')
-                else:
-                    err = _join(err, f'codex CLI: {why}')
-            return reading, err
-    except OSError as e:
+        source = (common.load_policy().get('codex') or {}).get('binary_source') or 'auto'
+        binary, why, lease = common.acquire_codex_binary(source)
+        if not binary:
+            return None, f'codex binary not found: {why}'
+        reading, err = _exchange_reading([binary, 'app-server'], timeout)
+        if why:
+            if reading:
+                reading['note'] = _join(reading.get('note'), f'codex CLI: {why}')
+            else:
+                err = _join(err, f'codex CLI: {why}')
+        return reading, err
+    except (OSError, ValueError) as e:
         return None, f'codex binary lookup failed: {common.clip(str(e) or type(e).__name__, 140)}'
+    finally:
+        common.release_codex(lease)
 
 
 def _rollout_line_reading(line: str):
@@ -1033,10 +1038,22 @@ def rollout_token_usage(session_id, sessions_root: str | None = None) -> dict | 
     return None
 
 
-def read_codex_raw(_argv=None, sessions_root=None, timeout: float = APP_SERVER_TIMEOUT_S) -> dict:
+def rollout_fallback_enabled(policy: dict | None) -> bool:
+    """policy meter.codex_rollout_fallback (default true). Anything but a real boolean reads as false, so a
+    malformed setting fails closed: the Codex reading goes unknown instead of reading local session files."""
+    v = ((policy or {}).get('meter') or {}).get('codex_rollout_fallback', True)
+    return v is True
+
+
+def read_codex_raw(_argv=None, sessions_root=None, timeout: float = APP_SERVER_TIMEOUT_S,
+                   rollout_fallback: bool = True) -> dict:
+    """The app-server reading; when that fails, the newest local rollout reading unless rollout_fallback is off,
+    in which case a failed exchange is source 'none' (status unknown) and no session file is opened."""
     reading, why = read_app_server(_argv, timeout)
     if reading:
         return reading
+    if not rollout_fallback:
+        return {'source': 'none', 'note': _join(why, 'rollout fallback off (meter.codex_rollout_fallback / --no-rollout)')}
     fallback = rollout_reading(sessions_root)
     if fallback:
         fallback['note'] = _join(why, 'using the newest rollout reading')
@@ -1067,6 +1084,15 @@ def _cached_meter(policy: dict) -> dict | None:
     return m
 
 
+def cached_observation(policy=None):
+    """Latest cached evidence, with freshness applied, and no probes or writes."""
+    policy = policy or common.load_policy()
+    raw = common.read_json(meter_path(), {})
+    raw = raw if isinstance(raw, dict) else {}
+    return dict(raw, claude=finish_claude(raw.get('claude') if isinstance(raw.get('claude'), dict) else {}, policy),
+                codex=finish_codex(raw.get('codex') if isinstance(raw.get('codex'), dict) else {}, policy))
+
+
 def _cached_needs_refresh(cached: dict) -> bool:
     """The cached Claude reading is unknown because the token expired, and no automatic refresh was tried yet."""
     c = cached.get('claude') or {}
@@ -1074,12 +1100,15 @@ def _cached_needs_refresh(cached: dict) -> bool:
 
 
 def read(fresh: bool = False, refresh_claude: bool = False, policy: dict | None = None,
-         auto_refresh: bool = False, _claude_reader=None, _codex_reader=None, _run=None, _http=None) -> dict:
+         auto_refresh: bool = False, _claude_reader=None, _codex_reader=None, _run=None, _http=None,
+         rollout_fallback: bool | None = None) -> dict:
     """Both meters. Uses state/meter.json when younger than the TTL unless fresh/refresh_claude.
 
-    auto_refresh (status, route, run; never the hook or plain `twinlane meter`): when the Claude reading is
+    auto_refresh (route, run; never the hook or plain `twinlane meter`): when the Claude reading is
     unknown because the CLI token expired, spend ONE tiny Haiku call per expiry to renew it
-    (policy.meter.auto_refresh_claude, default off). The result then carries `refreshed_now: ['claude']`."""
+    (policy.meter.auto_refresh_claude, default off). The result then carries `refreshed_now: ['claude']`.
+
+    rollout_fallback: None follows policy meter.codex_rollout_fallback; False never reads Codex rollout files."""
     policy = policy or common.load_policy()
     started = common.now()  # the cache stamp is when this read began: no reading in it is older than that
     auto = auto_refresh and not refresh_claude and auto_refresh_enabled(policy)
@@ -1093,7 +1122,9 @@ def read(fresh: bool = False, refresh_claude: bool = False, policy: dict | None 
         claude_reader = lambda: read_claude_auto(policy, _http=_http, _run=_run)  # noqa: E731
     else:
         claude_reader = lambda: read_claude_raw(refresh=refresh_claude, _http=_http, _run=_run)  # noqa: E731
-    readers = {'claude': claude_reader, 'codex': _codex_reader or read_codex_raw}
+    use_rollouts = rollout_fallback_enabled(policy) if rollout_fallback is None else rollout_fallback is True
+    readers = {'claude': claude_reader,
+               'codex': _codex_reader or (lambda: read_codex_raw(rollout_fallback=use_rollouts))}
     raw: dict = {}
 
     queue_ = getattr(_deferral, 'queue', None)  # the reader threads inherit this thread's deferral
@@ -1368,6 +1399,8 @@ def cli(argv) -> int:
     ap.add_argument('--record-claude', metavar='JSON',
                     help='store a Claude reading: OAuth or desktop get_usage JSON, @file, or - for stdin')
     ap.add_argument('--source', choices=('desktop', 'statusline'), help='writer name for --record-claude')
+    ap.add_argument('--no-rollout', action='store_true',
+                    help='never read Codex rollout session files: a failed app-server read stays unknown')
     try:
         a = ap.parse_args(argv)
     except SystemExit as e:
@@ -1382,11 +1415,11 @@ def cli(argv) -> int:
         common.emit(sec, a.json, _fmt_engine('claude', sec, common.now()))
         return common.EXIT_OK
     if a.dry_run:
-        m = read(fresh=a.fresh, policy=policy)
+        m = read(fresh=a.fresh, policy=policy, rollout_fallback=False if a.no_rollout else None)
         plan = refresh_report()
         m = dict(m, refresh_dry_run=plan)
         common.emit(m, a.json, '\n'.join([format_line(m), plan['report']]))
         return common.EXIT_OK
-    m = read(fresh=a.fresh, refresh_claude=a.refresh, policy=policy)
+    m = read(fresh=a.fresh, refresh_claude=a.refresh, policy=policy, rollout_fallback=False if a.no_rollout else None)
     common.emit(m, a.json, format_line(m))
     return common.EXIT_OK

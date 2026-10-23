@@ -1,8 +1,14 @@
 {
   "policy_version": 1,
+  "jobs": {"archive_after_days": 14},
+  "wip": {"max_writers": 5, "session_active_s": 1800, "count_main_checkout": true, "claims_command": null, "claims_timeout_s": 10},
+  "lanes": {"stale_after_s": 86400, "claude_agents": true, "claude_agents_timeout_s": 8, "state_file_ttl_s": 86400, "park_timeout_s": 259200},
+  "inbox": {"show": 5},
+  "context": {"window_tokens": {"claude": null, "codex": null, "models": {}}, "checkpoint_pct": 70, "rotate_pct": 85},
+  "sessions": {"lead_session_id": null, "lead_family": []},
   "thresholds": {"caution_pct": 75, "handoff_pct": 80, "stop_pct": 85, "hard_pct": 100},
   "meter": {"cache_ttl_s": 120, "hook_cache_max_age_s": 300, "auto_refresh_claude": false,
-    "after_read_timeout_s": 10, "overlap_scan_timeout_s": 5},
+    "codex_rollout_fallback": true, "after_read_timeout_s": 10, "overlap_scan_timeout_s": 5},
   "claude": {
     "models": {"default": "claude-opus-5-5", "fast": "claude-sonnet-5-5", "cheap": "claude-haiku-4-5"},
     "fast_kinds": [],
@@ -38,13 +44,13 @@
       "code": "sol-high", "intel": "sol-high", "plan": "astra", "review": "astra"},
     "write_kinds": ["code", "integrate"], "allow_credits": false, "max_parallel": 4,
     "timeout_s": 3600, "preflight_max_age_s": 300, "stale_reading_max_age_s": 1800,
-    "binary_source": "auto", "exec_config": [], "min_cli_version": null
+    "binary_source": "auto", "exec_config": [], "min_cli_version": null, "allow_older_env_bin": false
   },
   "guard": {"allow_subagents": false, "self_aliases": [], "deny_commands": [], "deny_text": []},
   "secrets": {"extra_env_name_patterns": []},
   "land": {"heartbeat_s": 15, "heartbeat_stale_s": 120, "gate_timeout_s": 1800},
   "ship": {"dry_run_max_age_s": 1800},
-  "wt": {"deps_dirs": [], "stale_days": 7, "prune_min_age_s": 86400, "link_roots": []},
+  "wt": {"deps_dirs": [], "stale_days": 7, "prune_min_age_s": 86400, "link_roots": [], "behind_max": 50, "merged_min_age_s": 3600, "preflight": "refuse"},
   "best_of": {"max_contestants": 3},
   "resume": {"max_batch": 10},
   "projects": {},

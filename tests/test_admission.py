@@ -8,6 +8,10 @@ import tempfile
 import unittest
 from unittest import mock
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+
+import test_support  # noqa: E402; disposable paths must be set before common caches them at import
+
 from twinlane import common, jobs, meter
 
 

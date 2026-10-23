@@ -9,6 +9,7 @@ import os
 import sys
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -34,6 +35,10 @@ class Fakes(test_baton.BatonTestBase):
 
     def setUp(self):
         super().setUp()
+        # Transcript fixtures exercise fallback without consulting a real supervisor.
+        patcher = mock.patch('twinlane.lanes.supervisor_rows', return_value=None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         for p in (baton.CLAUDE_PROJECTS, baton.CODEX_SESSIONS, common.JOBS):
             self.assertTrue(os.path.abspath(p).startswith(os.path.abspath(self.tmp)), p)  # never the real dirs
         os.makedirs(common.JOBS, exist_ok=True)
@@ -178,11 +183,14 @@ class FilterTests(Fakes):
                              self.x_ev('task_complete', turn='external-import-turn-1', last_agent_message='imp')])
         exe = '01a10000-0000-7000-8000-0000000000c3'
         self.codex_done(exe, originator='codex_exec', source='exec')
-        self.assertEqual(sorted(self.listed()), [('claude', CLAUDE_A), ('codex', CODEX_A)])
+        self.assertEqual(sorted(self.listed()), [('claude', CLAUDE_A), ('codex', CODEX_A), ('codex', sub)])
         everything = {k: r['state'] for k, r in self.listed(include_jobs=True).items()}
         self.assertEqual(everything[('claude', CLAUDE_B)], 'job')
         self.assertEqual(everything[('codex', exe)], 'job')
-        self.assertNotIn(('codex', sub), everything)  # subagent threads are never sessions
+        self.assertIn(('codex', sub), everything)  # children must remain visible to the lead
+        child = self.listed(include_jobs=True)[('codex', sub)]
+        self.assertEqual(child['started_by'], CODEX_A)
+        self.assertTrue(child['unmanaged'])
         self.assertNotIn(('codex', imp), everything)  # import-only rollouts are never sessions
 
     def test_imported_turns_do_not_change_the_state(self):
@@ -315,7 +323,7 @@ class TextTests(Fakes):
         self.put_claude(CLAUDE_A, [self.c_user('a | b\nc'), self.c_asst('x | y')])
         md = sessions.format_md(sessions.list_sessions(limit=0))
         row = [ln for ln in md.splitlines() if CLAUDE_A in ln][0]
-        self.assertEqual(row.count('|'), 9)
+        self.assertEqual(row.count('|'), md.splitlines()[0].count('|'))
 
 
 class CliTests(Fakes):

@@ -81,6 +81,20 @@ class ProjectConfig(unittest.TestCase):
         self.assertIs(cfg['land']['command_rebases'], False)
         self.assertIsNone(cfg['test'])
 
+    def test_land_gate_and_wip_options_are_boolean_and_wip_needs_command(self):
+        _, cfg = projects.resolve(self.repo, self.policy())
+        self.assertFalse(cfg['land']['require_gate'])
+        self.assertFalse(cfg['land']['command_handles_wip'])
+        entry = {'land': {'require_gate': True, 'command_handles_wip': True, 'command': ['carry']}}
+        _, cfg = projects.resolve(self.repo, self.policy({self.repo: entry}))
+        self.assertTrue(cfg['land']['require_gate'])
+        self.assertTrue(cfg['land']['command_handles_wip'])
+        for key in ('require_gate', 'command_handles_wip'):
+            with self.subTest(key=key), self.assertRaisesRegex(projects.ProjectError, key + ' must be true or false'):
+                projects.resolve(self.repo, self.policy({self.repo: {'land': {key: 'yes'}}}))
+        with self.assertRaisesRegex(projects.ProjectError, 'needs land.command'):
+            projects.resolve(self.repo, self.policy({self.repo: {'land': {'command_handles_wip': True}}}))
+
     def test_a_project_entry_overrides_one_key_and_keeps_the_other_defaults(self):
         entry = {'land': {'target': 'trunk', 'gate': ['make', 'check', '{worktree}'], 'command_rebases': True,
                           'gate_timeout_s': 60},

@@ -150,6 +150,429 @@ class Land(unittest.TestCase):
 
     # --- queue ---------------------------------------------------------------
 
+    def test_required_gate_refuses_run_and_dry_run_without_landing(self):
+        wt, _ = self.feature('feat-required')
+        self.enqueue('required', wt)
+        self.configure(require_gate=True)
+        before = self.head()
+        for argv in (('run', '--dry-run'), ('run',)):
+            rc, out, err = self.cli(*argv)
+            self.assertEqual(rc, common.EXIT_REFUSED, err)
+            self.assertIn('requires a land gate', out + err)
+            self.assertIn('REQUIRED', out + err)
+        self.assertEqual(self.head(), before)
+        self.assertEqual(self.queue_slugs(), ['required'])
+        self.assertEqual(self.events()[-1]['event'], 'refused')
+
+    def test_tree_changing_command_is_dequeued_but_unverified(self):
+        wt, _ = self.feature('feat-unverified')
+        self.enqueue('unverified', wt)
+        script = self.script('land_extra.py', LAND_COMMAND)
+        self.configure(gate=[PY, '-c', 'pass'], command=[PY, script, '{repo}', '{worktree}', '{branch}', '{slug}',
+                       '{target}', '{base}', '{source_commit}', self.ws.path('args.json')])
+        rc, out, err = self.cli('run', '--json')
+        self.assertEqual(rc, common.EXIT_FAILED, err)
+        self.assertIn('UNVERIFIED', err)
+        event = json.loads(out)['details']['event']
+        self.assertEqual(event['event'], 'landed-unverified')
+        self.assertFalse(event['tree_matches'])
+        self.assertEqual(self.queue_slugs(), [])
+        self.assertEqual(land.landings(self.repo), [])
+
+    def test_changed_lane_tree_is_regated_and_failed_regate_is_unverified(self):
+        wt, _ = self.feature('feat-regate')
+        self.enqueue('regate', wt)
+        script = self.script('advance_lane.py', """
+import os, subprocess, sys
+with open(sys.argv[2], 'w') as h: h.write('extra')
+subprocess.run(['git', 'add', sys.argv[2]], check=True)
+subprocess.run(['git', 'commit', '-q', '-m', 'extra'], check=True)
+subprocess.run(['git', '-C', os.environ['TWINLANE_LAND_REPO'], 'merge', '-q', '--ff-only', sys.argv[1]], check=True)
+""")
+        gate_count = self.ws.path('gate-count')
+        gate = self.script('count_gate.py', '''
+import os, sys
+p = sys.argv[1]
+n = int(open(p).read()) + 1 if os.path.exists(p) else 1
+with open(p, 'w') as h: h.write(str(n))
+sys.exit(1 if len(sys.argv) > 2 and n == 2 else 0)
+''')
+        self.configure(gate=[PY, gate, gate_count], command=[PY, script, '{branch}', 'extra.txt'])
+        rc, out, err = self.cli('run', '--json')
+        self.assertEqual(rc, 0, err)
+        event = json.loads(out)
+        self.assertEqual(event['event'], 'landed')
+        self.assertEqual(event['regate']['rc'], 0)
+        self.assertTrue(os.path.isfile(event['regate']['log']))
+        self.assertTrue(event['regate']['log'].endswith('-regate.log'))
+        with open(gate_count) as handle:
+            self.assertEqual(handle.read(), '2')
+        # A fresh command landing exercises the failure of the second gate.
+        wt2, _ = self.feature('feat-regate-fail')
+        self.enqueue('regate-fail', wt2)
+        self.configure(gate=[PY, gate, self.ws.path('gate-count-fail'), 'fail'],
+                       command=[PY, script, '{branch}', 'second.txt'])
+        rc, _, err = self.cli('run')
+        self.assertEqual(rc, common.EXIT_FAILED, err)
+        self.assertIn('re-gate failed (rc 1)', err)
+        self.assertEqual(self.events()[-1]['event'], 'landed-unverified')
+        self.assertEqual(self.queue_slugs(), [])
+
+    def test_nonzero_command_after_moving_target_is_unverified(self):
+        wt, _ = self.feature('feat-nonzero')
+        self.enqueue('nonzero', wt)
+        command = [PY, '-c', "import subprocess,sys; subprocess.run(['git','-C',sys.argv[1],'merge','--ff-only',sys.argv[2]],check=True); sys.exit(1)", '{repo}', '{branch}']
+        self.configure(command=command, gate=[PY, '-c', 'pass'])
+        rc, _, err = self.cli('run')
+        self.assertEqual(rc, common.EXIT_FAILED, err)
+        self.assertIn('UNVERIFIED', err)
+        self.assertEqual(self.events()[-1]['event'], 'landed-unverified')
+        self.assertEqual(self.queue_slugs(), [])
+
+    def test_successful_ungated_command_records_moved_target(self):
+        wt, _ = self.feature('feat-unrelated')
+        self.enqueue('unrelated', wt)
+        script = self.script('unrelated.py', '''
+import os, subprocess
+repo = os.environ['TWINLANE_LAND_REPO']
+with open(os.path.join(repo, 'other.txt'), 'w') as h: h.write('unrelated')
+subprocess.run(['git', '-C', repo, 'add', 'other.txt'], check=True)
+subprocess.run(['git', '-C', repo, 'commit', '-q', '-m', 'unrelated'], check=True)
+''')
+        self.configure(command=[PY, script])
+        rc, _, err = self.cli('run')
+        self.assertEqual(rc, 0, err)
+        event = self.events()[-1]
+        self.assertEqual(event['event'], 'landed')
+        self.assertFalse(event['contains_gated_commit'])
+        self.assertTrue(any('nothing was gated' in n for n in event['notes']))
+        self.assertEqual(self.queue_slugs(), [])
+
+    def replacement_command(self, rc=0):
+        script = self.script('replace.py', '''
+import os, subprocess, sys
+repo = os.environ['TWINLANE_LAND_REPO']
+head, base = os.environ['TWINLANE_LAND_HEAD'], os.environ['TWINLANE_LAND_BASE']
+replacement = subprocess.check_output(['git', 'commit-tree', head + '^{tree}', '-p', base,
+                                       '-m', 'replacement'], text=True).strip()
+subprocess.run(['git', '-C', repo, 'merge', '--ff-only', replacement], check=True)
+sys.exit(int(sys.argv[1]))
+''')
+        return [PY, script, str(rc)]
+
+    def test_identical_tree_replacement_is_verified_without_original_ancestor(self):
+        wt, commits = self.feature('feat-replacement')
+        self.enqueue('replacement', wt)
+        self.configure(gate=[PY, '-c', 'pass'], command=self.replacement_command())
+        rc, out, err = self.cli('run', '--json')
+        self.assertEqual(rc, 0, err)
+        event = json.loads(out)
+        self.assertEqual(event['event'], 'landed')
+        self.assertNotEqual(event['to'], commits[-1])
+        self.assertFalse(event['contains_gated_commit'])
+        self.assertTrue(event['tree_matches'])
+        self.assertEqual(self.queue_slugs(), [])
+        self.assertEqual([e['event'] for e in self.events()], ['landing', 'command-finished', 'landed'])
+
+    def test_nonzero_replacement_is_unverified_and_dequeued(self):
+        wt, _ = self.feature('feat-replacement-fail')
+        self.enqueue('replacement-fail', wt)
+        self.configure(gate=[PY, '-c', 'pass'], command=self.replacement_command(rc=7))
+        rc, out, err = self.cli('run', '--json')
+        self.assertEqual(rc, common.EXIT_FAILED, err)
+        event = json.loads(out)['details']['event']
+        self.assertEqual(event['event'], 'landed-unverified')
+        self.assertFalse(event['contains_gated_commit'])
+        self.assertTrue(event['tree_matches'])
+        self.assertEqual(event['command']['rc'], 7)
+        self.assertEqual(self.queue_slugs(), [])
+
+    def test_divergent_command_rebase_regates_result(self):
+        wt, commits = self.feature('feat-command-rebase')
+        upstream = self.ws.commit(self.repo, 'upstream.txt', 'upstream\n')
+        self.enqueue('command-rebase', wt)
+        queued = land.read_queue(self.paths)
+        script = self.script('rebase.py', '''
+import os, subprocess
+repo = os.environ['TWINLANE_LAND_REPO']
+subprocess.run(['git', 'rebase', os.environ['TWINLANE_LAND_BASE']], check=True)
+head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+subprocess.run(['git', '-C', repo, 'merge', '--ff-only', head], check=True)
+''')
+        self.configure(command=[PY, script], command_rebases=True, gate=[PY, '-c', 'pass'])
+        rc, out, err = self.cli('run', '--json')
+        self.assertEqual(rc, 0, err)
+        event = json.loads(out)
+        self.assertEqual(event['event'], 'landed')
+        self.assertEqual(event['from'], upstream)
+        self.assertNotEqual(event['to'], commits[-1])
+        self.assertFalse(event['contains_gated_commit'])
+        self.assertFalse(event['tree_matches'])
+        self.assertEqual(event['regate']['rc'], 0)
+        self.assertEqual(self.queue_slugs(), [])
+        # A rebased branch now points to the result, rather than the original gated commit.
+        common.write_json(self.paths.queue, queued)
+        before = self.events()
+        rc, _, err = self.cli('run')
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.events(), before)
+        self.assertEqual(self.queue_slugs(), [])
+
+    def test_interrupt_after_merge_is_journaled_and_salvaged(self):
+        wt, commits = self.feature('feat-interrupt')
+        self.enqueue('interrupt', wt)
+        original = land.Lander._land
+        def interrupt(lander):
+            original(lander)
+            raise KeyboardInterrupt()
+        with mock.patch.object(land.Lander, '_land', interrupt), self.assertRaises(KeyboardInterrupt):
+            land.Lander(repo=self.repo).run()
+        self.assertEqual(self.head(), commits[-1])
+        self.assertEqual([e['event'] for e in self.events()], ['landing', 'landed'])
+        self.assertEqual(self.events()[-1]['recovered'], 'interrupted')
+        self.assertEqual(self.queue_slugs(), [])
+
+    def write_intent(self, wt, mode='ff', gate=None):
+        runner = land.Lander(repo=self.repo)
+        runner.check(land.read_queue(self.paths)['entries'][0])
+        f = runner.facts
+        intent = runner._event('landing', **{'head': f['head'], 'from': f['base'], 'gated_tree': self.head(wt, 'HEAD^{tree}'),
+                                            'gate': gate, 'mode': mode})
+        runner._record(intent)
+        return intent
+
+    def finish_command(self, intent, rc=0):
+        event = dict(intent, event='command-finished', to=self.head(), command={'rc': rc})
+        with self.paths.locked():
+            land._append_ledger(self.paths, event)
+
+    def test_custom_interrupt_before_completion_is_unverified_even_with_matching_tree(self):
+        wt, _ = self.feature('feat-command-interrupt')
+        self.enqueue('command-interrupt', wt)
+        self.configure(command=self.replacement_command(), gate=[PY, '-c', 'pass'])
+        original = land.Lander._run_logged
+        def interrupt(runner, argv, what, env):
+            result = original(runner, argv, what, env)
+            if what == 'land':
+                raise KeyboardInterrupt()
+            return result
+        with mock.patch.object(land.Lander, '_run_logged', interrupt):
+            rc, out, err = self.cli('run', '--json')
+        self.assertEqual(rc, common.EXIT_FAILED, err)
+        event = json.loads(out)['details']['event']
+        self.assertEqual(event['event'], 'landed-unverified')
+        self.assertTrue(event['tree_matches'])
+        self.assertEqual([e['event'] for e in self.events()], ['landing', 'landed-unverified'])
+        self.assertEqual(self.queue_slugs(), [])
+
+    def test_recovery_without_custom_completion_is_unverified(self):
+        wt, _ = self.feature('feat-missing-completion')
+        self.enqueue('missing-completion', wt)
+        self.write_intent(wt, mode='command')
+        git_fixtures.git(self.repo, 'merge', '--ff-only', 'feat-missing-completion')
+        rc, out, err = self.cli('run', '--json')
+        self.assertEqual(rc, common.EXIT_FAILED, err)
+        self.assertEqual(json.loads(out)['details']['event']['event'], 'landed-unverified')
+        self.assertEqual([e['event'] for e in self.events()], ['landing', 'landed-unverified'])
+        self.assertEqual(self.queue_slugs(), [])
+
+    def test_recovery_with_completed_replacement_uses_tree_identity(self):
+        wt, _ = self.feature('feat-recover-replacement')
+        self.enqueue('recover-replacement', wt)
+        self.configure(command=self.replacement_command(), gate=[PY, '-c', 'pass'])
+        original = land.Lander._land
+        def interrupt(runner):
+            original(runner)
+            raise KeyboardInterrupt()
+        with mock.patch.object(land.Lander, '_land', interrupt), \
+                mock.patch.object(land.Lander, '_salvage', side_effect=OSError('journal unavailable')), \
+                self.assertRaises(KeyboardInterrupt):
+            land.Lander(repo=self.repo).run()
+        self.assertEqual(self.events()[-1]['event'], 'command-finished')
+        rc, out, err = self.cli('run', '--json')
+        self.assertEqual(rc, 0, err)
+        event = json.loads(out)
+        self.assertTrue(event['tree_matches'])
+        self.assertFalse(event['contains_gated_commit'])
+        self.assertEqual(event['event'], 'landed')
+        self.assertEqual(self.queue_slugs(), [])
+
+    def test_unverified_recovery_records_once_and_finishes_lost_dequeue(self):
+        wt, _ = self.feature('feat-recover-unverified')
+        self.enqueue('recover-unverified', wt)
+        queued = land.read_queue(self.paths)
+        intent = self.write_intent(wt, mode='command', gate={'rc': 0})
+        git_fixtures.git(self.repo, 'merge', '--ff-only', 'feat-recover-unverified')
+        self.ws.commit(self.repo, 'extra.txt', 'extra\n')
+        self.finish_command(intent)
+        for recorded in (False, True):
+            if recorded:
+                common.write_json(self.paths.queue, queued)
+            before = self.events()
+            with mock.patch.object(common, 'write_json', wraps=common.write_json) as writes:
+                rc, out, err = self.cli('run', '--json')
+            self.assertEqual(rc, common.EXIT_FAILED, err)
+            event = json.loads(out)['details']['event']
+            self.assertEqual(event['event'], 'landed-unverified')
+            self.assertEqual(len([e for e in self.events() if e['event'] == 'landed-unverified']), 1)
+            self.assertEqual(sum(c.args[0] == self.paths.queue for c in writes.call_args_list), 1)
+            self.assertEqual(self.queue_slugs(), [])
+            if recorded:
+                self.assertEqual(self.events(), before)
+
+    def test_recovery_of_nonzero_completed_command_is_unverified_with_matching_tree(self):
+        wt, _ = self.feature('feat-completed-nonzero')
+        self.enqueue('completed-nonzero', wt)
+        intent = self.write_intent(wt, mode='command')
+        git_fixtures.git(self.repo, 'merge', '--ff-only', 'feat-completed-nonzero')
+        self.finish_command(intent, rc=9)
+        rc, out, err = self.cli('run', '--json')
+        self.assertEqual(rc, common.EXIT_FAILED, err)
+        event = json.loads(out)['details']['event']
+        self.assertEqual(event['event'], 'landed-unverified')
+        self.assertTrue(event['tree_matches'])
+        self.assertEqual(event['command']['rc'], 9)
+        self.assertEqual(self.queue_slugs(), [])
+
+    def test_unattributable_recovery_keeps_queue_and_reports_inspection(self):
+        wt, _ = self.feature('feat-unknown')
+        self.enqueue('unknown', wt)
+        intent = self.write_intent(wt, mode='command')
+        target = self.ws.commit(self.repo, 'unrelated.txt', 'other lane\n')
+        for _ in range(2):
+            rc, out, err = self.cli('run', '--json')
+            self.assertEqual(rc, common.EXIT_FAILED, err)
+            event = json.loads(out)['details']['event']
+            self.assertEqual(event['event'], 'interrupted-unknown')
+            self.assertEqual((event['from'], event['to'], event['head']), (intent['from'], target, intent['head']))
+            self.assertIn(f"git log {intent['from']}..{target}", err)
+            self.assertIn('twinlane land dequeue unknown', err)
+            self.assertIn('rebase', err)
+            self.assertEqual(self.queue_slugs(), ['unknown'])
+        git_fixtures.git(wt, 'rebase', 'main')
+        rc, _, err = self.cli('run')
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.events()[-1]['event'], 'landed')
+        self.assertEqual(self.queue_slugs(), [])
+
+    def test_unattributable_salvage_keeps_queue_and_exits_failed(self):
+        wt, _ = self.feature('feat-unknown-interrupt')
+        self.enqueue('unknown-interrupt', wt)
+        def interrupt(runner):
+            self.ws.commit(self.repo, 'unrelated.txt', 'other lane\n')
+            raise KeyboardInterrupt()
+        with mock.patch.object(land.Lander, '_land', interrupt):
+            rc, out, err = self.cli('run', '--json')
+        self.assertEqual(rc, common.EXIT_FAILED, err)
+        self.assertEqual(json.loads(out)['details']['event']['event'], 'interrupted-unknown')
+        self.assertEqual(self.queue_slugs(), ['unknown-interrupt'])
+
+    def test_next_run_recovers_intent_and_dry_run_writes_nothing(self):
+        wt, commits = self.feature('feat-recover')
+        self.enqueue('recover', wt)
+        self.write_intent(wt)
+        git_fixtures.git(self.repo, 'merge', '--ff-only', 'feat-recover')
+        before = self.snapshot(wt)
+        rc, out, err = self.cli('run', '--dry-run')
+        self.assertEqual(rc, 0, err)
+        self.assertIn('would record the interrupted landing', out)
+        self.assertEqual(self.snapshot(wt), before)
+        self.write_holder(slug='recover', pid=4_000_000, created=1)
+        rc, out, err = self.cli('run', '--break', '--reason', 'the old runner exited', '--json')
+        self.assertEqual(rc, 0, err)
+        event = json.loads(out)
+        self.assertEqual((event['event'], event['recovered'], event['to']), ('landed', 'next-run', commits[-1]))
+        self.assertEqual(self.queue_slugs(), [])
+
+    def test_intent_before_merge_records_interrupted_then_lands(self):
+        wt, _ = self.feature('feat-before')
+        self.enqueue('before', wt)
+        self.write_intent(wt)
+        rc, _, err = self.cli('run')
+        self.assertEqual(rc, 0, err)
+        self.assertEqual([e['event'] for e in self.events()], ['landing', 'interrupted', 'landing', 'landed'])
+
+    def test_recovery_finishes_dequeue_without_duplicate_terminal_event(self):
+        wt, _ = self.feature('feat-dequeue')
+        self.enqueue('dequeue', wt)
+        queued = land.read_queue(self.paths)
+        self.assertEqual(self.cli('run')[0], 0)
+        common.write_json(self.paths.queue, queued)  # power loss after terminal append, before queue replace
+        before = self.events()
+        self.assertEqual(self.cli('run')[0], 0)
+        self.assertEqual(self.events(), before)
+        self.assertEqual(self.queue_slugs(), [])
+
+    def test_reusing_slug_for_new_work_does_not_recover_old_landing(self):
+        wt, _ = self.feature('feat-repeat')
+        self.enqueue('repeat', wt)
+        self.assertEqual(self.cli('run')[0], 0)
+        newer = self.ws.commit(wt, 'newer.txt', 'more work\n')
+        self.enqueue('repeat', wt)
+        rc, _, err = self.cli('run')
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.head(), newer)
+        self.assertEqual(len(land.landings(self.repo)), 2)
+
+    def test_salvage_error_keeps_original_interrupt_and_intent(self):
+        wt, _ = self.feature('feat-salvage')
+        self.enqueue('salvage', wt)
+        with mock.patch.object(land.Lander, '_land', side_effect=KeyboardInterrupt), \
+                mock.patch.object(land.Lander, '_salvage', side_effect=OSError('journal unavailable')), \
+                self.assertRaises(KeyboardInterrupt):
+            land.Lander(repo=self.repo).run()
+        self.assertEqual(self.events()[-1]['event'], 'landing')
+        self.assertEqual(self.queue_slugs(), ['salvage'])
+
+    def test_already_landed_head_is_dequeued_and_next_head_is_available(self):
+        wt, _ = self.feature('feat-already')
+        second, _ = self.feature('feat-next')
+        self.enqueue('already', wt)
+        self.enqueue('next', second)
+        git_fixtures.git(self.repo, 'merge', '--ff-only', 'feat-already')
+        before = self.snapshot(wt)
+        rc, out, err = self.cli('run', '--dry-run')
+        self.assertEqual(rc, 0, err)
+        self.assertIn('would dequeue already', out)
+        self.assertEqual(self.snapshot(wt), before)
+        rc, out, err = self.cli('run')
+        self.assertEqual(rc, 0, err)
+        self.assertIn('already-landed', out)
+        self.assertEqual(self.queue_slugs(), ['next'])
+        self.assertEqual(self.events()[-1]['event'], 'already-landed')
+
+    def test_command_handles_wip_lists_paths_but_staged_changes_still_refuse(self):
+        wt, _ = self.feature('feat-wip', {'shared.txt': 'feature\n'})
+        self.enqueue('wip', wt)
+        self.ws.write(self.repo, 'shared.txt', 'peer edit\n')
+        self.assertEqual(self.cli('run')[0], common.EXIT_REFUSED)
+        output = self.ws.path('wip-env.json')
+        script = self.script('carry_wip.py', '''
+import json, os, subprocess, sys
+p = os.environ['TWINLANE_LAND_WIP_FILE']
+with open(p) as h: paths = json.load(h)
+with open(sys.argv[1], 'w') as h: json.dump({'file': p, 'paths': paths}, h)
+repo = os.environ['TWINLANE_LAND_REPO']
+# The project command preserves peer content before its merge.
+for path in paths:
+    with open(os.path.join(repo, path)) as h: content = h.read()
+    with open(sys.argv[1] + '.peer', 'w') as h: h.write(content)
+    subprocess.run(['git', '-C', repo, 'restore', '--', path], check=True)
+subprocess.run(['git', '-C', repo, 'merge', '--ff-only', os.environ['TWINLANE_LAND_HEAD']], check=True)
+''')
+        self.configure(command=[PY, script, output], command_handles_wip=True)
+        git_fixtures.git(self.repo, 'add', 'shared.txt')
+        self.assertEqual(self.cli('run')[0], common.EXIT_REFUSED)
+        git_fixtures.git(self.repo, 'restore', '--staged', 'shared.txt')
+        rc, _, err = self.cli('run')
+        self.assertEqual(rc, 0, err)
+        with open(output) as handle:
+            value = json.load(handle)
+        self.assertEqual(value['paths'], ['shared.txt'])
+        self.assertTrue(os.path.isfile(value['file']))
+        with open(output + '.peer') as handle:
+            self.assertEqual(handle.read(), 'peer edit\n')
+
     def test_enqueue_is_fifo_and_idempotent_per_slug(self):
         wt_a, _ = self.feature('feat-a')
         wt_b, _ = self.feature('feat-b')
@@ -404,7 +827,7 @@ class Land(unittest.TestCase):
         (recorded,) = land.landings(self.repo, 'a')
         self.assertEqual((recorded['from'], recorded['to'], recorded['commits']), (base, commits[-1], commits))
         rc, out, _ = self.cli('log', 'a', '--json')
-        self.assertEqual([e['event'] for e in json.loads(out)['events']], ['landed'])
+        self.assertEqual([e['event'] for e in json.loads(out)['events']], ['landing', 'landed'])
 
     def test_target_moved_without_rebase_refuses(self):
         wt, commits = self.feature('feat-a')
@@ -499,7 +922,7 @@ class Land(unittest.TestCase):
         self.assertEqual(self.head(), commits[-1])
         with open(os.path.join(self.repo, 'other.txt'), encoding='utf-8') as handle:
             self.assertEqual(handle.read(), 'peer edit elsewhere\n')
-        self.assertEqual([e['event'] for e in self.events()], ['refused'] * 3 + ['landed'])
+        self.assertEqual([e['event'] for e in self.events()], ['refused'] * 3 + ['landing', 'landed'])
 
     def test_project_land_command_argv_and_range_recomputed(self):
         wt, commits = self.feature('feat-a')
@@ -507,7 +930,7 @@ class Land(unittest.TestCase):
         base = self.head()
         out_path = self.ws.path('argv.json')
         script = self.script('land_cmd.py', LAND_COMMAND)
-        self.configure(gate=[PY, '-c', 'pass'], command=[PY, script, '{repo}', '{worktree}', '{branch}', '{slug}',
+        self.configure(command=[PY, script, '{repo}', '{worktree}', '{branch}', '{slug}',
                                                           '{target}', '{base}', '{source_commit}', out_path])
         rc, out, err = self.cli('run', '--json')
         self.assertEqual(rc, 0, err)

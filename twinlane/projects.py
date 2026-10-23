@@ -25,10 +25,10 @@ PLACEHOLDERS = ('repo', 'worktree', 'branch', 'slug', 'target', 'manifest', 'sou
 # command must not silently leave the step unconfigured.
 PROJECT_KEYS = {
     'land': ('target', 'gate', 'command', 'command_rebases', 'heartbeat_s', 'heartbeat_stale_s',
-             'gate_timeout_s'),
+             'gate_timeout_s', 'require_gate', 'command_handles_wip', 'archive_worktree'),
     'ship': ('dry_run_command', 'command', 'dry_run_max_age_s'),
     'wt': ('deps_dirs', 'root', 'setup_command', 'remove_command', 'link_roots', 'stale_days',
-           'prune_min_age_s'),
+           'prune_min_age_s', 'behind_max', 'merged_min_age_s', 'preflight'),
 }
 TOP_KEYS = tuple(PROJECT_KEYS) + ('test',)
 COMMAND_KEYS = {'land': ('gate', 'command'), 'ship': ('dry_run_command', 'command'),
@@ -37,10 +37,11 @@ LIST_KEYS = {'wt': ('deps_dirs', 'link_roots')}
 # (section, key) -> smallest allowed value; the number must be finite and not a bool.
 NUMBER_KEYS = {
     ('land', 'heartbeat_s'): 1, ('land', 'heartbeat_stale_s'): 1, ('land', 'gate_timeout_s'): 1,
-    ('ship', 'dry_run_max_age_s'): 1, ('wt', 'stale_days'): 0, ('wt', 'prune_min_age_s'): 0,
+    ('ship', 'dry_run_max_age_s'): 1, ('wt', 'stale_days'): 0, ('wt', 'prune_min_age_s'): 0, ('wt', 'behind_max'): 0, ('wt', 'merged_min_age_s'): 0,
     ('best_of', 'max_contestants'): 1, ('resume', 'max_batch'): 1,
 }
 _PLACEHOLDER = re.compile(r'\{([A-Za-z_][A-Za-z0-9_]*)\}')
+BOOL_LAND_KEYS = ('command_rebases', 'require_gate', 'command_handles_wip')
 
 
 class ProjectError(ValueError):
@@ -233,10 +234,18 @@ def _validate(cfg: dict) -> None:
         if not _is_number(value) or value < low:
             raise ProjectError(f'{section}.{key} must be a number >= {low}')
     land = cfg['land']
+    for section, key, allowed in (('land', 'archive_worktree', ('off', 'suggest', 'apply')), ('wt', 'preflight', ('refuse', 'warn', 'off'))):
+        value = cfg[section].get(key)
+        if value is not None and value not in allowed:
+            raise ProjectError(f'{section}.{key} must be one of {allowed}')
     if land.get('target') is not None and (not isinstance(land['target'], str) or not land['target'].strip()):
         raise ProjectError('land.target must be a branch name')
-    if not isinstance(land.get('command_rebases'), bool):
-        raise ProjectError('land.command_rebases must be true or false')
+    for key in BOOL_LAND_KEYS:
+        if not isinstance(land.get(key), bool):
+            raise ProjectError(f'land.{key} must be true or false')
+    if land.get('command_handles_wip') and not land.get('command'):
+        raise ProjectError('land.command_handles_wip needs land.command '
+                           '(the built-in fast-forward cannot carry peer edits)')
     if cfg['wt'].get('root') is not None and not (isinstance(cfg['wt']['root'], str) and cfg['wt']['root'].strip()):
         raise ProjectError('wt.root must be a directory path')
 
@@ -275,7 +284,9 @@ def resolve(repo_dir: str | None = None, policy: dict | None = None) -> tuple[st
             own = _check_section(section, entry.get(section, {}), PROJECT_KEYS[section])
             merged = common._merge_config(base, own)
             for key in PROJECT_KEYS[section]:
-                merged.setdefault(key, False if key == 'command_rebases' else None)
+                defaults = {('wt', 'merged_min_age_s'): 3600, ('wt', 'behind_max'): 50,
+                            ('wt', 'preflight'): 'refuse', ('land', 'archive_worktree'): 'suggest'}
+                merged.setdefault(key, defaults.get((section, key), False if key in BOOL_LAND_KEYS else None))
             cfg[section] = merged
         else:
             cfg[section] = dict(base)

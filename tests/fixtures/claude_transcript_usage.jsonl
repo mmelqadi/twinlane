@@ -1,0 +1,3 @@
+{"type":"assistant","timestamp":"2026-01-01T12:00:00Z","message":{"model":"demo","usage":{"input_tokens":1200,"cache_creation_input_tokens":1000,"cache_read_input_tokens":140000}}}
+{"type":"assistant","isSidechain":true,"message":{"usage":{"input_tokens":999999}}}
+{"type":"assistant","message":{"model":"<synthetic>","usage":{"input_tokens":999999}}}

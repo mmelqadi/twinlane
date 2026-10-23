@@ -59,6 +59,13 @@ class BoardBase(unittest.TestCase):
         common.JOBS = os.path.join(self.tmp, 'jobs')
         common.BATONS = os.path.join(self.tmp, 'batons')
         common.ensure_dirs()
+        config = mock.patch.dict(os.environ, {'TWINLANE_CONFIG': os.path.join(self.tmp, 'config.json')})
+        config.start()
+        self.addCleanup(config.stop)
+        for name, path in (('CLAUDE_PROJECTS', 'claude'), ('CODEX_SESSIONS', 'codex')):
+            session_dirs = mock.patch.object(baton, name, os.path.join(self.tmp, path))
+            session_dirs.start()
+            self.addCleanup(session_dirs.stop)
         self.policy = common.load_policy()
 
     def tearDown(self):
@@ -164,7 +171,7 @@ class CollectTests(BoardBase):
         data = board.collect(policy=self.policy)
         self.assertFalse(data['meters']['cached'])
         self.assertEqual(data['meters']['routes'], {})
-        self.assertIn('no cached meter', ' '.join(a['text'] for a in data['attention']))
+        self.assertIn('no cached meter', ' '.join(a['text'] for a in data['signals']))
         self.assertIn('route now: n/a', board.render_text(data))
 
     def test_stale_reading_and_stop_line_are_attention_and_change_routes(self):
@@ -172,14 +179,14 @@ class CollectTests(BoardBase):
         data = board.collect(policy=self.policy)
         m = data['meters']
         self.assertEqual(m['codex']['status'], 'unknown')       # stale reading cannot keep reading "ok"
-        text = ' '.join(a['text'] for a in data['attention'])
+        text = ' '.join(a['text'] for a in data['signals'])
         self.assertIn('claude STOP (87%, stop at 85%)', text)
         self.assertIn('codex UNKNOWN', text)
         self.assertTrue(m['routes']['code']['refused'])           # claude stop + codex unknown
 
     def test_extra_usage_and_credits_flags(self):
         self.write_meter(claude={'extra_usage_enabled': True}, codex={'on_credits': True})
-        text = ' '.join(a['text'] for a in board.collect(policy=self.policy)['attention'])
+        text = ' '.join(a['text'] for a in board.collect(policy=self.policy)['signals'])
         self.assertIn('extra usage is ON', text)
         self.assertIn('paid credits', text)
 
@@ -192,7 +199,7 @@ class CollectTests(BoardBase):
         self.write_meter(claude=held, codex={'status': 'out', 'max_pct': 100.0})
         data = board.collect(policy=self.policy)
         self.assertEqual(data['meters']['claude']['hold'], 'extra usage state unknown')
-        text = ' '.join(a['text'] for a in data['attention'])
+        text = ' '.join(a['text'] for a in data['signals'])
         self.assertIn('claude UNKNOWN', text)
         self.assertIn('extra usage state unknown', text)
         self.assertTrue(data['meters']['routes']['code']['refused'])
@@ -286,7 +293,7 @@ class CollectTests(BoardBase):
         self.assertEqual(done['cccc']['verdict'], 'MERGE AFTER FIXES')
         self.assertEqual(done['cccc']['served'], 'claude-sonnet-5-5')
         self.assertEqual(done['cccc']['requested'], 'claude-sonnet-5-5')
-        texts = [a['text'] for a in data['attention']]
+        texts = [a['text'] for a in data['signals']]
         joined = '\n'.join(texts)
         self.assertIn('1 finished, not yet read: MERGE AFTER FIXES x1', joined)
         self.assertIn('failed: 20261009-090001-claude-dddd', joined)
@@ -294,7 +301,7 @@ class CollectTests(BoardBase):
         self.assertIn('limit_hit: 20261009-090003-claude-ffff', joined)
         self.assertIn('20261009-100001-codex-bbbb at 83% of its timeout', joined)
         self.assertNotIn('gggg', joined)                           # older than the 24 h window
-        self.assertIn('gggg', '\n'.join(a['text'] for a in board.collect(show_all=True, policy=self.policy)['attention']))
+        self.assertIn('gggg', '\n'.join(a['text'] for a in board.collect(show_all=True, policy=self.policy)['signals']))
 
     def test_baton_live_count_uses_unfinished_jobs_not_only_pointers(self):
         # A size-trimmed baton keeps 10 in-flight pointers but lists all 90 live jobs in jobs[]: the board counts 90.
@@ -333,7 +340,7 @@ class CollectTests(BoardBase):
         self.assertEqual({r['id'][-4:]: r['status'] for r in data['jobs']['live']}, {'uuuu': 'unknown'})
         self.assertEqual({r['id'][-4:]: r['status'] for r in data['jobs']['finished']}, {'llll': 'lost'})
         self.assertEqual(data['jobs']['unreadable'], [])
-        text = '\n'.join(a['text'] for a in data['attention'])
+        text = '\n'.join(a['text'] for a in data['signals'])
         self.assertIn('unknown: 20261009-100000-claude-uuuu', text)
         self.assertIn('check from the host', text.split('unknown: 20261009-100000-claude-uuuu')[1].splitlines()[0])
         self.assertNotIn('lost: 20261009-100000-claude-uuuu', text)
@@ -348,7 +355,8 @@ class CollectTests(BoardBase):
         self.assertEqual(rows['alpha']['in_flight'], ['j1', 'j2'])
         self.assertEqual(rows['alpha']['approvals_pending'], ['send the SMS blast'])
         self.assertLessEqual(len(rows['beta']['next_action']), 100)
-        self.assertIn('approval pending [alpha]: send the SMS blast', [a['text'] for a in data['attention']])
+        self.assertTrue(any(a['kind'] == 'inbox' and 'alpha:H1' in a['id'] and 'send the SMS blast' in a['text']
+                            for a in data['attention']))
 
 
 class RenderTests(BoardBase):
@@ -374,7 +382,7 @@ class RenderTests(BoardBase):
         self.assertLess(out.index('== ATTENTION'), out.index('== JOBS'))
         self.assertLess(out.index('== JOBS'), out.index('== BATONS'))
         self.assertLess(out.index('== BATONS'), out.index('== WORKTREES'))
-        self.assertIn('+3 more (--all)', out)                     # 9 live jobs, cap 6
+        self.assertIn(f"+{9 - board.CAPS['live']} more (--all)", out)  # compact cap; --all exposes all 9
         rc, full = self.run_board('--all')
         self.assertGreater(len(full.splitlines()), len(lines))
         self.assertNotIn('more (--all)', full)
@@ -407,14 +415,15 @@ class RenderTests(BoardBase):
                 self.assertIn('...', out)                             # clipped with ASCII dots, not an ellipsis char
                 self.assertNotIn('\u2026', out)
                 self.assertIn('\u0645\u0631\u062d\u0628\u0627', out)   # text from batons passes through as is
-                self.assertEqual(out.replace('\u0645\u0631\u062d\u0628\u0627', '').isascii(), True)
+                # The capacity line deliberately uses middle-dot separators.
+                self.assertEqual(out.replace('\u0645\u0631\u062d\u0628\u0627', '').replace('·', '').isascii(), True)
 
     def test_json_has_every_section(self):
         self.populate(live=2)
         rc, out = self.run_board('--json')
         self.assertEqual(rc, 0)
         data = json.loads(out)
-        self.assertEqual(set(data), {'generated_at', 'all', 'meters', 'attention', 'jobs', 'batons', 'worktrees'})
+        self.assertEqual(set(data), {'generated_at', 'all', 'meters', 'attention', 'signals', 'sessions', 'lanes', 'jobs', 'batons', 'worktrees', 'waiting', 'capacity'})
         self.assertEqual(set(data['jobs']), {'live', 'finished', 'unreadable', 'scanned'})
         self.assertNotIn('_all_finished', data['jobs'])
 
@@ -740,7 +749,7 @@ class RobustnessTests(BoardBase):
                          started_ago=500, ended_ago=400)
         data = board.collect(policy=self.policy)
         self.assertEqual([(r['id'], r['status']) for r in data['jobs']['live']], [(old, 'orphaned')])
-        self.assertIn(f'orphaned: {old}', ' '.join(a['text'] for a in data['attention']))
+        self.assertIn(f'orphaned: {old}', ' '.join(a['text'] for a in data['signals']))
 
     def test_a_long_job_created_long_ago_that_failed_recently_is_in_attention(self):
         # Round-3 finding: the shortcut skipped by CREATION age; a 29 h-old job that failed 1 h ago vanished.
@@ -750,12 +759,12 @@ class RobustnessTests(BoardBase):
         for i in range(board.FINISHED_DEFAULT + 2):
             self.add_job(jid_ago(600 - i, f'n{i:03d}'), 'done', started_ago=600, ended_ago=500, final='MERGE')
         data = board.collect(policy=self.policy)
-        self.assertIn(old, ' '.join(a['text'] for a in data['attention']))
+        self.assertIn(old, ' '.join(a['text'] for a in data['signals']))
         # a job that both started and ended outside the window is still skipped (the shortcut still works)
         older = jid_ago(60 * 3600, 'gone')
         self.add_job(older, 'failed', started_ago=60 * 3600, ended_ago=59 * 3600)
         data = board.collect(policy=self.policy)
-        self.assertNotIn(older, ' '.join(a['text'] for a in data['attention']))
+        self.assertNotIn(older, ' '.join(a['text'] for a in data['signals']))
 
     def test_pending_approval_is_never_pushed_off_the_screen(self):
         self.write_meter()
@@ -763,29 +772,30 @@ class RobustnessTests(BoardBase):
             self.add_job(f'20261009-09{i:02d}00-claude-f{i:03x}', 'failed', started_ago=900, ended_ago=800)
         self.add_baton('needs-ok', approvals=['email the mailing list'])
         data = board.collect(policy=self.policy)
-        self.assertEqual(data['attention'][0]['kind'], 'approval')            # priority, not discovery order
+        self.assertEqual(data['attention'][0]['kind'], 'inbox')
         rc, out = self.run_board()
-        self.assertIn('approval pending [needs-ok]: email the mailing list', out)
+        self.assertIn('needs-ok:H1: ok? [records: email the mailing list]', out)
         self.assertIn('more (--all)', out)                                    # the capped rest says how many
-        self.assertEqual(sum(1 for line in out.splitlines() if line.startswith('! ')), board.CAPS['attention'])
+        self.assertEqual(sum(1 for line in out.splitlines() if line.startswith('! ')), 1)
         rc, md = self.run_board('--md')
         self.assertIn('email the mailing list', md)
         self.assertIn('more (`--all`)', md)
 
-    def test_engine_at_stop_outranks_failures_and_p0_ignores_the_cap(self):
+    def test_engine_stop_stays_in_signals_and_human_questions_are_capped(self):
         self.write_meter(claude={'status': 'stop', 'max_pct': 90.0})
         for i in range(3):
             self.add_baton(f'b{i}', approvals=[f'ok{i}a', f'ok{i}b', f'ok{i}c'])      # 9 approvals > cap of 6
         for i in range(4):
             self.add_job(f'20261009-09{i:02d}00-claude-f{i:03x}', 'failed', started_ago=900, ended_ago=800)
         data = board.collect(policy=self.policy)
-        kinds = [a['kind'] for a in data['attention']]
-        self.assertEqual(set(kinds[:10]), {'approval', 'engine'})
+        kinds = [a['kind'] for a in data['signals']]
+        self.assertEqual(kinds[0], 'engine')
+        self.assertEqual({a['kind'] for a in data['attention']}, {'inbox'})
         _, out = self.run_board()
-        self.assertEqual(sum('approval pending' in line for line in out.splitlines()), 9)
+        self.assertEqual(sum(1 for line in out.splitlines() if line.startswith('! ')), 5)
         self.assertIn('claude STOP', out)
-        self.assertNotIn('failed:', out)                                      # failures pushed below the cap, counted in "+N more"
-        self.assertIn('+4 more (--all)', out)
+        self.assertIn('failed:', out)  # job problems remain visible in signals
+        self.assertIn('+4 hidden (twinlane inbox --all)', out)
 
     def test_malformed_baton_is_labelled_not_fatal(self):
         self.write_meter()
@@ -807,7 +817,7 @@ class RobustnessTests(BoardBase):
         self.assertEqual(set(rows), {'good', 'bad', 'worse', 'broken'})
         self.assertEqual(rows['bad']['problems'], ['owner', 'progress', 'holds.approvals_pending'])
         self.assertEqual(rows['worse']['problems'], ['not a JSON object'])
-        text = '\n'.join(a['text'] for a in data['attention'])
+        text = '\n'.join(a['text'] for a in data['signals'])
         self.assertIn('malformed baton [bad]: owner, progress, holds.approvals_pending', text)
         self.assertIn('malformed baton [worse]', text)
         self.assertIn('malformed baton [broken]', text)
@@ -928,12 +938,12 @@ class RobustnessTests(BoardBase):
         data = board.collect(policy=self.policy)
         self.assertEqual(data['jobs']['live'], [])
         self.assertEqual({r['id']: r['problems'] for r in data['jobs']['unreadable']}, want)
-        text = '\n'.join(a['text'] for a in data['attention'])
+        text = '\n'.join(a['text'] for a in data['signals'])
         for jid, problems in want.items():
             self.assertIn(f'unreadable job {jid}: {problems[0]}', text)
         _, out = self.run_board()
         self.assertIn('unreadable 5', out)
-        self.assertNotIn(' queued ', out)
+        self.assertNotIn(' queued ', '\n'.join(line for line in out.splitlines() if not line.startswith('writers ')))
 
     def test_attention_covers_an_old_failure_behind_many_newer_finished_jobs(self):
         self.write_meter()
@@ -943,7 +953,7 @@ class RobustnessTests(BoardBase):
             self.add_job(jid_ago(600 + i, f'd{i:03x}'), 'done', started_ago=600 + i, ended_ago=300, final='MERGE\nx')
         data = board.collect(policy=self.policy)
         self.assertEqual(len(data['jobs']['finished']), board.FINISHED_DEFAULT)      # only the shown rows are capped
-        text = '\n'.join(a['text'] for a in data['attention'])
+        text = '\n'.join(a['text'] for a in data['signals'])
         self.assertIn(old, text)
         self.assertIn('failed', text)
         self.assertEqual(board.collect(policy=self.policy, show_all=True)['jobs']['scanned'], 102)
@@ -969,8 +979,8 @@ class RobustnessTests(BoardBase):
         self.assertEqual([(r['id'], r['problems']) for r in data['jobs']['unreadable']],
                          [(jid, ['status.json missing'])])
         self.assertEqual([r['id'] for r in data['jobs']['live']], [fresh])      # inside the grace period: queued
-        self.assertIn(f'unreadable job {jid}: status.json missing', '\n'.join(a['text'] for a in data['attention']))
-        self.assertNotIn(fresh, '\n'.join(a['text'] for a in data['attention']))
+        self.assertIn(f'unreadable job {jid}: status.json missing', '\n'.join(a['text'] for a in data['signals']))
+        self.assertNotIn(fresh, '\n'.join(a['text'] for a in data['signals']))
 
     def test_a_job_dir_still_being_created_is_not_flagged(self):
         self.write_meter()
@@ -985,7 +995,7 @@ class CollectedMarkerTests(BoardBase):
         jid = '20261009-090000-claude-cccc'
         self.add_job(jid, 'done', final='MERGE\nbody', started_ago=900, ended_ago=600)
         data = board.collect(policy=self.policy)
-        self.assertIn('1 finished, not yet read', '\n'.join(a['text'] for a in data['attention']))
+        self.assertIn('1 finished, not yet read', '\n'.join(a['text'] for a in data['signals']))
         self.assertFalse(data['jobs']['finished'][0]['collected'])
         self.assertFalse(os.path.exists(os.path.join(common.JOBS, jid, 'collected')))   # the board never writes it
         self.assertIn('(unread)', self.run_board()[1])
@@ -997,7 +1007,7 @@ class CollectedMarkerTests(BoardBase):
             self.assertIsNotNone(common.parse_time(h.read().strip()))
         data = board.collect(policy=self.policy)
         self.assertTrue(data['jobs']['finished'][0]['collected'])
-        self.assertNotIn('not yet read', '\n'.join(a['text'] for a in data['attention']))
+        self.assertNotIn('not yet read', '\n'.join(a['text'] for a in data['signals']))
         self.assertNotIn('(unread)', self.run_board()[1])
 
     def test_result_without_a_receipt_does_not_mark(self):
@@ -1060,13 +1070,13 @@ class LostTogetherTests(BoardBase):
                 os.utime(os.path.join(top, f), (stamp, stamp))
 
     def texts(self):
-        return [a['text'] for a in board.collect(policy=self.policy)['attention']]
+        return [a['text'] for a in board.collect(policy=self.policy)['signals']]
 
     def test_four_jobs_lost_within_15_seconds_are_one_line(self):
         self.write_meter()
         ids = [self.add_lost(f'l{i}00', i * 5, started_ago=900 - i)[0] for i in range(4)]
         data = board.collect(policy=self.policy)
-        texts = [a['text'] for a in data['attention']]
+        texts = [a['text'] for a in data['signals']]
         lost_lines = [t for t in texts if 'lost' in t]
         self.assertEqual(len(lost_lines), 1, lost_lines)
         line = lost_lines[0]
@@ -1075,7 +1085,7 @@ class LostTogetherTests(BoardBase):
             self.assertIn(jid, line)
         self.assertIn('a sign-out, shutdown or sleep can end every runner; rerun each with twinlane run --continue-job ID',
                       line)
-        item = [a for a in data['attention'] if 'lost together' in a['text']][0]
+        item = [a for a in data['signals'] if 'lost together' in a['text']][0]
         self.assertEqual((item['priority'], item['kind']), (board.P_FAIL, 'problem'))
         self.assertEqual(sorted(item['ids']), sorted(ids))
         # grouping never hides a job: every row stays in the data and in --json
@@ -1144,8 +1154,9 @@ class LostTogetherTests(BoardBase):
         self.assertEqual(len(texts), 1 + 1 + 5)                         # STOP, one group line, five failures
         self.assertTrue(texts[0].startswith('claude STOP'))             # P0 first; the group is P2, after it
         _, out = self.run_board()
-        self.assertEqual(sum(1 for line in out.splitlines() if line.startswith('! ')), board.CAPS['attention'])
-        self.assertIn('+1 more (--all)', out)                           # 7 items, cap 6: counted as items, not jobs
+        self.assertEqual(sum(1 for line in out.splitlines() if line.startswith('! ')), 0)
+        self.assertIn('== SIGNALS (7)', out)
+        self.assertIn('4 jobs lost together', out)
 
     def test_a_lost_job_with_no_dated_files_is_not_grouped(self):
         self.write_meter()
@@ -1168,3 +1179,16 @@ class LostTogetherTests(BoardBase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class FailureErrorTests(BoardBase):
+    def test_failed_job_attention_includes_redacted_error(self):
+        self.write_meter()
+        jid = jid_ago(120, 'fail', 'codex')
+        self.add_job(jid, 'failed', engine='codex', extra={'error': 'model X requires a newer version of Codex ' + SECRET})
+        with mock.patch.object(baton, 'CLAUDE_PROJECTS', os.path.join(self.tmp, 'claude')), \
+                mock.patch.object(baton, 'CODEX_SESSIONS', os.path.join(self.tmp, 'codex')):
+            data = board.collect(policy=self.policy)
+        text = '\n'.join(a['text'] for a in data['signals'])
+        self.assertIn('- model X requires a newer version of Codex', text)
+        self.assertNotIn(SECRET, text)

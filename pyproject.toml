@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "twinlane"
-version = "0.2.0"
+version = "0.3.0.dev0"
 description = "Run Claude Code and Codex together on included subscriptions"
 readme = "README.md"
 requires-python = ">=3.9"

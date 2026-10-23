@@ -18,8 +18,9 @@ import os
 import re
 import sys
 import time
+from contextlib import nullcontext, contextmanager, ExitStack
 
-from twinlane import common
+from twinlane import common, observations
 
 # Tests point these at fixture dirs.
 CLAUDE_PROJECTS = os.path.join(common.CLAUDE_DIR, 'projects')
@@ -29,6 +30,8 @@ SLUG_RE = re.compile(r'^[a-z0-9-]{1,60}$')
 HISTORY_KEEP = 50
 REASONS = ('checkpoint', 'limit', 'handoff', 'job', 'user')
 ENGINES = ('claude', 'codex')
+STATES = ('active', 'review', 'landed', 'closed', 'waiting-on-you', 'waiting-external', 'parked')
+SESSION_RE = re.compile(r'^[A-Za-z0-9-]{6,80}$')
 ACCEPT_STATUSES = ('not_run', 'fail', 'pass', 'blocked', 'n/a')
 EVIDENCE_KINDS = ('source', 'test', 'review', 'integration', 'deploy', 'prod')
 LIVE_JOB_STATUSES = ('queued', 'running', 'orphaned', 'unknown')
@@ -185,13 +188,23 @@ class BatonError(Exception):
 # ---------------------------------------------------------------- paths / slugs
 
 def valid_slug(slug) -> bool:
-    return isinstance(slug, str) and bool(SLUG_RE.match(slug))
+    return isinstance(slug, str) and bool(SLUG_RE.fullmatch(slug))
 
 
 def require_slug(slug) -> str:
     if not valid_slug(slug):
         raise BatonError(f'invalid slug {slug!r}: use 1-60 chars of a-z, 0-9 and -')
     return slug
+
+
+def require_waiting_on(value):
+    if isinstance(value, str):
+        if value in ('lead', 'user', 'none'):
+            return value
+        kind, _, ident = value.partition(':')
+        if kind == 'job' and JOB_ID_RE.fullmatch(ident) or kind == 'lane' and valid_slug(ident):
+            return value
+    raise BatonError('waiting_on must be lead, user, job:<job id>, lane:<slug>, or none')
 
 
 def baton_path(slug: str) -> str:
@@ -207,6 +220,10 @@ def brief_path(slug: str) -> str:
 
 
 def norm_dir(path: str | None) -> str | None:
+    return observations.once(('norm-dir', path), lambda: _norm_dir(path))
+
+
+def _norm_dir(path: str | None) -> str | None:
     """Absolute, OS-native directory path; accepts Git Bash style /c/x/y on Windows."""
     if not path:
         return None
@@ -227,8 +244,8 @@ def same_dir(a, b) -> bool:
 def under_dir(child, parent) -> bool:
     if not child or not parent:
         return False
-    c = common.canon_path(str(child))
-    p = common.canon_path(str(parent))
+    c = observations.once(('canon', str(child)), lambda: common.canon_path(str(child)))
+    p = observations.once(('canon', str(parent)), lambda: common.canon_path(str(parent)))
     return c == p or c.startswith(p.rstrip('\\/') + os.sep)
 
 
@@ -247,6 +264,8 @@ def redact(text) -> str:
 def empty_baton(slug: str) -> dict:
     return {
         'baton_version': 1, 'slug': require_slug(slug), 'updated_at': None, 'reason': 'user',
+        'state': 'active', 'external': None, 'progress_at': None, 'bound_sessions': [],
+        'waiting_on': 'none', 'waiting_since': None,
         'owner': {'engine': None, 'session_id': None, 'model': None},
         'task': {'tracker_id': None, 'title': None, 'goal': None, 'acceptance': []},
         'repo': {'root': None, 'worktree': None, 'branch': None, 'head': None, 'base': None, 'pushed': None,
@@ -269,6 +288,15 @@ def _merge_defaults(baton: dict) -> dict:
             for kk, vv in v.items():
                 baton[k].setdefault(kk, vv)
     _legacy_tracker(baton)
+    # Give legacy holds stable ids in memory; only an explicit write persists them.
+    holds = baton.get('holds')
+    if isinstance(holds, dict):
+        pending = holds.get('approvals_pending')
+        if isinstance(pending, list):
+            pending[:] = [{'action': h, 'ask_text': h} if isinstance(h, str) else h for h in pending]
+        for h in holds.get('approvals_pending') or []:
+            if isinstance(h, dict) and not h.get('id'):
+                h['id'] = _next_hold_id(holds)
     return baton
 
 
@@ -292,13 +320,14 @@ def load(slug: str) -> dict | None:
     if not isinstance(data, dict):
         return None
     data.setdefault('slug', slug)
+    require_waiting_on(data.get('waiting_on', 'none'))
     return _merge_defaults(data)
 
 
-def baton_lock(slug: str):
+def baton_lock(slug: str, timeout_s=60):
     """Per-slug OS lock around every load-modify-save, so a job receipt, a snap and a handoff
     writing the same baton never drop each other's update. Not re-entrant: take it once."""
-    return common.file_lock(os.path.join(common.BATONS, f'{slug}.lock'), timeout_s=60)
+    return common.file_lock(os.path.join(common.BATONS, f'{slug}.lock'), timeout_s=timeout_s)
 
 
 def load_for_update(slug: str) -> dict | None:
@@ -314,21 +343,34 @@ def validate(baton) -> list[str]:
     if not isinstance(baton, dict):
         return ['baton must be a JSON object']
     errs = []
+    try:
+        require_waiting_on(baton.get('waiting_on', 'none'))
+    except BatonError as e:
+        errs.append(str(e))
     if baton.get('baton_version') != 1:
         errs.append('baton_version must be 1')
     if not valid_slug(baton.get('slug')):
         errs.append('slug must match [a-z0-9-]{1,60}')
     if baton.get('reason') is not None and baton.get('reason') not in REASONS:
         errs.append(f'reason must be one of {REASONS}')
+    if baton.get('state', 'active') not in STATES:
+        errs.append(f'state must be one of {STATES}')
     for key in ('owner', 'task', 'repo', 'progress', 'holds', 'meter_at_write'):
         if key in baton and not isinstance(baton[key], dict):
             errs.append(f'{key} must be an object')
-    for key in ('decisions', 'rejected', 'evidence', 'jobs', 'read_first', 'do_not', 'verify_before_act'):
+    for key in ('decisions', 'rejected', 'evidence', 'jobs', 'read_first', 'do_not', 'verify_before_act', 'bound_sessions'):
         if key in baton and not isinstance(baton[key], list):
             errs.append(f'{key} must be a list')
     owner = baton.get('owner') if isinstance(baton.get('owner'), dict) else {}
     if owner.get('engine') not in (None,) + ENGINES:
         errs.append(f'owner.engine must be one of {ENGINES}')
+    bindings = baton.get('bound_sessions', [])
+    if not isinstance(bindings, list) or len(bindings) > 8 or any(
+            not isinstance(e, dict) or not isinstance(e.get('id'), str) or not SESSION_RE.fullmatch(e['id'])
+            or e.get('engine') not in (None,) + ENGINES for e in bindings):
+        errs.append('bound_sessions needs at most 8 valid session entries')
+    if not isinstance((baton.get('holds') if isinstance(baton.get('holds'), dict) else {}).get('answers', []), list):
+        errs.append('holds.answers must be a list')
     task = baton.get('task') if isinstance(baton.get('task'), dict) else {}
     acc = task.get('acceptance', [])
     if not isinstance(acc, list):
@@ -354,7 +396,7 @@ def validate(baton) -> list[str]:
         errs.append('read_first holds at most 5 paths')
     def check_text(value, path='baton'):
         if isinstance(value, str):
-            limit = BATON_QUOTE_MAX_CHARS if path.endswith('.quote') else BATON_FIELD_MAX_CHARS
+            limit = BATON_QUOTE_MAX_CHARS if path.endswith(('.quote', '.words')) else BATON_FIELD_MAX_CHARS
             if len(value) > limit:
                 errs.append(f'{path} exceeds {limit} characters; keep pointers, not prose')
         elif isinstance(value, dict):
@@ -434,15 +476,20 @@ def _apply_caps(baton: dict) -> None:
     baton['jobs'] = [j for j in jobs if id(j) not in dropped]  # every unfinished job stays, in order
 
 
-def _clip_strings(value, path='baton'):
+def _clip_strings(value, path='baton', originals=None):
     """Clip every over-long string in place (system writes never refuse on length)."""
     items = value.items() if isinstance(value, dict) else enumerate(value) if isinstance(value, list) else ()
     for key, item in list(items):
         sub = f'{path}.{key}' if isinstance(value, dict) else f'{path}[{key}]'
         if isinstance(item, str):
-            value[key] = common.clip(item, BATON_QUOTE_MAX_CHARS if sub.endswith('.quote') else BATON_FIELD_MAX_CHARS)
+            limit = BATON_QUOTE_MAX_CHARS if sub.endswith(('.quote', '.words')) else BATON_FIELD_MAX_CHARS
+            if len(item) > limit:
+                if originals is not None:
+                    originals[sub] = item
+                    print(f'twinlane baton: {sub}: {len(item)} characters; truncated to {limit}', file=sys.stderr)
+                value[key] = item[:limit - 1] + '\u2026'
         else:
-            _clip_strings(item, sub)
+            _clip_strings(item, sub, originals)
 
 
 def _baton_bytes(baton: dict) -> int:
@@ -509,9 +556,46 @@ def _fit_size(baton: dict) -> None:
         pool.pop(0)
 
 
+def _job_dependencies(record):
+    refs = set()
+    waiting = record.get('waiting_on')
+    if isinstance(waiting, str) and waiting.startswith('job:'):
+        refs.add(waiting[4:])
+    entries = record.get('jobs')
+    for entry in entries if isinstance(entries, list) else []:
+        if isinstance(entry, dict) and _is_live_job(entry) and isinstance(entry.get('id'), str):
+            refs.add(entry['id'])
+    progress = record.get('progress')
+    flights = progress.get('in_flight') if isinstance(progress, dict) else None
+    for entry in flights if isinstance(flights, list) else []:
+        if isinstance(entry, dict) and isinstance(entry.get('job'), str):
+            refs.add(entry['job'])
+    return {jid for jid in refs if JOB_ID_RE.fullmatch(jid)}
+
+
+@contextmanager
+def _dependency_locks(record, extra=(), reject_archived=True):
+    from . import jobs
+    with ExitStack() as locks:
+        for jid in sorted(_job_dependencies(record) | set(extra)):
+            locks.enter_context(jobs.archive_lock(jid))
+            active = os.path.join(common.JOBS, jid)
+            if reject_archived and jobs.job_dir(jid) != active:
+                raise BatonError(f'job {jid} is archived; cannot add a live dependency')
+        yield
+
+
 def save(baton: dict, reason: str = 'user', strict: bool = False) -> dict:
+    # Includes brand-new slugs: archive does not rely on a snapshot of baton locks.
+    if not strict:
+        _clean_jobs(baton)  # normalization can add a dependency: choose locks from the final job list
+    with _dependency_locks(baton):
+        return _save_locked(baton, reason, strict)
+
+
+def _save_locked(baton: dict, reason: str = 'user', strict: bool = False) -> dict:
     """Write the baton atomically, moving the previous version into history first.
-    strict=True (new/set from user input) refuses over-long text; other writers clip and trim."""
+    Long text is clipped; its full value is retained in the history for this write."""
     if reason not in REASONS:
         raise BatonError(f'reason must be one of {REASONS}')
     slug = require_slug(baton.get('slug'))
@@ -520,7 +604,18 @@ def save(baton: dict, reason: str = 'user', strict: bool = False) -> dict:
         _clean_jobs(baton)
     _apply_caps(baton)
     baton['reason'] = reason
+    if reason == 'checkpoint' and not baton.get('progress_at'):
+        baton['progress_at'] = baton.get('updated_at') or common.iso(common.now())
     baton['updated_at'] = common.iso(common.now())
+    if reason != 'checkpoint':
+        baton['progress_at'] = baton['updated_at']
+    previous = common.read_json(baton_path(slug))
+    if baton.get('waiting_on', 'none') != (previous or {}).get('waiting_on', 'none'):
+        baton['waiting_since'] = common.now().isoformat()
+    elif isinstance(previous, dict):
+        baton['waiting_since'] = previous.get('waiting_since')
+    originals = {}
+    _clip_strings(baton, originals=originals)
     if strict:
         errs = [e for e in validate(baton) if 'bytes; maximum' not in e]
         if errs:
@@ -531,10 +626,11 @@ def save(baton: dict, reason: str = 'user', strict: bool = False) -> dict:
     errs = [e for e in validate(baton) if 'bytes; maximum' not in e or strict]
     if errs:
         raise BatonError('invalid baton: ' + '; '.join(errs[:5]))
-    previous = common.read_json(baton_path(slug))
     if isinstance(previous, dict):
         _append_history(slug, previous)
     common.write_json(baton_path(slug), baton)
+    if originals:
+        _append_history(slug, {'event': 'text_truncated', 'at': baton['updated_at'], 'full_text': originals})
     try:  # list_batons breaks updated_at (1 s) ties by mtime; Windows' write mtime is one coarse clock tick
         t = time.time_ns()
         os.utime(baton_path(slug), ns=(t, t))
@@ -682,7 +778,8 @@ def cached_meter() -> dict:
 def _scan_jobs_dir(limit: int) -> list[dict]:
     """Fallback when jobs.py is unavailable: read jobs/<id>/{job,status,result}.json directly."""
     try:
-        ids = sorted((d for d in os.listdir(common.JOBS) if os.path.isdir(os.path.join(common.JOBS, d))),
+        ids = sorted((d for d in os.listdir(common.JOBS) if observations.JOB_DIRECTORY_RE.fullmatch(d)
+                      and os.path.isdir(os.path.join(common.JOBS, d))),
                      reverse=True)[:limit]
     except OSError:
         return []
@@ -710,9 +807,23 @@ def list_all_jobs(limit: int = 50) -> list[dict]:
         return _scan_jobs_dir(limit)
 
 
+@observations.command
 def live_jobs_for(cwd: str | None) -> list[dict]:
-    return [j for j in list_all_jobs() if j.get('status') in LIVE_JOB_STATUSES
-            and (cwd is None or under_dir(norm_dir(j.get('cwd')), cwd))]
+    def index():
+        from . import jobs
+        rows = [j for j in jobs.list_jobs(limit=0) if j.get('status') in LIVE_JOB_STATUSES]
+        by_path = {}
+        for row in rows:
+            path = norm_dir(row.get('cwd'))
+            by_path.setdefault(path, []).append(row)
+        return rows, by_path
+    def collect():
+        # The display cap must not hide a live worker from custody/staleness.
+        rows, by_path = observations.once(('live-jobs', common.JOBS), index)
+        if cwd is None:
+            return rows
+        return [row for path, values in by_path.items() if under_dir(path, cwd) for row in values]
+    return observations.once(('live-jobs-for', common.JOBS, cwd), collect)
 
 
 def _merge_live_jobs(baton: dict, live: list[dict]) -> None:
@@ -778,11 +889,27 @@ def _refresh_mechanical(baton: dict, cwd: str | None, st: dict | None = None) ->
     return baton
 
 
-def snap(slug: str, cwd: str | None = None, reason: str = 'checkpoint') -> dict:
+def snap(slug: str, cwd: str | None = None, reason: str = 'checkpoint', *,
+         lock_timeout_s=60, extra=None, create=True) -> dict:
     """Refresh repo/git state, live jobs and the cached meter. Creates a skeleton if the baton is new."""
-    with baton_lock(require_slug(slug)):
-        baton = load_for_update(slug) or empty_baton(slug)
+    from . import wip
+    # The PreCompact hook passes a short lock timeout; the WIP lock must not outwait it.
+    with wip.lock(min(30, lock_timeout_s)), baton_lock(require_slug(slug), timeout_s=lock_timeout_s):
+        baton = load_for_update(slug)
+        if baton is None and not create:
+            return None
+        previous = (baton['repo'].get('worktree') or baton['repo'].get('root')) if baton else None
+        is_new = baton is None
+        if baton is None:
+            baton = empty_baton(slug)
         _refresh_mechanical(baton, cwd)
+        if extra:
+            baton.update(extra)
+        destination = baton['repo'].get('worktree') or baton['repo'].get('root') or cwd or os.getcwd()
+        if baton.get('state', 'active') in ('active', 'review') and (
+                is_new or not previous or common.writer_key(previous) != common.writer_key(destination)):
+            wip.check(destination, 'baton', slug,
+                      argv=['baton', 'snap', slug, '--cd', destination])
         return save(baton, reason)
 
 
@@ -808,12 +935,22 @@ def _goal_lines(goal: str | None) -> str | None:
 
 
 def new(slug: str, goal: str, tracker: str | None = None, title: str | None = None, cwd: str | None = None,
-        accept: list[str] | None = None) -> dict:
+        accept: list[str] | None = None, session=None, waiting_on='none', ask=None) -> dict:
     require_slug(slug)
-    with baton_lock(slug):
+    require_waiting_on(waiting_on)
+    if waiting_on == 'user' and not ask:
+        raise BatonError('waiting_on user needs --ask with records/count')
+    from . import wip
+    if os.path.exists(baton_path(slug)):
+        raise BatonError(f'baton {slug} exists; use twinlane baton set')
+    with (wip.admission(cwd, 'baton', slug) if cwd else nullcontext()), baton_lock(slug):
         if os.path.exists(baton_path(slug)):
             raise BatonError(f'baton {slug} exists; use `twinlane baton set {slug} ...`')
         baton = empty_baton(slug)
+        if ask:
+            apply_set(baton, _parser().parse_args(['set', slug, '--ask', ask]))
+        baton['waiting_on'] = 'user' if ask and waiting_on == 'none' else waiting_on
+        bind_sessions(baton, session or [])
         baton['task'].update({'goal': _goal_lines(goal), 'tracker_id': tracker, 'title': title or slug,
                               'acceptance': parse_accept(accept)})
         if cwd:
@@ -836,6 +973,8 @@ def _set_accept_status(baton: dict, spec: str) -> None:
 
 def _parse_evidence(spec: str) -> dict:
     parts = [p.strip() for p in spec.split('|', 2)]
+    if len(parts) == 1 or parts[0] not in EVIDENCE_KINDS:
+        return {'kind': 'source', 'text': spec}
     if len(parts) != 3 or parts[0] not in EVIDENCE_KINDS:
         raise BatonError(f'--evidence wants kind|path|result with kind in {EVIDENCE_KINDS}')
     return {'kind': parts[0], 'path': parts[1], 'result': parts[2]}
@@ -854,7 +993,7 @@ def _parse_hold(spec: str) -> dict:
 
 
 def _hold_ids(holds: dict) -> set:
-    return {h['id'] for key in ('approvals_pending', 'approvals_granted', 'approvals_rejected')
+    return {h['id'] for key in ('approvals_pending', 'approvals_granted', 'approvals_rejected', 'answers')
             for h in holds.get(key) or [] if isinstance(h, dict) and h.get('id')}
 
 
@@ -905,10 +1044,89 @@ def _append_unique(lst: list, items) -> None:
             lst.append(it)
 
 
+def record_answer(holds, hold, decision, text, via='inbox'):
+    if decision not in ('yes', 'no') or not isinstance(text, str) or not text.strip():
+        raise BatonError('an answer needs yes/no and nonempty words/reason')
+    holds['approvals_pending'] = [h for h in holds['approvals_pending'] if h is not hold]
+    entry = {'id': hold['id'], 'question': hold.get('ask_text') or hold.get('action'),
+             'decision': decision, 'at': common.iso(common.now()), 'engine': hold.get('engine'),
+             'session_id': hold.get('session_id'), 'via': via, 'live_write_approval': False,
+             'words' if decision == 'yes' else 'reason': text}
+    holds.setdefault('answers', []).append(entry)
+    return entry
+
+
+def after_answer(b):
+    # An answer does not acquire a writer slot or resume a parked task.
+    if b.get('state') == 'waiting-on-you' and not b['holds']['approvals_pending']:
+        b['state'] = 'parked'
+        b['state_at'] = common.iso(common.now())
+    if b.get('waiting_on') == 'user' and not b['holds']['approvals_pending']:
+        b['waiting_on'] = 'lead'
+
+
+def bind_sessions(b, ids=(), remove=()):
+    entries = b.setdefault('bound_sessions', [])
+    for sid in list(ids or ()) + list(remove or ()):
+        if not isinstance(sid, str) or not SESSION_RE.fullmatch(sid):
+            raise BatonError('session id must match [A-Za-z0-9-]{6,80}')
+    entries[:] = [e for e in entries if e['id'] not in set(remove or ())]
+    for sid in ids or ():
+        engine = 'claude' if find_claude_session(sid) else 'codex' if find_codex_session(sid) else None
+        entries[:] = [e for e in entries if e['id'] != sid]
+        entries.append({'id': sid, 'engine': engine, 'at': common.iso(common.now())})
+    entries[:] = entries[-8:]
+
+
 def apply_set(baton: dict, a) -> dict:
     """Merge `twinlane baton set` arguments (an argparse Namespace or similar) into the baton."""
     prog, task, holds = baton['progress'], baton['task'], baton['holds']
     now = common.iso(common.now())
+    state, ask, external = (getattr(a, k, None) for k in ('state', 'ask', 'external'))
+    waiting = getattr(a, 'waiting_on', None)
+    if waiting is not None:
+        require_waiting_on(waiting)
+        if waiting == 'user' and not ask:
+            raise BatonError('waiting_on user needs --ask with records/count')
+        baton['waiting_on'] = waiting
+    if ask and external:
+        raise BatonError('use --ask or --external, not both')
+    if state == 'blocked':
+        raise BatonError('blocked needs one question: use --ask "<yes/no question?>" or --external URL')
+    if state == 'stale':
+        raise BatonError('stale is derived; use --state active, parked or closed')
+    if getattr(a, 'count', None) is not None and (type(a.count) is not int or a.count < 1):
+        raise BatonError('--count must be a positive integer')
+    if ask:
+        if '\n' in ask or '\r' in ask or ask.count('?') != 1 or not ask.strip().endswith('?'):
+            raise BatonError('--ask must be one plain yes/no question ending in ?; include the records/count')
+        holds['approvals_pending'].append({'id': _next_hold_id(holds), 'kind': 'question', 'action': getattr(a, 'record', None),
+                                          'count': getattr(a, 'count', None), 'asked_at': now,
+                                          'ask_text': ask.strip(), 'at': now,
+                                          'engine': baton['owner'].get('engine'),
+                                          'session_id': baton.get('bound_session')})
+        state = 'waiting-on-you'
+        baton['waiting_on'] = 'user'
+    if external:
+        if not re.match(r'^https?://[^\s]+$', external):
+            raise BatonError('--external must be an http(s) URL')
+        baton['external'] = external
+        state = 'waiting-external'
+    if state == 'waiting-on-you' and not holds['approvals_pending']:
+        raise BatonError('waiting-on-you needs --ask with records/count')
+    if state == 'waiting-external' and not baton.get('external'):
+        raise BatonError('waiting-external needs --external URL')
+    if state and state not in STATES:
+        raise BatonError('unknown baton state ' + state)
+    if state:
+        baton['state'] = state
+        baton['state_at'] = now
+        if state == 'parked':
+            from . import lanes
+            baton['park_timeout_s'] = lanes.duration(getattr(a, 'park_for', None))
+    bindings = getattr(a, 'bind_session', None) or []
+    bind_sessions(baton, [bindings] if isinstance(bindings, str) else bindings,
+                  getattr(a, 'unbind_session', None) or [])
     if a.next is not None:
         prog['next_action'] = a.next
     _append_unique(prog['done'], a.done)
@@ -925,7 +1143,7 @@ def apply_set(baton: dict, a) -> dict:
         _set_accept_status(baton, spec)
     if a.decision or a.user_quote:
         by_user = bool(a.user_quote)
-        baton['decisions'].append({'what': a.decision or common.clip(a.user_quote, BATON_FIELD_MAX_CHARS), 'why': a.why or '',
+        baton['decisions'].append({'what': a.decision or a.user_quote, 'why': a.why or '',
                                    'by': 'user' if by_user else 'agent', 'quote': a.user_quote, 'at': now})
     _append_unique(baton['rejected'], a.reject)
     resolve, deny = getattr(a, 'resolve', None), getattr(a, 'deny', None)
@@ -956,12 +1174,15 @@ def apply_set(baton: dict, a) -> dict:
 
 def replace_from_file(slug: str, path: str) -> dict:
     data = common.read_json(path)
-    errs = validate(data)
+    errs = [e for e in validate(data) if ' characters; keep pointers' not in e and 'bytes; maximum' not in e]
     if errs:
         raise BatonError('invalid baton file: ' + '; '.join(errs))
     if data['slug'] != slug:
         raise BatonError(f'file slug {data["slug"]!r} does not match {slug!r}')
-    with baton_lock(slug):
+    from . import wip
+    with wip.lock(), baton_lock(slug):
+        if data.get('state', 'active') in ('active', 'review') and (data.get('repo') or {}).get('worktree'):
+            wip.check(data['repo']['worktree'], 'baton', slug)
         return save(_merge_defaults(data), data.get('reason') or 'user', strict=True)
 
 
@@ -999,6 +1220,71 @@ def _record_job_locked(slug: str, jid: str, receipt: dict) -> None:
 
 # ---------------------------------------------------------------- list / show
 
+def owner_job(slug, receipt, terminal=False):
+    """Notify an existing owner, serialized with baton writers. Never grants authority.
+
+    A per-job marker survives bounded baton history. The history event is checked too,
+    so retrying after a crash between the history write and marker cannot append twice.
+    """
+    jid = _receipt_id(receipt)
+    if not isinstance(jid, str) or not JOB_ID_RE.fullmatch(jid):
+        raise BatonError('invalid owner job id')
+    with baton_lock(require_slug(slug)):
+        b = load_for_update(slug)
+        if b is None:
+            raise BatonError(f'no baton {slug}')
+        with _dependency_locks(b, extra=(jid,), reject_archived=False):
+            return _owner_job_locked(slug, receipt, terminal, jid, b)
+
+
+def _owner_job_locked(slug, receipt, terminal, jid, b):
+    from . import jobs
+    marker = jobs._p(jid, jobs.OWNER_NOTIFIED)
+    pending_path = jobs._p(jid, jobs.OWNER_PENDING)
+    notified = common.read_json(marker)
+    if terminal and isinstance(notified, dict):
+        if notified.get('owner', slug) != slug:
+            raise BatonError('completion marker belongs to another owner')
+        try:
+            os.remove(pending_path)
+        except FileNotFoundError:
+            pass
+        return
+    _merge_live_jobs(b, [{'id': jid, 'engine': receipt.get('engine'),
+                          'status': receipt.get('status', 'queued'), 'session_id': receipt.get('session_id')}])
+    reconcile_jobs(b)
+    if not terminal:
+        b['waiting_on'] = 'job:' + jid
+        save(b, 'job')
+        return
+    if b.get('waiting_on', 'none') in ('none', 'job:' + jid):
+        from . import lanes
+        b['waiting_on'] = 'lane:' + slug if lanes.bound_ids(b) else 'lead'
+    pending = common.read_json(pending_path, {}) or {}
+    event = pending.get('event')
+    previous = next((e for e in history(slug) if e.get('event') == 'job_done' and e.get('job_id') == jid), None)
+    if previous is not None:
+        event = previous
+    elif not isinstance(event, dict):
+        # Saving the baton is idempotent. A crash here leaves the write-ahead
+        # intent and the receipt, so repair can finish the event and marker.
+        save(b, 'job')
+        event = {'event': 'job_done', 'owner': slug, 'engine': receipt.get('engine'),
+                 'at': receipt.get('finished_at') or common.iso(common.now()),
+                 'job_id': jid, 'status': receipt.get('status'), 'exit_code': receipt.get('exit_code'),
+                 'waiting_on': b.get('waiting_on'), 'waiting_since': b.get('waiting_since'),
+                 'receipt_path': jobs._p(jid, 'result.json')}
+        jobs._write_job_json(jid, jobs.OWNER_PENDING, dict(pending, owner=slug, job_id=jid, event=event))
+    if previous is None:
+        _append_history(slug, event)
+    jobs._write_job_json(jid, jobs.OWNER_NOTIFIED, dict(event, owner=slug, engine=receipt.get('engine')))
+    try:
+        os.remove(pending_path)
+    except FileNotFoundError:
+        pass
+
+
+@observations.command
 def list_batons() -> list[dict]:
     out = []
     for path in glob.glob(os.path.join(common.BATONS, '*.json')):
@@ -1010,12 +1296,23 @@ def list_batons() -> list[dict]:
         owner = sub('owner').get('engine')
         updated = b.get('updated_at') if isinstance(b.get('updated_at'), str) else None
         out.append({'slug': b['slug'], 'owner': owner if owner in ENGINES else None,
+                    'state': effective_state(b),
                     'age': fmt_age(common.age_s(updated)), 'updated_at': updated,
                     'reason': b.get('reason') if isinstance(b.get('reason'), str) else None,
                     'next_action': sub('progress').get('next_action'),
                     'worktree': sub('repo').get('worktree'), '_mtime': _mtime_ns(path)})
     out.sort(key=lambda r: (r.get('updated_at') or '', r.pop('_mtime')), reverse=True)
     return out
+
+
+def effective_state(b: dict, policy=None) -> str:
+    from . import lanes
+    return lanes.effective_state(b, policy=policy)
+
+
+def record_landing(event: dict):
+    from . import lanes
+    return lanes.mark_landed(event, None)
 
 
 # ---------------------------------------------------------------- black box: Claude transcripts
@@ -1471,6 +1768,7 @@ def render_baton_section(b: dict, ref_chars: int | None = None) -> list[str]:
     owner = b.get('owner') or {}
     out = [f"## Task (baton `{b['slug']}`, updated {b.get('updated_at') or '?'}, reason {b.get('reason')}, "
            f"owner {owner.get('engine') or '-'})"]
+    out.append(f"- State: {b.get('state', 'active')}")
     if task.get('title'):
         out.append(f"- Title: {task['title']}" + (f" (tracker {task['tracker_id']})" if task.get('tracker_id') else ''))
     if task.get('goal'):
@@ -1490,7 +1788,7 @@ def render_baton_section(b: dict, ref_chars: int | None = None) -> list[str]:
                 ('Approvals pending', [_hold_label(h) for h in holds.get('approvals_pending') or []], 5),
                 ('Prohibitions', holds.get('prohibitions'), 6),
                 ('Do not', b.get('do_not'), 6),
-                ('Evidence', [f"{e.get('kind')}: {e.get('path')} -> {e.get('result')}"
+                ('Evidence', [e['text'] if 'text' in e else f"{e.get('kind')}: {e.get('path')} -> {e.get('result')}"
                               for e in b.get('evidence') or []], 6),
                 ('Read first', b.get('read_first'), 5)]
     for title, items, limit in sections:
@@ -1765,7 +2063,11 @@ def handoff(slug: str | None = None, cwd: str | None = None, session: str | None
     if with_session and not session:
         raise BatonError('--with-session needs --session ID')
     slug, cwd, others = _resolve_target(slug, cwd, session)
-    with baton_lock(slug):
+    from . import wip
+    with wip.lock(), baton_lock(slug):
+        b = load_for_update(slug)
+        if not b or b.get('state', 'active') in ('active', 'review'):
+            wip.check(cwd, 'baton', slug)
         return _handoff_locked(slug, cwd, others, session, to, out, kind, with_session)
 
 
@@ -1853,16 +2155,28 @@ def _parser() -> argparse.ArgumentParser:
     p = sub.add_parser('new')
     p.add_argument('slug')
     p.add_argument('--goal', required=True)
+    p.add_argument('--waiting-on', default='none')
+    p.add_argument('--ask')
     p.add_argument('--tracker')
     p.add_argument('--title')
     p.add_argument('--cd')
     p.add_argument('--accept', action='append')
+    p.add_argument('--session', action='append')
     p.add_argument('--json', action='store_true')
     p = sub.add_parser('set')
     p.add_argument('slug')
+    p.add_argument('--waiting-on')
     for flag in ('--next', '--goal', '--title', '--tracker', '--decision', '--why', '--user-quote', '--file'):
         p.add_argument(flag)
     p.add_argument('--owner', choices=ENGINES)
+    p.add_argument('--state', help=', '.join(STATES))
+    p.add_argument('--ask')
+    p.add_argument('--external')
+    p.add_argument('--bind-session', metavar='SESSION_ID', action='append')
+    p.add_argument('--unbind-session', action='append')
+    p.add_argument('--park-for')
+    p.add_argument('--record')
+    p.add_argument('--count', type=int)
     p.add_argument('--resolve', metavar='ID|TEXT', help='resolve one pending approval: with --grant "<user quote>" '
                    'or --deny ["<reason>"]')
     p.add_argument('--deny', nargs='?', const='', metavar='REASON')
@@ -1910,20 +2224,24 @@ def _summary(b: dict) -> str:
 
 def _baton_cmd(a) -> int:
     if a.sub == 'new':
-        b = new(a.slug, a.goal, a.tracker, a.title, a.cd, a.accept)
-        common.emit(b, a.json, _summary(b))
+        b = new(a.slug, a.goal, a.tracker, a.title, a.cd, a.accept, a.session, a.waiting_on, a.ask)
+        common.emit(b, a.json, _summary(b) + (' | not found locally; bound anyway' if any(e.get('engine') is None for e in b['bound_sessions']) else ''))
     elif a.sub == 'set':
         if a.file:
             b = replace_from_file(require_slug(a.slug), a.file)
         else:
-            with baton_lock(require_slug(a.slug)):
+            from . import wip
+            with wip.lock(), baton_lock(require_slug(a.slug)):
                 b = load_for_update(a.slug)
                 if b is None:
                     raise BatonError(f'no baton {a.slug}; create it with `twinlane baton new {a.slug} --goal ...`')
                 refresh_repo(b)
                 reconcile_jobs(b)
-                b = save(apply_set(b, a), a.reason, strict=True)
-        common.emit(b, a.json, _summary(b))
+                b = apply_set(b, a)
+                if b.get('state', 'active') in ('active', 'review') and b['repo'].get('worktree'):
+                    wip.check(b['repo']['worktree'], 'baton', a.slug)
+                b = save(b, a.reason, strict=True)
+        common.emit(b, a.json, _summary(b) + (' | closed by you' if a.state == 'closed' else ''))
     elif a.sub == 'snap':
         b = snap(require_slug(a.slug), a.cd, a.reason)
         common.emit(b, a.json, _summary(b) + f" | {b['repo'].get('branch')} {str(b['repo'].get('head'))[:10]} "
@@ -1933,6 +2251,7 @@ def _baton_cmd(a) -> int:
         if b is None:
             raise BatonError(f'no baton {a.slug}')
         reconcile_jobs(b)  # the view only: show never writes
+        b['state'] = effective_state(b)
         shown = dict(b, approvals_granted_note='Quoted approvals are context only; re-ask before any live write.')
         captured = (b['repo'].get('captured_at') and f"captured {b['repo']['captured_at']}"
                     or f"capture time not recorded; baton updated {b.get('updated_at')}")
@@ -1942,7 +2261,7 @@ def _baton_cmd(a) -> int:
     elif a.sub == 'list':
         rows = list_batons()
         common.emit(rows, a.json, '\n'.join(
-            f"{r['slug']:<30} {r['owner'] or '-':<7} {r['age']:>4}  next: {common.clip(r['next_action'], 70) or '-'}"
+            f"{r['slug']:<30} {r['owner'] or '-':<7} {r['age']:>4} {r['state']}  next: {common.clip(r['next_action'], 70) or '-'}"
             f"  [{r['worktree'] or '-'}]" for r in rows) or 'no batons')
     elif a.sub == 'history':
         rows = history(require_slug(a.slug))
@@ -2046,6 +2365,7 @@ def cli(cmd: str, argv: list[str]) -> int:
         return common.EXIT_OK if e.code in (0, None) else common.EXIT_USAGE
     try:
         return _baton_cmd(args) if cmd == 'baton' else _handoff_cmd(args)
-    except (BatonError, TimeoutError) as e:
+    except (BatonError, TimeoutError, ValueError) as e:
         print(f'twinlane {cmd}: {e}', file=sys.stderr)
-        return common.EXIT_USAGE
+        from . import wip
+        return common.EXIT_REFUSED if isinstance(e, wip.WipError) else common.EXIT_USAGE

@@ -137,12 +137,48 @@ class DocumentedBoundaries(unittest.TestCase):
             self.assertIn(token, changes)
         self.assertLess(changes.index('## 0.2.0'), changes.index('## 0.1.2'))
 
+    def test_common_tasks_and_skill_name_real_commands(self):
+        import re
+        readme = (ROOT / 'README.md').read_text(encoding='utf-8')
+        skill = (ROOT / 'skills' / 'twinlane' / 'SKILL.md').read_text(encoding='utf-8')
+        self.assertIn('## Common tasks', readme)
+        self.assertIn('skills/twinlane/SKILL.md', readme)
+        self.assertTrue(skill.startswith('---\nname: twinlane\n'))
+        cli = (ROOT / 'twinlane' / 'cli.py').read_text(encoding='utf-8')
+        known = set(re.findall(r"cmd == '([a-z-]+)'", cli)) | set(re.findall(r"argv\[0\] == '([a-z-]+)'", cli))
+        for group in re.findall(r"cmd in \(([^)]*)\)", cli):
+            known |= set(re.findall(r"'([a-z-]+)'", group))
+        section = readme.split('## Common tasks', 1)[1].split('\n## ', 1)[0]
+        for body, name in ((section, 'README Common tasks'), (skill, 'skills/twinlane/SKILL.md')):
+            used = set(re.findall(r'`twinlane ([a-z-]+)', body))
+            self.assertTrue(used, name)
+            self.assertEqual(used - known, set(), f'{name} names commands the CLI does not have')
+
+    def test_fresh_readings_are_documented(self):
+        readme, limits, skill = doc('README.md'), doc('LIMITS.md'), doc('skills/twinlane/SKILL.md')
+        for body in (readme, limits):
+            self.assertIn('--no-rollout', body)
+            self.assertIn('meter.codex_rollout_fallback', body)
+        self.assertIn('### Fresh readings', readme)
+        self.assertIn('TWINLANE_CODEX_BIN', skill)
+        self.assertIn('--no-rollout', skill)
+        self.assertIn('never dispatch on a guess', skill)
+
     def test_version_files_agree(self):
         import re
         init = (ROOT / 'twinlane' / '__init__.py').read_text(encoding='utf-8')
         toml = (ROOT / 'pyproject.toml').read_text(encoding='utf-8')
-        self.assertEqual(re.search(r"__version__ = '([^']+)'", init).group(1),
-                         re.search(r'(?m)^version = "([^"]+)"', toml).group(1))
+        version = re.search(r"__version__ = '([^']+)'", init).group(1)
+        self.assertEqual(version, re.search(r'(?m)^version = "([^"]+)"', toml).group(1))
+        # CITATION.cff is what citing readers see: it names the same version, released the day
+        # the newest CHANGELOG section gives.
+        cff = (ROOT / 'CITATION.cff').read_text(encoding='utf-8')
+        top = re.search(r'(?m)^## (\S+) - (\d{4}-\d{2}-\d{2})', (ROOT / 'CHANGELOG.md').read_text(encoding='utf-8'))
+        self.assertEqual(re.search(r'(?m)^version: (\S+)', cff).group(1), top.group(1))
+        # Unreleased development builds keep the citation for the latest actual release.
+        if '.dev' not in version:
+            self.assertEqual(top.group(1), version)
+        self.assertEqual(re.search(r'(?m)^date-released: (\S+)', cff).group(1).strip('"\''), top.group(2))
 
 
 if __name__ == '__main__':

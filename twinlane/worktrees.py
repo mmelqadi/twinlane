@@ -216,11 +216,15 @@ def _unlink(link: dict) -> None:
         os.unlink(link['path'])
 
 
-def _relink(link: dict) -> bool:
+def _relink(link: dict, worktree_root=None) -> bool:
     """Best effort: put back a link `_unlink` removed (used when a removal fails half-way)."""
     if os.path.lexists(link['path']):
         return True
     try:
+        if worktree_root:
+            if not os.path.isdir(worktree_root):
+                return False
+            os.makedirs(os.path.dirname(link['path']), exist_ok=True)
         if link['kind'] == 'junction' and common.IS_WIN:
             import _winapi
             if not link.get('resolved'):
@@ -256,11 +260,14 @@ def add(repo: str, branch: str, path: str, base: str | None = None) -> str:
     its real path. Refuses an existing path; never --force."""
     if os.path.lexists(path):
         raise WorktreeError(f'{path} already exists')
-    args = ['worktree', 'add', '-b', branch, '--', path] + ([base] if base else [])
-    rc, msg = common.git(repo, *args, timeout=REMOVE_TIMEOUT_S)
-    if rc != 0:
-        raise WorktreeError(f'git worktree add failed: {msg}')
-    return common.real_path(path)
+    from . import wip
+    with wip.admission(path, 'worktree', branch, new_worktree=True):
+        args = ['worktree', 'add', '-b', branch, '--', path] + ([base] if base else [])
+        rc, msg = common.git(repo, *args, timeout=REMOVE_TIMEOUT_S)
+        if rc != 0:
+            raise WorktreeError(f'git worktree add failed: {msg}')
+        return common.real_path(path)
+
 
 
 def worktree_list(main_root: str) -> list[dict]:
@@ -342,26 +349,43 @@ def _dirty(path: str) -> int | None:
 
 # ---------------------------------------------------------------- who uses a worktree
 
-def usage_index(main_root: str) -> dict:
+def usage_index(main_root: str, skip_baton_states=(), policy=None, *, fresh=False) -> dict:
     """Everything that may be using a worktree: live jobs (by cwd), batons, land queue entries and the
     current directory. Anything that cannot be read goes to `problems`, and prune then removes nothing:
-    an unread record is not proof that nobody uses a worktree."""
+    an unread record is not proof that nobody uses a worktree. `fresh` bypasses cached supervisor evidence."""
     from twinlane import baton as baton_mod
     from twinlane import jobs as jobs_mod
+    from twinlane import sessions
     u = {'jobs': [], 'batons': [], 'queue': [], 'queue_branches': [], 'problems': [], 'cwd': None}
+    try:
+        interactive = sessions.collect_sessions(since_s=((policy or common.load_policy()).get('wip') or {}).get('session_active_s', 1800), limit=0, raw_paths=True, policy=policy, fresh=fresh)['rows']
+        for row in interactive:
+            state = row.get('state')
+            if state not in ('job', 'parked', 'ended'):  # an idle session is alive between turns: it still uses its cwd
+                cwd = row.get('_writer_cwd') or row.get('cwd')
+                if isinstance(cwd, str) and cwd.strip():
+                    status = state if state in ('active', 'mid-turn', 'working', 'idle', 'waiting-on-user', 'needs-you') else 'unknown interactive session state'
+                    u['jobs'].append((_canon(cwd), 'session:' + str(row.get('id') or '?'), status))
+                else:
+                    u['problems'].append('interactive session has no readable cwd; ownership unknown')
+    except Exception:
+        u['problems'].append('interactive session usage unreadable')
     try:
         u['cwd'] = _canon(os.getcwd())
     except OSError:
         u['cwd'] = None
     if os.path.isdir(common.JOBS):
+        from .observations import JOB_DIRECTORY_RE
         try:
-            ids = sorted(os.listdir(common.JOBS))
+            ids = sorted(jid for jid in os.listdir(common.JOBS) if jid != 'archive')
         except OSError as e:
             ids = []
             u['problems'].append(f'cannot list jobs ({e})')
         for jid in ids:
             if not os.path.isdir(os.path.join(common.JOBS, jid)):
                 continue
+            if not JOB_DIRECTORY_RE.fullmatch(jid):
+                u['problems'].append(f'nonmatching job folder {jid}; ownership unknown')
             try:
                 status = jobs_mod.job_status(jid)
             except Exception:  # noqa: BLE001 - an unreadable job counts as live
@@ -383,6 +407,8 @@ def usage_index(main_root: str) -> dict:
             if not isinstance(raw, dict):
                 u['problems'].append(f'baton {slug} is unreadable')
                 continue
+            if raw.get('state') in skip_baton_states:
+                continue  # historical references do not keep a verified landed lane alive
             repo = raw.get('repo')
             if repo is None:
                 continue
@@ -464,6 +490,26 @@ def deps_report(path: str, deps_dirs) -> list[dict]:
     return out
 
 
+def preflight(path, cfg):
+    path = common.worktree_top(path) or path
+    wt = cfg.get('wt') or {}
+    problems = [f"{p['dir']}: {p['problem']}" for p in deps_report(path, wt.get('deps_dirs'))]
+    main_root = projects.main_checkout(path) if wt.get('link_roots') else path
+    roots = [os.path.realpath(_link_root(main_root, r)) for r in wt.get('link_roots') or []]
+    roots.append(os.path.realpath(path))
+    for rel in wt.get('deps_dirs') or []:
+        full = os.path.join(path, rel)
+        try:
+            islink = link_kind(os.lstat(full))
+        except OSError:
+            continue
+        if islink and os.path.exists(full):
+            target = os.path.realpath(full)
+            if not any(_under(_canon(target), _canon(root)) for root in roots):
+                problems.append(f'{rel}: link resolves outside allowed roots')
+    return problems
+
+
 def _registry_long_paths() -> int | None:
     """HKLM ...\\FileSystem LongPathsEnabled (Windows only), or None when unknown."""
     if not common.IS_WIN:
@@ -512,7 +558,9 @@ def _settings(cfg: dict) -> dict:
     return {'stale_s': float(wt.get('stale_days') if wt.get('stale_days') is not None else 7) * 86400,
             'min_age_s': float(wt.get('prune_min_age_s') if wt.get('prune_min_age_s') is not None else 86400),
             'deps_dirs': wt.get('deps_dirs') or [], 'link_roots': wt.get('link_roots') or [],
-            'remove_command': wt.get('remove_command')}
+            'remove_command': wt.get('remove_command'),
+            'merged_min_age_s': float(wt.get('merged_min_age_s') if wt.get('merged_min_age_s') is not None else 3600),
+            'behind_max': float(wt.get('behind_max') if wt.get('behind_max') is not None else 50)}
 
 
 def classify(main_root: str, cfg: dict, w: dict, target: str | None, usage: dict, now: float | None = None) -> dict:
@@ -577,13 +625,16 @@ def _link_scan(root: str) -> tuple[list[dict], str | None]:
         return [], f'cannot scan {root} for links ({e.strerror or e})'
 
 
+def _link_root(main_root, root):
+    full = os.path.expanduser(root)
+    return full if os.path.isabs(full) else os.path.join(main_root, full)
+
+
 def inbound_index(main_root: str, link_roots) -> dict:
     """Links found under wt.link_roots (relative roots resolve against the main checkout)."""
     links, problems = [], []
     for root in link_roots or []:
-        full = os.path.expanduser(root)
-        if not os.path.isabs(full):
-            full = os.path.join(main_root, full)
+        full = _link_root(main_root, root)
         if not os.path.lexists(full):
             continue
         found, err = _link_scan(full)
@@ -768,7 +819,7 @@ def _remove(main_root: str, settings: dict, row: dict, links: list[dict], target
         return [lk['resolved'] for lk in protected if not os.path.exists(lk['resolved'])]
 
     def restore():
-        back = [lk['path'] for lk in res['unlinked'] if _relink(lk)]
+        back = [lk['path'] for lk in res['unlinked'] if _relink(lk, path)]
         return f'; links put back: {len(back)}/{len(res["unlinked"])}' if res['unlinked'] else ''
 
     for lk in links:
@@ -810,7 +861,7 @@ def _remove(main_root: str, settings: dict, row: dict, links: list[dict], target
                        f'{common.clip(msg, 300)}' + (restore() if os.path.isdir(path) else '')
         return res
     if os.path.lexists(path):
-        res['error'] = 'the folder is still there after the removal'
+        res['error'] = 'the folder is still there after the removal' + restore()
         return res
     res['removed'] = True
     if _tip(main_root, branch):
@@ -830,10 +881,28 @@ def _ledger(main_root: str, record: dict) -> None:
         h.write(json.dumps(record, ensure_ascii=False) + '\n')
 
 
-def _evaluate(main_root, cfg, w, target, usage, inbound, include_empty, now=None, others=()):
+def _evaluate(main_root, cfg, w, target, usage, inbound, include_empty, now=None, others=(), merged_only=False):
     s = _settings(cfg)
     row = classify(main_root, cfg, w, target, usage, now)
+    if merged_only:
+        s['min_age_s'] = s['merged_min_age_s']
+        if row['state'] in ('merged', 'empty', 'unlanded') and target:
+            rc, text = common.git(main_root, 'cherry', target, row['branch'], timeout=GIT_TIMEOUT_S)
+            rm, merges = common.git(main_root, 'rev-list', '--merges', '--count', target + '..' + row['branch'], timeout=GIT_TIMEOUT_S)
+            rb, behind = common.git(main_root, 'rev-list', '--count', row['branch'] + '..' + target, timeout=GIT_TIMEOUT_S)
+            if rc or rm or rb or not merges.strip().isdigit() or not behind.strip().isdigit() or any(
+                    line and line[0] not in '+-' for line in text.splitlines()):
+                row['state'] = 'unknown'
+                row['notes'].append('git cherry failed: unique commits or behind unknown')
+            else:
+                row['unique'] = 0 if row.get('landed') else sum(line.startswith('+') for line in text.splitlines()) + int(merges.strip())
+                row['behind'] = int(behind.strip())
+                row['verdict'] = 'merged' if row['unique'] == 0 else 'rebase or park' if row['behind'] > s['behind_max'] else 'keep'
+                row['rebase_or_park'] = row['verdict'] == 'rebase or park'
+                row['state'] = 'merged' if row['unique'] == 0 else 'unlanded'
     row['blockers'] = blockers(row, include_empty, s, usage)
+    if row.get('unique'):
+        row['blockers'].append(f"{row['unique']} unique commit(s), {row['behind']} behind {target}: {row['verdict']}")
     links = []
     if not row['blockers']:
         deep, links = deep_blockers(row, inbound, others)
@@ -844,26 +913,30 @@ def _evaluate(main_root, cfg, w, target, usage, inbound, include_empty, now=None
 
 
 def prune(repo_dir: str | None = None, yes: bool = False, include_empty: bool = False,
-          policy: dict | None = None, now: float | None = None) -> dict:
+          policy: dict | None = None, now: float | None = None, merged_only: bool = False, only=None, archive=False) -> dict:
     """Dry run unless `yes`. Returns {repo, target, dry_run, rows, removed, failed, aborted}."""
     main_root, cfg = projects.resolve(repo_dir, policy)
     s = _settings(cfg)
+    if archive:
+        cfg = dict(cfg, wt=dict(cfg.get('wt') or {}, merged_min_age_s=0))
     target = target_branch(main_root, cfg)
     result = {'repo': main_root, 'target': target, 'dry_run': not yes, 'rows': [], 'removed': 0,
-              'failed': 0, 'aborted': False}
+              'failed': 0, 'aborted': False, 'merged_only': merged_only}
 
     def run_all():
-        usage = usage_index(main_root)
+        usage = usage_index(main_root, ('landed', 'closed') if merged_only else (), policy)
         inbound = inbound_index(main_root, s['link_roots'])
         listed = worktree_list(main_root)
         others = [x['path'] for x in listed]
         for w in listed:
-            row, links = _evaluate(main_root, cfg, w, target, usage, inbound, include_empty, now, others)
+            if only and _canon(w['path']) not in {_canon(p) for p in only}:
+                continue
+            row, links = _evaluate(main_root, cfg, w, target, usage, inbound, include_empty, now, others, merged_only)
             if row['main']:
                 continue
             result['rows'].append(row)
             if row['blockers']:
-                row['action'] = 'skip'
+                row['action'] = 'rebase or park' if row.get('rebase_or_park') else 'skip'
                 continue
             if not yes:
                 row['action'] = 'would remove'
@@ -878,9 +951,9 @@ def prune(repo_dir: str | None = None, yes: bool = False, include_empty: bool = 
             if fresh is None:
                 row['action'], row['blockers'] = 'skip', ['no longer listed by git']
                 continue
-            row2, links = _evaluate(main_root, cfg, fresh, target, usage_index(main_root),
+            row2, links = _evaluate(main_root, cfg, fresh, target, usage_index(main_root, ('landed', 'closed') if merged_only else (), policy, fresh=True),
                                     inbound_index(main_root, s['link_roots']), include_empty, now,
-                                    [x['path'] for x in relisted])
+                                    [x['path'] for x in relisted], merged_only)
             if row2['blockers']:
                 row2['action'] = 'skip'
                 result['rows'][-1] = row2
@@ -912,13 +985,17 @@ def prune(repo_dir: str | None = None, yes: bool = False, include_empty: bool = 
     return result
 
 
-def render_prune(r: dict) -> str:
-    lines = [f'twinlane wt prune: {r["repo"]}  target {r["target"] or "(none)"}'
+def render_prune(r: dict, command='prune') -> str:
+    lines = [f'twinlane wt {command}: {r["repo"]}  target {r["target"] or "(none)"}'
              + ('  (dry run)' if r['dry_run'] else '')]
     for row in r['rows']:
         head = f'  {row["action"]:<12}  {row["branch"]}  {row["path"]}'
-        if row['action'] == 'skip':
+        if r.get('merged_only'):
+            head += f"  UNIQUE {row.get('unique', '?')} BEHIND {row.get('behind', '?')}"
+        if row['action'] in ('skip', 'rebase or park'):
             head += ': ' + '; '.join(row['blockers'])
+            if row.get('rebase_or_park'):
+                head += f"; rebase or park ({row['behind']} commits behind, {row['unique']} unique)"
         elif row['action'] == 'would remove':
             head += f'  (state {row["state"]}, tip {(row["tip"] or "")[:12]}'
             if row['links']:
@@ -935,7 +1012,7 @@ def render_prune(r: dict) -> str:
     would = sum(1 for row in r['rows'] if row['action'] == 'would remove')
     if r['dry_run']:
         lines.append(f'dry run: {would} would be removed; nothing changed.'
-                     + (' Rerun with --yes to remove them.' if would else ''))
+                     + (f' Rerun with {"--apply" if command == "gc" else "--yes"} to remove them.' if would else ''))
     else:
         lines.append(f'removed {r["removed"]}, failed {r["failed"]}'
                      + ('; STOPPED: a link target vanished, check the unlinked list above' if r['aborted'] else ''))
@@ -983,11 +1060,18 @@ def cli(argv) -> int:
     fmt.add_argument('--md', action='store_true')
     p = sub.add_parser('prune', help='remove merged, clean, unused, old worktrees (dry run unless --yes)')
     p.add_argument('--repo')
-    p.add_argument('--yes', action='store_true')
+    p.add_argument('--yes', '--apply', action='store_true')
+    p.add_argument('--only', action='append')
     p.add_argument('--include-empty', action='store_true')
+    p.add_argument('--merged-only', action='store_true', help='require zero unique patches via git cherry')
     p.add_argument('--json', action='store_true')
     p.add_argument('--group')
     p.add_argument('--discard-unmerged', action='store_true')
+    g = sub.add_parser('gc', help='prune zero-unique clean unused worktrees (dry run unless --apply)')
+    g.add_argument('--repo')
+    g.add_argument('--apply', '--yes', action='store_true')
+    g.add_argument('--only', action='append')
+    g.add_argument('--json', action='store_true')
     try:
         args = ap.parse_args(argv)
     except SystemExit as e:
@@ -995,16 +1079,19 @@ def cli(argv) -> int:
     if args.cmd is None:
         ap.print_help()
         return common.EXIT_USAGE
-    if args.cmd == 'prune':
-        refused = projects.refuse_in_worker('wt prune')
+    if args.cmd in ('prune', 'gc'):
+        gc = args.cmd == 'gc'
+        apply = args.apply if gc else args.yes
+        refused = projects.refuse_in_worker('wt ' + args.cmd) if not gc or apply else None
         if refused is not None:
             return refused
-        if args.group or args.discard_unmerged:
+        if not gc and (args.group or args.discard_unmerged):
             print('twinlane wt prune: --group/--discard-unmerged is not available: discarding an unmerged branch '
                   'needs git branch -D, which wt prune never runs', file=sys.stderr)
             return common.EXIT_USAGE
         try:
-            res = prune(args.repo, yes=args.yes, include_empty=args.include_empty)
+            res = prune(args.repo, yes=apply, include_empty=gc or args.include_empty,
+                        merged_only=gc or args.merged_only, only=args.only)
         except (projects.ProjectError, WorktreeError) as e:
             print(f'twinlane wt prune: {e}', file=sys.stderr)
             return common.EXIT_USAGE
@@ -1014,7 +1101,7 @@ def cli(argv) -> int:
         if args.json:
             common.emit(_public(res), True)
         else:
-            print(render_prune(res))
+            print(render_prune(res, command=args.cmd))
         return common.EXIT_FAILED if res['failed'] or res['aborted'] else common.EXIT_OK
     policy = common.load_policy()
     targets = _project_dirs(policy, args.repo) if args.all else [args.repo]

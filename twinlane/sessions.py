@@ -19,7 +19,7 @@ import re
 import sys
 import time
 
-from twinlane import baton, common
+from twinlane import baton, common, observations
 
 ACTIVE_S = 120                 # modified this recently: the session is probably running now
 DEFAULT_SINCE_S = 48 * 3600
@@ -35,7 +35,7 @@ CUT_COUNT_BUDGET_S = 1.5       # time spent counting the rows a --limit cut off;
 JOB_SCAN_MAX = 3000           # newest job dirs whose receipts are read for session ids
 FORWARD_MAX = 10               # sessions named in one printed forward command
 
-STATES = ('active', 'waiting-on-user', 'mid-turn', 'unknown')
+STATES = ('active', 'waiting-on-user', 'mid-turn', 'unknown', 'working', 'idle', 'needs-you', 'parked')
 ENGINE_CHOICES = ('claude', 'codex', 'all')
 
 _IDE_TAG = re.compile(r'<(ide_[a-z_]+)>.*?</\1>|</?pasted_content[^>]*>', re.S)
@@ -111,7 +111,7 @@ def job_session_ids() -> set[str]:
     """Session ids recorded by `twinlane run` jobs (receipts and attempt lists): those sessions are workers."""
     ids = set()
     try:
-        names = sorted(os.listdir(common.JOBS), reverse=True)[:JOB_SCAN_MAX]
+        names = observations.job_ids()[:JOB_SCAN_MAX]
     except OSError:
         return ids
 
@@ -121,7 +121,7 @@ def job_session_ids() -> set[str]:
 
     for name in names:
         for fname in ('result.json', 'status.json'):
-            doc = common.read_json(os.path.join(common.JOBS, name, fname), None)
+            doc = observations.job_json(name, fname)
             take(doc)
             if isinstance(doc, dict) and isinstance(doc.get('attempts'), list):
                 for a in doc['attempts']:
@@ -135,7 +135,7 @@ def _claude_user_text(obj: dict) -> str:
     return baton._clean_user_text(baton._claude_text((obj.get('message') or {}).get('content')))
 
 
-def scan_claude(lines: list[str]) -> dict:
+def scan_claude(lines: list[str], include_sidechain=False) -> dict:
     """One pass over transcript lines: entrypoint, last cwd, model, the last assistant text and who spoke last.
 
     `last_turn` is 'assistant' only for a finished assistant message (text, no tool call pending);
@@ -153,7 +153,7 @@ def scan_claude(lines: list[str]) -> dict:
             continue
         out['entrypoint'] = obj.get('entrypoint') or out['entrypoint']
         kind = obj.get('type')
-        if kind not in ('user', 'assistant') or obj.get('isSidechain'):
+        if kind not in ('user', 'assistant') or (obj.get('isSidechain') and not include_sidechain):
             continue
         out['cwd'] = obj.get('cwd') or out['cwd']
         msg = obj.get('message') if isinstance(obj.get('message'), dict) else {}
@@ -221,11 +221,13 @@ def _claude_names(lines: list[str]) -> tuple[str | None, str | None]:
 
 
 def _describe_claude(path: str, ctx: dict) -> dict | None:
+    from . import context
     jobs = ctx['jobs']
     sid = os.path.splitext(os.path.basename(path))[0]
     size = _file_size(path)
     tail = common.tail_lines(path, TAIL_BYTES)
-    info = scan_claude(tail)
+    child = os.path.basename(os.path.dirname(path)) == 'subagents'
+    info = scan_claude(tail, include_sidechain=child)
     head = tail if size <= TAIL_BYTES else _head_lines(path, CLAUDE_HEAD_BYTES)
     if not info['entrypoint'] and head is not tail:
         info['entrypoint'] = scan_claude(head)['entrypoint']
@@ -235,11 +237,16 @@ def _describe_claude(path: str, ctx: dict) -> dict | None:
         or _claude_title(head) or info['first_user']
     is_job = sid in jobs or str(info['entrypoint'] or '').startswith('sdk')
     if info['last_turn'] is None and size > TAIL_BYTES:  # one huge last turn filled the tail
-        wide = scan_claude(common.tail_lines(path, TAIL_WIDE_BYTES))
+        tail = common.tail_lines(path, TAIL_WIDE_BYTES)
+        wide = scan_claude(tail, include_sidechain=child)
         info.update({k: wide[k] for k in ('cwd', 'model', 'last_text', 'last_turn')})
     return {'engine': 'claude', 'id': sid, 'cwd': info['cwd'], 'model': info['model'], 'title': title,
             'last_text': info['last_text'], 'turn': {'assistant': 'assistant', 'busy': 'busy'}.get(info['last_turn']),
-            'job': is_job, 'path': path}
+            'job': is_job, 'path': path,
+            'context': context.estimate('claude', tail, info['model'], policy=ctx.get('policy'), include_sidechain=child),
+            'started_by': provenance(head + ([] if head is tail else tail)) or
+                          (os.path.basename(os.path.dirname(os.path.dirname(path))) if child else None),
+            'managed': sid in ctx.get('managed', jobs)}
 
 
 # ---------------------------------------------------------------- Codex rollouts
@@ -360,28 +367,56 @@ def codex_thread_names() -> dict[str, str]:
 
 
 def _describe_codex(path: str, ctx: dict) -> dict | None:
+    from . import context
     jobs, names = ctx['jobs'], ctx['codex_names']
     meta = baton.rollout_meta(path)
-    if baton._is_subagent(meta):
-        return None
     sid = _codex_id(path, meta)
     size = _file_size(path)
     lines = common.tail_lines(path, TAIL_BYTES)
     info = scan_codex(lines)
     if info['last_turn'] is None and size > TAIL_BYTES:  # no turn marker in the tail: look further back once
-        info = scan_codex(common.tail_lines(path, TAIL_WIDE_BYTES))
+        lines = common.tail_lines(path, TAIL_WIDE_BYTES)
+        info = scan_codex(lines)
     if info['external'] and not info['native']:
         return None  # only an import of another tool's history
     title = names.get(sid)  # what the Codex sidebar shows
     if not title or not info['model']:
         head = lines if size <= TAIL_BYTES else _head_lines(
-            path, keep=lambda ln: bool(baton.USER_TURN_LINE.search(ln)) or '"turn_context"' in ln)
+            path, keep=lambda ln: bool(baton.USER_TURN_LINE.search(ln)) or '"turn_context"' in ln or '"token_count"' in ln or '"task_started"' in ln)
         title = title or _codex_title(head) or (f"automation: {info['automation']}" if info['automation'] else None)
         if not info['model']:  # no turn context in the tail (one long turn): the first turn's model is the best guess
             info['model'] = scan_codex([ln for ln in head if '"turn_context"' in ln[:300]][:1])['model']
+        if head is not lines:
+            lines = head + lines
     return {'engine': 'codex', 'id': sid, 'cwd': meta.get('cwd'), 'model': info['model'], 'title': title,
             'last_text': info['last_text'], 'turn': {'assistant': 'assistant', 'busy': 'busy'}.get(info['last_turn']),
-            'job': sid in jobs or baton._is_exec(meta), 'path': path}
+            'job': sid in jobs or baton._is_exec(meta), 'path': path,
+            'context': context.estimate('codex', lines, info['model'], policy=ctx.get('policy')),
+            'started_by': codex_parent(meta), 'managed': sid in ctx.get('managed', jobs)}
+
+
+def provenance(lines):
+    """Only explicit creator/parent fields are provenance; a model or cwd is not."""
+    for line in reversed(lines):
+        try:
+            obj = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(obj, dict):
+            value = obj.get('startedBy') or obj.get('started_by') or obj.get('parentSessionId')
+            if isinstance(value, str) and value.strip():
+                return value
+    return None
+
+
+def codex_parent(meta):
+    direct = meta.get('startedBy') or meta.get('started_by')
+    if isinstance(direct, str):
+        return direct
+    source = meta.get('source')
+    child = source.get('subagent') if isinstance(source, dict) else None
+    spawn = child.get('thread_spawn') if isinstance(child, dict) else None
+    return spawn.get('parent_thread_id') if isinstance(spawn, dict) else None
 
 
 # ---------------------------------------------------------------- listing
@@ -402,6 +437,16 @@ def _candidates(engine: str, cutoff: float) -> list[tuple[float, str, str]]:
             for e in entries:
                 if e.name.endswith('.jsonl'):
                     _add(found, 'claude', e, cutoff)
+                elif e.is_dir():
+                    # Claude stores children below <parent session>/subagents/.
+                    child_dir = os.path.join(e.path, 'subagents')
+                    try:
+                        children = list(os.scandir(child_dir))
+                    except OSError:
+                        continue
+                    for child in children:
+                        if child.name.endswith('.jsonl'):
+                            _add(found, 'claude', child, cutoff)
     if engine in ('codex', 'all'):
         stack = [baton.CODEX_SESSIONS]
         while stack:
@@ -447,14 +492,38 @@ def _row(raw: dict, mtime: float) -> dict:
     return {'engine': raw['engine'], 'id': _safe(raw['id'], 120), 'cwd': _safe(raw['cwd'], 300),
             'modified': common.iso(common.parse_time(mtime)), 'age_s': int(age), 'age': common.fmt_age(age),
             'model': _safe(raw['model'], 60),
+            'context': baton.redact_obj(raw.get('context')),
+            'started_by': _safe(raw.get('started_by'), 120),
+            'unmanaged': age <= DEFAULT_SINCE_S and not raw.get('managed', False),
             'title': _safe(raw['title'], TITLE_CHARS) or '(no user message in the head read)',
             'last': _safe(last, LAST_CHARS),
             'state': 'job' if raw['job'] else classify(raw['turn'], age), 'path': _safe(raw['path'], 500)}
 
 
-def _context() -> dict:
+def _context(policy=None) -> dict:
+    return observations.once(('session-context',), lambda: _read_context(policy))
+
+
+def _read_context(policy=None) -> dict:
     """Read once per run: job session ids and the Codex app's thread names."""
-    return {'jobs': job_session_ids(), 'codex_names': codex_thread_names()}
+    import glob
+    ids = job_session_ids()
+    if policy is None:
+        try:
+            policy = common.load_policy()
+        except Exception:
+            policy = {}
+    config = policy.get('sessions') or {}
+    managed = set(ids)
+    managed.update(x for x in config.get('lead_family', []) if isinstance(x, str))
+    if isinstance(config.get('lead_session_id'), str):
+        managed.add(config['lead_session_id'])
+    for path in glob.glob(os.path.join(common.BATONS, '*.json')):
+        b = common.read_json(path)
+        if isinstance(b, dict):
+            from . import lanes
+            managed.update(lanes.bound_ids(b))
+    return {'jobs': ids, 'managed': managed, 'codex_names': codex_thread_names(), 'policy': policy}
 
 
 def describe_session(engine: str, path: str) -> dict | None:
@@ -467,11 +536,14 @@ def describe_session(engine: str, path: str) -> dict | None:
     return _row(raw, mtime) if raw else None
 
 
+@observations.command
 def collect_sessions(engine: str = 'all', since_s: float = DEFAULT_SINCE_S, cwd: str | None = None,
-                     limit: int = DEFAULT_LIMIT, include_jobs: bool = False, states=None) -> dict:
+                     limit: int = DEFAULT_LIMIT, include_jobs: bool = False, states=None, raw_paths=False, policy=None,
+                     fresh=False) -> dict:
     """{'rows': [...], 'cut': N, 'cut_waiting': M, 'cut_exact': bool}: the newest `limit` matching rows, and how
     many further matching rows the limit cut off (counted for up to CUT_COUNT_BUDGET_S; then `cut_exact` is False
-    and the counts are lower bounds). `states` keeps only rows in those states ('job' implies include_jobs)."""
+    and the counts are lower bounds). `states` keeps only rows in those states ('job' implies include_jobs).
+    `fresh` bypasses the supervisor cache for destructive eligibility checks."""
     if engine not in ENGINE_CHOICES:
         raise ValueError(f'engine must be one of {ENGINE_CHOICES}')
     states = set(states or ())
@@ -480,10 +552,13 @@ def collect_sessions(engine: str = 'all', since_s: float = DEFAULT_SINCE_S, cwd:
         raise ValueError(f'unknown --state {sorted(bad)}: use {", ".join(STATES + ("job",))}')
     include_jobs = include_jobs or 'job' in states
     want = baton.norm_dir(cwd) if cwd else None
-    ctx = _context()
+    ctx = _context(policy)
+    from . import lanes
+    sources = lanes.observation_sources(ctx['policy'], fresh=True) if fresh else lanes.observation_sources(ctx['policy'])
+    matching = 0
     rows, cut, cut_waiting, cut_exact, started = [], 0, 0, True, time.monotonic()
     for mtime, eng, path in _candidates(engine, common.now().timestamp() - since_s):
-        full = bool(limit) and len(rows) >= limit
+        full = bool(limit) and matching >= limit
         if full and time.monotonic() - started > CUT_COUNT_BUDGET_S:
             cut_exact = False
             break
@@ -493,13 +568,28 @@ def collect_sessions(engine: str = 'all', since_s: float = DEFAULT_SINCE_S, cwd:
         if want and not baton.under_dir(baton.norm_dir(raw['cwd']), want):
             continue
         row = _row(raw, mtime)
-        if states and row['state'] not in states:
-            continue
-        if full:
-            cut += 1
-            cut_waiting += row['state'] == 'waiting-on-user'
-        else:
-            rows.append(row)
+        row['_writer_cwd'] = raw['cwd']  # retain identity until observation and final filtering
+        row = lanes.observe([row], ctx['policy'], sources=sources, include_missing=False)[0]
+        matching += not states or row['state'] in states
+        rows.append(row)
+    rows = lanes.observe(rows, ctx['policy'], sources=sources)
+    rows = [r for r in rows if engine == 'all' or r['engine'] == engine]
+    if states:
+        rows = [r for r in rows if r['state'] in states]
+    if want:
+        rows = [r for r in rows if baton.under_dir(baton.norm_dir(r.get('_writer_cwd') or r.get('cwd')), want)]
+    if limit and len(rows) > limit:
+        cut += len(rows) - limit
+        cut_waiting += sum(r['state'] in ('waiting-on-user', 'needs-you') for r in rows[limit:])
+        rows = rows[:limit]
+    for row in rows:
+        row.setdefault('unmanaged', row['id'] not in ctx['managed'])
+    if not raw_paths:
+        for row in rows:
+            row.pop('_writer_cwd', None)
+            for key in ('id', 'cwd', 'title', 'reason'):
+                if isinstance(row.get(key), str):
+                    row[key] = baton.redact(row[key])
     return {'rows': rows, 'cut': cut, 'cut_waiting': cut_waiting, 'cut_exact': cut_exact}
 
 
@@ -543,11 +633,12 @@ def cut_notes(res: dict, limit: int, flags: str = '') -> list[str]:
 
 
 def format_text(rows: list[dict], notes: list[str] | None = None) -> str:
+    from . import context
     if not rows:
         return 'no recent interactive sessions'
     out = []
     for r in rows:
-        out.append(f"{r['engine']:<6} {r['id']}  {r['age']:>4} ago  {r['state']:<15} {r['model'] or '-'}  {r['cwd'] or '-'}")
+        out.append(f"{r['engine']:<6} {r['id']}  {r['age']:>4} ago  {r['state']:<15} {r['model'] or '-'}  {r['cwd'] or '-'}  {context.label(r.get('context'))} startedBy={r.get('started_by') or '?'}" + (' UNMANAGED' if r.get('unmanaged') else ''))
         out.append(f"       title: {r['title']}")
         if r['last']:
             out.append(f"       last:  {r['last']}")
@@ -559,12 +650,13 @@ def _cell(text) -> str:
 
 
 def format_md(rows: list[dict], out_dir: str | None = None, notes: list[str] | None = None) -> str:
+    from . import context
     if not rows:
         return 'No recent interactive sessions.'
-    out = ['| Engine | Id | Age | State | Model | Cwd | Title | Last assistant line |', '|---|---|---|---|---|---|---|---|']
+    out = ['| Engine | Id | Age | State | Model | Context | Cwd | Title | Last assistant line | startedBy | Custody |', '|---|---|---|---|---|---|---|---|---|---|---|']
     for r in rows:
-        out.append('| ' + ' | '.join(_cell(v) for v in (r['engine'], '`' + r['id'] + '`', r['age'], r['state'], r['model'],
-                                                          '`' + str(r['cwd'] or '-') + '`', r['title'], r['last'])) + ' |')
+        out.append('| ' + ' | '.join(_cell(v) for v in (r['engine'], '`' + r['id'] + '`', r['age'], r['state'], r['model'], context.label(r.get('context')),
+                                                          '`' + str(r['cwd'] or '-') + '`', r['title'], r['last'], r.get('started_by'), 'UNMANAGED' if r.get('unmanaged') else 'tracked')) + ' |')
     waiting_cut = [n for n in notes or [] if 'waiting-on-user' in n]
     if [n for n in notes or [] if n not in waiting_cut]:
         out += [''] + [f'- {n}' for n in notes if n not in waiting_cut]

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import difflib
 import json
 import os
 import re
@@ -25,10 +26,11 @@ import sys
 import tempfile
 from pathlib import Path
 
-from . import common
+from . import common, baton
 
 HOOK_EVENT = 'UserPromptSubmit'
 HOOK_TIMEOUT_S = 5
+EVENT_TIMEOUTS = {'UserPromptSubmit': 5, 'PreCompact': 30, 'Notification': 5, 'Stop': 5}
 # Exit 2 from a UserPromptSubmit hook BLOCKS the prompt, and python itself exits 2 when the script is
 # missing (folder moved, or mid-reinstall). `|| exit 0` turns every failure into a pass.
 FAIL_OPEN = '|| exit 0'
@@ -76,38 +78,38 @@ def is_our_hook(item, custom: str | None = None) -> bool:
     return bool(custom) and _norm(text) == _norm(custom)
 
 
-def _groups(settings: dict) -> list:
+def _groups(settings: dict, event=HOOK_EVENT) -> list:
     hooks = settings.get('hooks')
-    groups = hooks.get(HOOK_EVENT) if isinstance(hooks, dict) else None
+    groups = hooks.get(event) if isinstance(hooks, dict) else None
     return groups if isinstance(groups, list) else []
 
 
-def count_our_hooks(settings: dict, custom: str | None = None) -> int:
-    return sum(1 for g in _groups(settings) if isinstance(g, dict) and isinstance(g.get('hooks'), list)
+def count_our_hooks(settings: dict, custom: str | None = None, event=HOOK_EVENT) -> int:
+    return sum(1 for g in _groups(settings, event) if isinstance(g, dict) and isinstance(g.get('hooks'), list)
                for h in g['hooks'] if is_our_hook(h, custom))
 
 
-def add_hook(settings: dict, custom: str | None = None) -> bool:
+def add_hook(settings: dict, custom: str | None = None, event=HOOK_EVENT) -> bool:
     """Append our hook as its own matcher group. Returns False when it is already present."""
-    if count_our_hooks(settings, custom):
+    if count_our_hooks(settings, custom, event):
         return False
     hooks = settings.setdefault('hooks', {})
     if not isinstance(hooks, dict):
         raise ValueError('settings "hooks" is not an object; refusing to edit')
-    groups = hooks.setdefault(HOOK_EVENT, [])
+    groups = hooks.setdefault(event, [])
     if not isinstance(groups, list):
-        raise ValueError(f'settings hooks.{HOOK_EVENT} is not a list; refusing to edit')
-    groups.append({'hooks': [{'type': 'command', 'command': command(custom), 'timeout': HOOK_TIMEOUT_S}]})
+        raise ValueError(f'settings hooks.{event} is not a list; refusing to edit')
+    groups.append({'hooks': [{'type': 'command', 'command': command(custom), 'timeout': EVENT_TIMEOUTS.get(event, HOOK_TIMEOUT_S)}]})
     return True
 
 
-def remove_hook(settings: dict, custom: str | None = None) -> int:
+def remove_hook(settings: dict, custom: str | None = None, event=HOOK_EVENT) -> int:
     """Drop only our hook entries; a group (and the event key) emptied by that removal goes too."""
     hooks = settings.get('hooks')
-    if not isinstance(hooks, dict) or not isinstance(hooks.get(HOOK_EVENT), list):
+    if not isinstance(hooks, dict) or not isinstance(hooks.get(event), list):
         return 0
     removed, kept = 0, []
-    for group in hooks[HOOK_EVENT]:
+    for group in hooks[event]:
         if not isinstance(group, dict) or not isinstance(group.get('hooks'), list):
             kept.append(group)
             continue
@@ -120,9 +122,9 @@ def remove_hook(settings: dict, custom: str | None = None) -> int:
         kept.append(group)
     if removed:
         if kept:
-            hooks[HOOK_EVENT] = kept
+            hooks[event] = kept
         else:
-            del hooks[HOOK_EVENT]
+            del hooks[event]
     return removed
 
 
@@ -302,7 +304,15 @@ def check(settings_path: str, custom: str | None = None, bin_dir: str | None = N
             except OSError:
                 pass
         skills[folder] = {'path': target, 'exists': exists, 'current': current}
-    return {'hook': hook, 'bin_dir': bin_dir, 'bin_dir_on_path': _on_path(bin_dir),
+    events = {}
+    try:
+        settings = load_settings(settings_path)
+        for event in ('PreCompact', 'Notification', 'Stop'):
+            n = count_our_hooks(settings, custom, event)
+            events[event] = {'registered': n, 'exactly_one': n == 1}
+    except (OSError, ValueError) as exc:
+        events['error'] = str(exc)
+    return {'hook': hook, 'events': events, 'bin_dir': bin_dir, 'bin_dir_on_path': _on_path(bin_dir),
             'aliases': aliases, 'skills': skills}
 
 
@@ -319,6 +329,9 @@ def format_check(report: dict) -> str:
             lines.append('       add it (preview, then --yes): twinlane install')
         elif n > 1:
             lines.append('       fix it: twinlane install --unhook --yes, then twinlane install --yes')
+    for event, state in report.get('events', {}).items():
+        if isinstance(state, dict):
+            lines.append(f"hook   {event} registered {state['registered']} (expected exactly one)")
     lines.append(f"bin    {report['bin_dir']} " + ('is on PATH' if report['bin_dir_on_path'] else 'is NOT on PATH'))
     if not report['aliases']:
         lines.append('alias  none found (write one: twinlane install --alias NAME)')
@@ -335,22 +348,22 @@ def format_check(report: dict) -> str:
 
 # ---------------------------------------------------------------- planning (nothing is written here)
 
-def plan_hook(path: Path, custom: str | None, remove: bool) -> dict:
+def plan_hook(path: Path, custom: str | None, remove: bool, event=HOOK_EVENT) -> dict:
     settings = load_settings(path)
     proposed = copy.deepcopy(settings)
     shown = command(custom)
     if remove:
-        changed = remove_hook(proposed, custom) > 0
+        changed = remove_hook(proposed, custom, event) > 0
         plan = {'kind': 'unhook', 'target': str(path), 'changed': changed,
-                'would': f'Would remove the {HOOK_EVENT} hook from {path}',
-                'doing': f'Removing the {HOOK_EVENT} hook from {path}',
+                'would': f'Would remove the {event} hook from {path}',
+                'doing': f'Removing the {event} hook from {path}',
                 'noop': f'Hook not registered in {path}; nothing changed.'}
     else:
-        existing = count_our_hooks(settings, custom)
-        changed = add_hook(proposed, custom)
+        existing = count_our_hooks(settings, custom, event)
+        changed = add_hook(proposed, custom, event)
         plan = {'kind': 'hook', 'target': str(path), 'changed': changed,
-                'would': f'Would add {HOOK_EVENT} hook to {path}',
-                'doing': f'Adding {HOOK_EVENT} hook to {path}',
+                'would': f'Would add {event} hook to {path}',
+                'doing': f'Adding {event} hook to {path}',
                 'detail': 'Command: ' + shown,
                 'noop': 'Hook already registered; no write needed.' if existing == 1 else
                         f'Hook already registered {existing} times; run `twinlane install --unhook --yes` '
@@ -362,8 +375,13 @@ def plan_hook(path: Path, custom: str | None, remove: bool) -> dict:
         saved = backup_file(path) if path.exists() else None
         if saved:
             messages.append('Backup: ' + saved)
-        common.write_json(str(path), proposed)
-        n = count_our_hooks(load_settings(path), custom)
+        current = load_settings(path)
+        if remove:
+            remove_hook(current, custom, event)
+        else:
+            add_hook(current, custom, event)
+        common.write_json(str(path), current)
+        n = count_our_hooks(load_settings(path), custom, event)
         if remove:
             if n:
                 return common.EXIT_FAILED, messages, 'verification failed: hook still present', saved
@@ -374,6 +392,11 @@ def plan_hook(path: Path, custom: str | None, remove: bool) -> dict:
             messages.append('Verified one hook.')
         return common.EXIT_OK, messages, None, saved
 
+    plan['diff'] = ''.join(difflib.unified_diff(
+        json.dumps(settings, ensure_ascii=False, indent=2).splitlines(True),
+        json.dumps(proposed, ensure_ascii=False, indent=2).splitlines(True),
+        fromfile=str(path), tofile=str(path) + ' (proposed)'))
+    plan['event'] = event
     plan['apply'] = apply
     return plan
 
@@ -454,6 +477,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--check', action='store_true', help='read-only report; changes nothing')
     p.add_argument('--hook', action='store_true', help='add the hook (the default when no other action is given)')
     p.add_argument('--unhook', action='store_true', help='remove our hook entry')
+    p.add_argument('--lane-state', action='store_true', help='preview Notification/Stop hooks and the Codex notify line')
+    p.add_argument('--precompact', action='store_true', help='preview the session-bound PreCompact checkpoint hook')
     p.add_argument('--hook-command', metavar='CMD', help='custom hook command to register or recognise')
     p.add_argument('--alias', action='append', metavar='NAME[,NAME]', help='write command shims called NAME')
     p.add_argument('--bin-dir', default=None, help='folder for the shims (default ~/.local/bin)')
@@ -467,12 +492,14 @@ def main(argv=None) -> int:
     a = p.parse_args(argv)
     if a.hook and a.unhook:
         p.error('--hook and --unhook cannot be combined')
-    if a.check and (a.hook or a.unhook or a.yes or a.replace):
+    if a.check and (a.hook or a.unhook or a.yes or a.replace or a.precompact or a.lane_state):
         p.error('--check is read-only and cannot be combined with --hook, --unhook, --replace or --yes')
     if a.replace and not a.alias:
         p.error('--replace needs --alias')
-    do_hook = a.hook or a.unhook or not (a.alias or a.skill or a.check)
-    if a.hook_command and not (do_hook or a.check):
+    do_hook = a.hook or (a.unhook and not a.precompact) or not (a.alias or a.skill or a.check or a.precompact or a.lane_state)
+    if a.hook and a.precompact:
+        p.error('preview/install each hook separately: --hook or --precompact')
+    if a.hook_command and not (do_hook or a.check or a.precompact or a.lane_state):
         p.error('--hook-command needs --hook, --unhook, --check or the default hook action')
     path = Path(a.settings or default_settings_path())
     bin_dir = os.path.abspath(os.path.expanduser(a.bin_dir)) if a.bin_dir else default_bin_dir()
@@ -488,6 +515,10 @@ def main(argv=None) -> int:
         plans = []
         if do_hook:
             plans.append(plan_hook(path, a.hook_command, a.unhook))
+        if a.precompact:
+            plans.append(plan_hook(path, a.hook_command, a.unhook, 'PreCompact'))
+        if a.lane_state:
+            plans.extend(plan_hook(path, a.hook_command, a.unhook, event) for event in ('Notification', 'Stop'))
         if names:
             plans.extend(plan_aliases(names, bin_dir, a.replace))
         for folder in a.skill or []:
@@ -502,10 +533,13 @@ def main(argv=None) -> int:
         say(plan['doing'] if a.yes and plan['changed'] else plan['would'])
         if plan.get('detail'):
             say(plan['detail'])
+        if plan.get('diff'):
+            say(baton.redact(plan['diff']))
         if not plan['changed']:
             say(plan['noop'])
         results.append({'kind': plan['kind'], 'target': plan['target'], 'changed': plan['changed'],
-                        'applied': False, 'backup': None})
+                        'applied': False, 'backup': None,
+                        **({'event': plan['event'], 'diff': baton.redact(plan['diff'])} if 'event' in plan else {})})
     pending = [(plan, res) for plan, res in zip(plans, results) if plan['changed']]
     if names and not _on_path(bin_dir):
         say(f'Note: {bin_dir} is not on PATH.')
@@ -526,8 +560,11 @@ def main(argv=None) -> int:
                 rc = code
                 break
             res['applied'] = True
+    notify = [sys.executable, common.TWINLANE_PY, 'hook', '--codex-notify'] if a.lane_state else None
+    if notify:
+        say('Codex config (add manually; never edited here): notify = ' + json.dumps(notify))
     if a.json:
-        common.emit({'yes': a.yes, 'actions': results}, True)
+        common.emit({'yes': a.yes, 'actions': results, **({'codex_notify': notify} if notify else {})}, True)
     return rc
 
 

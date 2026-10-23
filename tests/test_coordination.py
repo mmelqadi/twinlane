@@ -486,6 +486,7 @@ class CoordinationTests(unittest.TestCase):
     def test_compatible_id_collision_is_bounded_and_preserves_existing_folder(self):
         taken = Path(common.JOBS) / '20261011-000000-claude-aaaa'; taken.mkdir()
         (taken / 'keep.txt').write_text('peer fixture')
+        # An unreadable live record occupies its own WIP lane; allocation still avoids its id.
         with mock.patch.object(common, 'stamp', return_value='20261011-000000'), \
                 mock.patch.object(coordination.secrets, 'token_hex', side_effect=['aaaa', 'bbbb']):
             self.assertTrue(jobs.create_job(self.plan()).endswith('-bbbb'))
@@ -704,6 +705,139 @@ class CoordinationTests(unittest.TestCase):
             with self.assertRaises(coordination.Refusal):
                 coordination._read('task-X')
         self.assertFalse(path.exists())
+
+    # ------------------------------------------------------------ owner resume
+
+    def resume(self, request, parent, actor='A', recipient='B', continue_job=None, flag=True):
+        job = continue_job or coordination._read('task-X')['dispatches'][parent]['job']
+        self.base['continue_job'] = job
+        try:
+            args = ['--brief', str(self.brief), '--cd', str(self.root), '--bg', '--json',
+                    '--continue-job', job, '--task-id', 'task-X', '--dispatch-id', request,
+                    '--actor', actor, '--recipient', recipient, '--parent-dispatch', parent]
+            return self.run_cli(args + (['--resume-owner'] if flag else []))
+        finally:
+            self.base.pop('continue_job')
+
+    def reviewed_chain(self):
+        """first A->B, review B->R, accepted fix R->B, re-review B->R: all done, B still owns."""
+        self.cli(); self.cli('review', 'B', 'R', 'first')
+        coordination.record_transition('task-X', 'finding-F1', authority='A', kind='review',
+            actor='R', recipient='B', predecessor='review', finding='F1: fixture finding',
+            evidence='owned reviewed fixture receipt')
+        self.assertEqual(self.cli('fix', 'R', 'B', 'review', 'finding-F1')[0], 0)
+        self.assertEqual(self.cli('rereview', 'B', 'R', 'fix')[0], 0)
+
+    def test_coordinator_resumes_finished_owner_without_new_ancestry(self):
+        self.reviewed_chain()
+        rc, text = self.resume('resume-1', 'fix')
+        self.assertEqual(rc, 0, text)
+        data = coordination._read('task-X')
+        entry, fix = data['dispatches']['resume-1'], data['dispatches']['fix']
+        self.assertEqual(entry['lineage'], fix['lineage'])
+        self.assertEqual((data['owner'], data['epoch'], data['revision']), ('B', 0, 1))
+        self.assertEqual(self.resume('resume-1', 'fix')[0], 0)  # replay: same job, no second runner
+        self.assertEqual(len(self.submissions), 5)
+
+    def test_resume_can_chain_from_the_owners_latest_resume(self):
+        self.cli()
+        self.assertEqual(self.resume('resume-1', 'first')[0], 0)
+        self.assertEqual(self.resume('resume-2', 'resume-1')[0], 0)
+        before = self.ids()
+        self.assertEqual(self.resume('resume-3', 'first')[0], 3)  # no longer the latest
+        self.assertEqual(self.ids(), before)
+
+    def test_resume_without_the_flag_still_hits_ownership_and_cycle_rules(self):
+        self.reviewed_chain()
+        before = self.ids()
+        rc, text = self.resume('resume-1', 'fix', flag=False)
+        self.assertEqual(rc, 3); self.assertIn('does not own the predecessor', text)
+        rc, text = self.cli('again', 'B', 'B', 'fix')
+        self.assertEqual(rc, 3); self.assertIn('ancestor', text)
+        self.assertEqual(self.ids(), before)
+
+    def test_resume_refusals_leave_no_job(self):
+        self.reviewed_chain()
+        before = self.ids()
+        cases = (dict(request='r1', parent='fix', actor='R'),                 # not the coordinator
+                 dict(request='r2', parent='fix', actor='B'),                 # owner cannot self-resume
+                 dict(request='r3', parent='fix', recipient='R'),             # not the owner
+                 dict(request='r4', parent='rereview', recipient='R'),        # predecessor is not the owner's
+                 dict(request='r5', parent='first'),                          # not the owner's latest
+                 dict(request='r6', parent='fix', continue_job='20261014-000000-claude-ffff'))
+        for case in cases:
+            with self.subTest(case=case):
+                self.assertEqual(self.resume(**case)[0], 3)
+        self.assertEqual(self.ids(), before)
+
+    def test_resume_refuses_unless_the_owner_finished_done_and_nothing_runs(self):
+        self.reviewed_chain()
+        data = coordination._read('task-X')
+        fix, rereview = data['dispatches']['fix']['job'], data['dispatches']['rereview']['job']
+        real = jobs.job_status
+        before = self.ids()
+        for target, status in ((fix, 'failed'), (fix, 'timeout'), (rereview, 'running'),
+                               (rereview, 'unknown'), (rereview, 'orphaned')):
+            with self.subTest(target=target, status=status),                     mock.patch.object(jobs, 'job_status', side_effect=lambda j: status if j == target else real(j)):
+                rc, text = self.resume('r-' + status, 'fix')
+                self.assertEqual(rc, 3, text)
+        self.assertEqual(self.ids(), before)
+
+    def test_resume_owner_must_be_exactly_true_and_takes_no_receipt(self):
+        self.cli()
+        job = coordination._read('task-X')['dispatches']['first']['job']
+        for value in (False, 1, 'yes'):
+            plan = self.plan('r1', 'A', 'B', 'first')
+            plan['coordination']['resume_owner'] = value
+            plan['continue_job'] = job
+            with self.subTest(value=value), self.assertRaises(coordination.Refusal):
+                coordination.allocate(plan, lambda jid: None)
+        coordination.record_transition('task-X', 'finding-F1', authority='A', kind='review',
+            actor='A', recipient='B', predecessor='first', finding='F1: fixture finding',
+            evidence='owned reviewed fixture receipt')  # real and unused: only the resume rule refuses it
+        plan = self.plan('r2', 'A', 'B', 'first', receipt='finding-F1')
+        plan['coordination']['resume_owner'] = True
+        plan['continue_job'] = job
+        with self.assertRaises(coordination.Refusal) as caught:
+            coordination.allocate(plan, lambda jid: None)
+        self.assertIn('takes no transition receipt', str(caught.exception))
+        self.assertIsNone(coordination._read('task-X')['receipts']['finding-F1']['used_by'])
+
+    def test_resume_without_a_task_registry_allocates_nothing(self):
+        for parent in (None, 'first'):
+            with self.subTest(parent=parent):
+                args = ['--brief', str(self.brief), '--cd', str(self.root), '--bg', '--json',
+                        '--task-id', 'task-X', '--dispatch-id', 'r1', '--actor', 'A', '--recipient', 'B',
+                        '--resume-owner']
+                rc, text = self.run_cli(args + (['--parent-dispatch', parent] if parent else []))
+                self.assertEqual(rc, 3, text)
+                self.assertEqual(self.ids(), set())
+                self.assertIsNone(coordination._read('task-X'))
+        plan = self.plan('r2', 'A', 'B')
+        plan['coordination']['resume_owner'] = True
+        with self.assertRaises(coordination.Refusal) as caught:
+            coordination.allocate(plan, lambda jid: None)
+        self.assertIn('existing task registry', str(caught.exception))
+        self.assertIsNone(coordination._read('task-X'))
+
+    def test_resume_needs_a_predecessor_in_an_existing_registry(self):
+        self.cli()
+        before = self.ids()
+        args = ['--brief', str(self.brief), '--cd', str(self.root), '--bg', '--json',
+                '--task-id', 'task-X', '--dispatch-id', 'r1', '--actor', 'A', '--recipient', 'B',
+                '--resume-owner']
+        self.assertEqual(self.run_cli(args)[0], 3)
+        self.assertEqual(self.ids(), before)
+
+    def test_worker_cannot_resume_an_owner(self):
+        self.cli()
+        plan = self.plan('r1', 'A', 'B', 'first')
+        plan['coordination']['resume_owner'] = True
+        plan['continue_job'] = coordination._read('task-X')['dispatches']['first']['job']
+        with mock.patch.object(coordination, 'worker_ids', return_value=['20261014-000000-claude-abcd']),                 mock.patch.object(coordination, '_check_lineage'):
+            with self.assertRaises(coordination.Refusal) as caught:
+                coordination.allocate(plan, lambda jid: None)
+        self.assertIn('workers cannot resume', str(caught.exception))
 
 
 if __name__ == '__main__':

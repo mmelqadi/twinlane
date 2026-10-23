@@ -20,6 +20,93 @@ import test_support  # noqa: E402; isolated temp home before importing twinlane
 from twinlane import common  # noqa: E402
 
 
+class WorktreeIdentityAndPreflight(unittest.TestCase):
+    def test_worktree_top_main_linked_nested_and_outside(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            main = os.path.join(tmp, 'main')
+            linked = os.path.join(tmp, 'linked')
+            for root in (main, linked):
+                os.makedirs(os.path.join(root, 'sub'))
+            os.mkdir(os.path.join(main, '.git'))
+            with open(os.path.join(linked, '.git'), 'w') as handle:
+                handle.write('gitdir: ../main/.git/worktrees/linked')
+            self.assertIsNone(common.worktree_top(tmp))
+            for root in (main, linked):
+                self.assertEqual(common.worktree_top(os.path.join(root, 'sub')), os.path.realpath(root))
+                self.assertEqual(common.writer_key(root), common.writer_key(os.path.join(root, 'sub')))
+            nested = os.path.join(linked, 'sub')
+            os.mkdir(os.path.join(nested, '.git'))
+            self.assertEqual(common.worktree_top(nested), os.path.realpath(nested))
+
+    def test_preflight_explicit_version_and_missing_binary_are_read_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = os.path.join(tmp, 'codex.cmd' if common.IS_WIN else 'codex')
+            with open(binary, 'w') as handle:
+                handle.write('@echo codex-cli 0.149.1\n' if common.IS_WIN else '#!/bin/sh\necho codex-cli 0.149.1\n')
+            os.chmod(binary, 0o755)
+            with mock.patch.dict(os.environ, {'TWINLANE_CODEX_BIN': binary, 'LOCALAPPDATA': tmp}), \
+                    mock.patch.object(common, 'CODEX_DIR', os.path.join(tmp, 'vendor')), \
+                    mock.patch.object(common, 'BIN', os.path.join(tmp, 'never-created')):
+                pf = common.codex_preflight({'codex': {'min_cli_version': '0.150.0'}})
+                self.assertIn('0.149.1', pf['refusal'])
+                self.assertEqual(pf['origin'], 'env')
+                self.assertFalse(os.path.exists(common.BIN))
+                os.environ['TWINLANE_CODEX_BIN'] = os.path.join(tmp, 'missing')
+                self.assertIn('missing file', common.codex_preflight({})['refusal'])
+
+    @unittest.skipUnless(common.IS_WIN, 'Windows app builds')
+    def test_app_build_ranking_and_older_env_opt_in(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, {'LOCALAPPDATA': tmp, 'TWINLANE_CODEX_BIN': ''}), \
+                    mock.patch.object(common, 'CODEX_DIR', os.path.join(tmp, 'vendor')), \
+                    mock.patch.object(common, 'BIN', os.path.join(tmp, 'private')):
+                base = os.path.join(tmp, 'OpenAI', 'Codex', 'bin')
+                self.assertIn(base, common._app_bin_dirs())
+                # The standalone CLI folder is a separately updated install, never an app source.
+                standalone = os.path.join(tmp, 'Programs', 'OpenAI', 'Codex', 'bin')
+                self.assertNotIn(standalone, common._app_bin_dirs())
+                self.assertTrue(common._standalone_codex(os.path.join(standalone, 'codex.exe')))
+                self.assertFalse(common._app_owned(os.path.join(standalone, 'codex.exe')))
+                builds = []
+                for name in ('old', 'new'):
+                    folder = os.path.join(base, name)
+                    os.makedirs(folder)
+                    for filename in common.CODEX_FILES:
+                        with open(os.path.join(folder, filename), 'w') as handle:
+                            handle.write(name)
+                    builds.append(os.path.join(folder, 'codex.exe'))
+                override = os.path.join(tmp, 'override.cmd')
+                with open(override, 'w') as handle:
+                    handle.write('@echo codex-cli 0.149.1\n')
+                version = lambda p: '0.162.0' if p == builds[1] else '0.149.1'
+                with mock.patch.object(common, '_read_codex_version', side_effect=version):
+                    os.environ['TWINLANE_CODEX_BIN'] = builds[0]
+                    pf = common.codex_preflight({})
+                    self.assertEqual((pf['binary'], pf['origin'], pf['version']), (builds[1], 'app', '0.162.0'))
+                    self.assertIsNone(pf['refusal'])
+                    os.environ['TWINLANE_CODEX_BIN'] = override
+                    self.assertIn('older than the Codex app build 0.162.0', common.codex_preflight({})['refusal'])
+                    os.makedirs(standalone)
+                    old_cli = os.path.join(standalone, 'codex.exe')
+                    with open(old_cli, 'w') as handle:
+                        handle.write('standalone')
+                    os.environ['TWINLANE_CODEX_BIN'] = old_cli
+                    refusal = common.codex_preflight({})['refusal']
+                    self.assertIn('(the standalone Codex CLI), older than the Codex app build 0.162.0', refusal)
+                    os.environ['TWINLANE_CODEX_BIN'] = override
+                    self.assertIsNone(common.codex_preflight({'codex': {'allow_older_env_bin': True}})['refusal'])
+                    self.assertIn('older than codex.min_cli_version', common.codex_preflight({'codex': {
+                        'allow_older_env_bin': True, 'min_cli_version': '0.150.0'}})['refusal'])
+                    self.assertFalse(os.path.exists(common.BIN))
+                    os.environ['TWINLANE_CODEX_BIN'] = builds[0]
+                    copied, why = common.resolve_codex()
+                    self.assertTrue(copied.startswith(common.BIN))
+                    self.assertIn('names app build 0.149.1; using the newer app build 0.162.0', why)
+                    binary, _, lease = common.acquire_codex_binary('path')
+                    self.addCleanup(common.release_codex, lease)
+                    self.assertTrue(binary.startswith(common.BIN))
+
+
 class PidAliveNeverKills(unittest.TestCase):
     def test_live_child_survives_the_probe(self):
         child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])
@@ -97,7 +184,9 @@ class PidStateIsTriState(unittest.TestCase):
 
     def test_kill_tree_refuses_an_unreadable_identity(self):
         # It cannot prove the pid is still the stamped process, so it must not kill it.
-        with unreadable_identity(self.child.pid):
+        probe = mock.patch.object(common, '_k32', return_value=FakeKernel(times_ok=False)) \
+            if common.IS_WIN else unreadable_identity(self.child.pid)
+        with probe:
             self.assertFalse(common.kill_tree(self.child.pid, self.created))
         self.assertIsNone(self.child.poll(), 'kill_tree killed a process whose identity it could not read')
 
@@ -456,7 +545,15 @@ class CodexBinaryPortable(unittest.TestCase):
             return (app, '', 'lease') if have_app[0] else (None, 'no complete Codex app build found', None)
 
         have_app = [True]
-        on_path = [os.path.join('usr', 'bin', 'codex')]
+        # A sibling of a disposable cwd is absolute and outside it on every platform.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cwd = os.path.abspath(os.path.join(tmp.name, 'work'))
+        path_binary = os.path.realpath(os.path.join(tmp.name, 'bin', 'codex'))
+        os.mkdir(cwd)
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(cwd)
+        on_path = [path_binary]
         with mock.patch.dict(os.environ, {'TWINLANE_CODEX_BIN': ''}), \
                 mock.patch.object(common, 'acquire_codex', side_effect=acquire) as lookup, \
                 mock.patch.object(common.shutil, 'which', side_effect=lambda name: on_path[0]):
@@ -473,13 +570,20 @@ class CodexBinaryPortable(unittest.TestCase):
             self.assertEqual((binary, lease), (on_path[0], None))
             self.assertIn('no complete Codex app build', why)
             self.assertIn(on_path[0], why)
-            # 4. nothing anywhere: fail closed
+            # 4. relative and absolute cwd-local PATH hits are refused.
+            for hit in (os.path.join('usr', 'bin', 'codex'), os.path.join(cwd, 'bin', 'codex')):
+                with self.subTest(hit=hit):
+                    on_path[0] = hit
+                    binary, why, lease = common.acquire_codex_binary('auto')
+                    self.assertEqual((binary, lease), (None, None))
+                    self.assertIn('inside the current directory', why)
+            # 5. nothing anywhere: fail closed
             on_path[0] = None
             binary, why, lease = common.acquire_codex_binary('auto')
             self.assertEqual((binary, lease), (None, None))
             self.assertIn('no codex on PATH', why)
             # app-copy never falls back to the PATH, and path never looks for an app copy
-            on_path[0] = os.path.join('usr', 'bin', 'codex')
+            on_path[0] = path_binary
             self.assertEqual(common.acquire_codex_binary('app-copy')[::2], (None, None))
             lookup.reset_mock()
             have_app[0] = True
@@ -1374,6 +1478,440 @@ class CodexBinary(unittest.TestCase):
         self.assertEqual(binary, good)
         self.assertIn('earlier private copy', why)
         self.assertIn(good, why)
+
+
+class FakeKernel:
+    """Scripted kernel32 for _win_observe: every call sets the ctypes last error itself, as a real
+    use_last_error function would, and is recorded. No real process is ever opened."""
+
+    def __init__(self, handle=77, open_error=0, exit_ok=True, exit_code=259, exit_error=0, times_ok=True,
+                 creation=133_700_000_000_000_001, times_error=0, close_ok=True, close_error=0, raises=()):
+        self.handle, self.open_error = handle, open_error
+        self.exit_ok, self.exit_code, self.exit_error = exit_ok, exit_code, exit_error
+        self.times_ok, self.creation, self.times_error = times_ok, creation, times_error
+        self.close_ok, self.close_error, self.raises = close_ok, close_error, set(raises)
+        self.calls = []
+
+    def _enter(self, name):
+        import ctypes
+        self.calls.append(name)
+        if name in self.raises:
+            ctypes.set_last_error(1234)
+            raise OSError(f'synthetic {name} failure')
+
+    def OpenProcess(self, access, inherit, pid):
+        import ctypes
+        self._enter('open')
+        ctypes.set_last_error(self.open_error)
+        return self.handle
+
+    def GetExitCodeProcess(self, handle, code):
+        import ctypes
+        self._enter('exit_code')
+        code._obj.value = self.exit_code
+        ctypes.set_last_error(self.exit_error)
+        return self.exit_ok
+
+    def GetProcessTimes(self, handle, created, exited, kernel, user):
+        import ctypes
+        self._enter('times')
+        created._obj.value = self.creation
+        ctypes.set_last_error(self.times_error)
+        return self.times_ok
+
+    def CloseHandle(self, handle):
+        import ctypes
+        self._enter('close')
+        ctypes.set_last_error(self.close_error)  # would clobber an earlier error that was not captured at once
+        return self.close_ok
+
+
+@unittest.skipUnless(common.IS_WIN, 'ctypes last-error capture is Windows-only')
+class WinProbeFailsClosed(unittest.TestCase):
+    """Only qualified absence, a readable exit or a creation mismatch is DEAD. An unexpected open or exit-query
+    failure is UNKNOWN with or without a stamp. Access denied, or failed times after STILL_ACTIVE, is an
+    existing process with an unreadable identity: UNKNOWN against a stamp, ALIVE (still blocking) without one."""
+
+    def observe(self, kernel, pid=4242, expected=None):
+        return common._win_observe(pid, kernel), common.observe_process(pid, expected, k32=kernel)
+
+    def stage(self, obs, name):
+        return next(s for s in obs['stages'] if s['stage'] == name)
+
+    def test_pid_state_uses_windows_absence_and_exit_evidence_without_os_kill(self):
+        cases = (({'handle': None, 'open_error': 87}, common.DEAD),
+                 ({'handle': None, 'open_error': 5}, common.UNKNOWN),
+                 ({'exit_code': 0}, common.DEAD))
+        for kwargs, expected in cases:
+            with self.subTest(kernel=kwargs):
+                kernel = FakeKernel(**kwargs)
+                with mock.patch.object(common, 'IS_WIN', True), \
+                        mock.patch.object(common, '_k32', return_value=kernel), \
+                        mock.patch.object(os, 'kill', side_effect=AssertionError('Windows must not use os.kill')):
+                    self.assertEqual(common.pid_state(4242, 99), expected)
+                self.assertEqual(kernel.calls.count('close'), int(bool(kernel.handle)))
+
+    def test_open_access_denied_exists_with_unknown_identity(self):
+        raw, obs = self.observe(FakeKernel(handle=None, open_error=5), expected=99)
+        self.assertEqual((raw['exists'], raw['created'], raw['reason']), (True, None, 'access_denied'))
+        self.assertEqual(obs['state'], common.UNKNOWN)
+        self.assertEqual(self.stage(obs, 'open')['last_error'], 5)
+
+    def test_stampless_unreadable_identity_is_alive_and_stamped_is_unknown(self):
+        real = common._win_process_info
+        for name, kw in (('access denied', {'handle': None, 'open_error': 5}),
+                         ('failed times', {'times_ok': False, 'times_error': 5})):
+            with self.subTest(name):
+                obs = common.observe_process(4242, None, k32=FakeKernel(**kw))
+                self.assertEqual((obs['state'], obs['exists'], obs['actual_created']), (common.ALIVE, True, None))
+                stamped = common.observe_process(4242, 99, k32=FakeKernel(**kw))
+                self.assertEqual(stamped['state'], common.UNKNOWN)
+                with mock.patch.object(common, '_win_process_info',
+                                       side_effect=lambda pid: real(pid, FakeKernel(**kw))),                         mock.patch.object(common, '_win_boot_created', return_value=None):  # no boot proof
+                    self.assertEqual(common.pid_state(4242), common.ALIVE)  # exists: still counts as running
+                    self.assertEqual(common.pid_state(4242, 99), common.UNKNOWN)
+                    self.assertFalse(common.pid_alive(4242, 99))
+                    self.assertTrue(common.pid_maybe_alive(4242, 99))
+
+    def test_open_invalid_parameter_for_a_valid_pid_is_qualified_absence(self):
+        raw, obs = self.observe(FakeKernel(handle=None, open_error=87), expected=99)
+        self.assertEqual((raw['exists'], raw['reason']), (False, 'no_such_process'))
+        self.assertEqual(obs['state'], common.DEAD)
+
+    def test_unexpected_open_error_is_unknown_not_dead(self):
+        for error in (0, 6, 31, 1450):
+            with self.subTest(error=error):
+                kernel = FakeKernel(handle=None, open_error=error)
+                raw, obs = self.observe(kernel, expected=99)
+                self.assertIsNone(raw['exists'])
+                self.assertEqual(obs['state'], common.UNKNOWN)
+                self.assertEqual(self.stage(obs, 'open')['last_error'], error)
+                self.assertNotIn('close', kernel.calls)  # no handle, nothing to close
+                with mock.patch.object(common, 'IS_WIN', True), \
+                        mock.patch.object(common, '_win_process_info', return_value=(raw['exists'], raw['created'])):
+                    self.assertEqual(common.pid_state(4242), common.UNKNOWN)  # even without a stamp
+                    self.assertEqual(common.pid_state(4242, 99), common.UNKNOWN)
+
+    def test_open_raising_is_unknown(self):
+        raw, obs = self.observe(FakeKernel(raises={'open'}), expected=99)
+        self.assertIsNone(raw['exists'])
+        self.assertEqual(obs['state'], common.UNKNOWN)
+        self.assertEqual(self.stage(obs, 'open')['exception'], 'OSError')
+
+    def test_failed_exit_query_is_unknown_and_its_error_is_captured_before_close(self):
+        kernel = FakeKernel(exit_ok=False, exit_code=0, exit_error=31, close_error=6)
+        raw, obs = self.observe(kernel, expected=99)
+        self.assertIsNone(raw['exists'])
+        self.assertEqual(raw['reason'], 'exit_code_failed')
+        self.assertEqual(obs['state'], common.UNKNOWN)
+        self.assertEqual(self.stage(obs, 'exit_code')['last_error'], 31)
+        self.assertEqual(kernel.calls.count('close'), 2)  # one per observation above, after the failure
+        self.assertEqual(kernel.calls[-1], 'close')
+
+    def test_exit_query_raising_still_closes_and_is_unknown(self):
+        kernel = FakeKernel(raises={'exit_code'})
+        raw, _ = self.observe(kernel)
+        self.assertIsNone(raw['exists'])
+        self.assertEqual(kernel.calls[:3], ['open', 'exit_code', 'close'])
+
+    def test_failed_times_is_running_with_unreadable_identity(self):
+        kernel = FakeKernel(times_ok=False, times_error=5)
+        raw, obs = self.observe(kernel, expected=99)
+        self.assertEqual((raw['exists'], raw['created'], raw['reason']), (True, None, 'times_failed'))
+        self.assertEqual(obs['state'], common.UNKNOWN)
+        self.assertEqual(self.stage(obs, 'times')['last_error'], 5)
+        self.assertEqual(kernel.calls[-1], 'close')
+        raw, obs = self.observe(FakeKernel(times_ok=False), expected=None)
+        self.assertEqual(obs['state'], common.ALIVE)  # nothing to compare: it is running
+
+    def test_exited_process_is_dead(self):
+        kernel = FakeKernel(exit_code=0)
+        raw, obs = self.observe(kernel, expected=99)
+        self.assertEqual((raw['exists'], raw['reason']), (False, 'exited'))
+        self.assertEqual(obs['state'], common.DEAD)
+        self.assertEqual(self.stage(obs, 'exit_code')['exit_code'], 0)
+        self.assertNotIn('times', kernel.calls)
+        self.assertEqual(kernel.calls[-1], 'close')
+
+    def test_matching_and_mismatched_stamp(self):
+        stamp = 133_700_000_000_000_001
+        _, obs = self.observe(FakeKernel(creation=stamp), expected=stamp)
+        self.assertEqual((obs['state'], obs['actual_created'], obs['expected_created']), (common.ALIVE, str(stamp), str(stamp)))
+        _, obs = self.observe(FakeKernel(creation=stamp), expected=stamp + 1)
+        self.assertEqual((obs['state'], obs['reason']), (common.DEAD, 'creation_mismatch'))
+
+    def test_close_runs_and_a_failed_close_changes_nothing(self):
+        for kw in ({}, {'exit_code': 0}, {'exit_ok': False}, {'times_ok': False}, {'raises': {'times'}}):
+            with self.subTest(**{k: str(v) for k, v in kw.items()}):
+                kernel = FakeKernel(close_ok=False, close_error=6, **kw)
+                ok_kernel = FakeKernel(**kw)
+                raw = common._win_observe(4242, kernel)
+                self.assertEqual(kernel.calls[-1], 'close')
+                self.assertEqual(kernel.calls.count('close'), 1)
+                close = self.stage(raw, 'close')
+                self.assertEqual((close['ok'], close['last_error']), (False, 6))
+                good = common._win_observe(4242, ok_kernel)
+                self.assertEqual((raw['exists'], raw['created']), (good['exists'], good['created']))
+        kernel = FakeKernel(raises={'close'})
+        raw = common._win_observe(4242, kernel)
+        self.assertEqual((raw['exists'], self.stage(raw, 'close')['exception']), (True, 'OSError'))
+
+    def test_large_filetime_roundtrips_exactly(self):
+        stamp = 2 ** 60 + 12345  # far above 2**53: a float would round it
+        self.assertNotEqual(int(float(stamp)), stamp)
+        _, obs = self.observe(FakeKernel(creation=stamp), expected=stamp)
+        self.assertEqual(obs['state'], common.ALIVE)
+        back = json.loads(json.dumps({'created': stamp, 'obs': obs}))
+        self.assertEqual(back['created'], stamp)
+        self.assertEqual(back['obs']['actual_created'], str(stamp))
+        self.assertEqual(int(back['obs']['actual_created']), stamp)
+        _, as_float = self.observe(FakeKernel(creation=stamp), expected=float(stamp))
+        self.assertEqual((as_float['state'], as_float['expected_created_problem']), (common.UNKNOWN, 'float'))
+        self.assertEqual(common._win_process_info(4242, FakeKernel(creation=stamp)), (True, stamp))
+
+
+def snapshot_buffer(entries, ptr_size=8, size=0x100):
+    """A synthetic SystemProcessInformation buffer: (pid, creation) entries chained by NextEntryOffset."""
+    import struct
+    pid_at, pid_fmt = (0x50, '<Q') if ptr_size == 8 else (0x44, '<I')
+    out = bytearray()
+    for i, (pid, created) in enumerate(entries):
+        entry = bytearray(size)
+        struct.pack_into('<I', entry, 0, size if i < len(entries) - 1 else 0)
+        struct.pack_into('<q', entry, 0x20, created)
+        struct.pack_into(pid_fmt, entry, pid_at, pid)
+        out += entry
+    return bytes(out)
+
+
+class ProcessSnapshotParsing(unittest.TestCase):
+    """The snapshot walk finds a pid's creation time in either pointer width and reads malformed input as None."""
+
+    def test_finds_the_pid_in_both_pointer_widths(self):
+        entries = [(4, 133_000_000_000_000_001), (15044, 134_367_896_988_950_621), (53268, 134_365_977_565_978_873)]
+        for ptr in (8, 4):
+            with self.subTest(ptr=ptr):
+                buf = snapshot_buffer(entries, ptr)
+                self.assertEqual(common._snapshot_created_from(buf, 15044, ptr), 134_367_896_988_950_621)
+                self.assertEqual(common._snapshot_created_from(buf, 53268, ptr), 134_365_977_565_978_873)
+                self.assertIsNone(common._snapshot_created_from(buf, 9999, ptr))
+
+    def test_malformed_input_is_none(self):
+        good = snapshot_buffer([(4, 1), (15044, 2)])
+        short = bytearray(good)
+        short[0:4] = (0x10).to_bytes(4, 'little')  # an entry shorter than its own header
+        cases = {'truncated': (good[:0x80], 15044, 8), 'empty': (b'', 15044, 8),
+                 'short step': (bytes(short), 15044, 8), 'bad width': (good, 15044, 2),
+                 'invalid pid': (good, 0, 8), 'bool pid': (good, True, 8),
+                 'zero stamp': (snapshot_buffer([(15044, 0)]), 15044, 8),
+                 'negative stamp': (snapshot_buffer([(15044, -5)]), 15044, 8)}
+        for name, (buf, pid, ptr) in cases.items():
+            with self.subTest(name):
+                self.assertIsNone(common._snapshot_created_from(buf, pid, ptr))
+
+
+class SnapshotKernel(FakeKernel):
+    """FakeKernel that also answers the process snapshot for a pid it cannot open."""
+
+    def __init__(self, snapshot=None, snapshot_raises=False, **kwargs):
+        super().__init__(**kwargs)
+        self.snapshot, self.snapshot_raises = snapshot, snapshot_raises
+
+    def snapshot_created(self, pid):
+        self.calls.append('snapshot')
+        if self.snapshot_raises:
+            raise OSError('synthetic snapshot failure')
+        return self.snapshot
+
+
+@unittest.skipUnless(common.IS_WIN, 'ctypes last-error capture is Windows-only')
+class WinSnapshotIdentity(unittest.TestCase):
+    """A pid this token cannot open (a SYSTEM service on a recycled pid) gets its creation time from a process
+    snapshot: a different time is DEAD, the same time is ALIVE, no snapshot leaves it UNKNOWN. Nothing is
+    killed on the way."""
+    RECORDED = 134_365_977_693_017_836
+
+    def observe(self, kernel, expected=RECORDED, pid=15044):
+        return common._win_observe(pid, kernel), common.observe_process(pid, expected, k32=kernel)
+
+    def denied(self, **kwargs):
+        return SnapshotKernel(handle=None, open_error=5, **kwargs)
+
+    def test_a_recycled_pid_reads_dead_and_the_same_process_reads_alive(self):
+        raw, obs = self.observe(self.denied(snapshot=134_367_896_988_950_621))
+        self.assertEqual((raw['exists'], raw['reason'], raw['created']), (True, 'access_denied', 134_367_896_988_950_621))
+        self.assertEqual((obs['state'], obs['reason']), (common.DEAD, 'creation_mismatch'))
+        self.assertEqual([s['stage'] for s in obs['stages']], ['open', 'snapshot'])
+        _, obs = self.observe(self.denied(snapshot=self.RECORDED))
+        self.assertEqual(obs['state'], common.ALIVE)
+
+    def test_no_snapshot_keeps_the_identity_unreadable(self):
+        for kernel in (self.denied(snapshot=None), self.denied(snapshot=0), self.denied(snapshot=True),
+                       self.denied(snapshot='134'), self.denied(snapshot_raises=True)):
+            with self.subTest(snapshot=kernel.snapshot, raises=kernel.snapshot_raises):
+                raw, obs = self.observe(kernel)
+                self.assertEqual((raw['exists'], raw['created']), (True, None))
+                self.assertEqual(obs['state'], common.UNKNOWN)
+                self.assertIs(next(s for s in obs['stages'] if s['stage'] == 'snapshot')['ok'], False)
+
+    def test_a_kernel_without_a_snapshot_is_never_given_the_real_one(self):
+        with mock.patch.object(common, '_win_snapshot_created', side_effect=AssertionError('real snapshot')):
+            raw, obs = self.observe(FakeKernel(handle=None, open_error=5))
+        self.assertEqual(obs['state'], common.UNKNOWN)
+        self.assertNotIn('snapshot', [s['stage'] for s in obs['stages']])
+
+    def test_failed_times_also_reads_the_snapshot(self):
+        kernel = SnapshotKernel(times_ok=False, times_error=5, snapshot=self.RECORDED + 1)
+        _, obs = self.observe(kernel)
+        self.assertEqual((obs['state'], obs['reason']), (common.DEAD, 'creation_mismatch'))
+        self.assertEqual(kernel.calls[-1], 'close')
+
+    def test_pid_state_and_kill_tree_on_a_recycled_pid(self):
+        kernel = self.denied(snapshot=134_367_896_988_950_621)
+        with mock.patch.object(common, '_k32', return_value=kernel),                 mock.patch.object(common.subprocess, 'run', side_effect=AssertionError('taskkill')),                 mock.patch.object(os, 'kill', side_effect=AssertionError('os.kill')):
+            self.assertEqual(common.pid_state(15044, self.RECORDED), common.DEAD)
+            self.assertFalse(common.pid_maybe_alive(15044, self.RECORDED))
+            self.assertFalse(common.kill_tree(15044, self.RECORDED))
+
+    def test_the_real_snapshot_agrees_with_this_process_and_refuses_a_bad_self_check(self):
+        own = common._win_own_created()
+        self.assertTrue(common._valid_stamp(own))
+        self.assertEqual(common._win_snapshot_created(os.getpid()), own)
+        with mock.patch.object(common, '_win_own_created', return_value=own + 1):
+            self.assertIsNone(common._win_snapshot_created(os.getpid()))
+        with mock.patch.object(common, '_snapshot_created_from', return_value=None):
+            self.assertIsNone(common._win_snapshot_created(os.getpid()))
+
+
+class BootKernel(SnapshotKernel):
+    """SnapshotKernel that also answers the boot time (the System process's creation) it was scripted with."""
+
+    def __init__(self, boot=None, boot_raises=False, **kwargs):
+        super().__init__(**kwargs)
+        self.boot, self.boot_raises = boot, boot_raises
+
+    def boot_created(self):
+        self.calls.append('boot')
+        if self.boot_raises:
+            raise OSError('synthetic boot failure')
+        return self.boot
+
+
+@unittest.skipUnless(common.IS_WIN, 'ctypes last-error capture is Windows-only')
+class WinBootProof(unittest.TestCase):
+    """A recorded stamp older than this boot names a process that cannot still exist, even when its pid now
+    belongs to a process this token cannot read (the dead-job custody bug: a Codex child pid recycled across
+    a restart left the writer slot held for days). Anything short of that proof stays UNKNOWN."""
+    RECORDED = 134_365_804_998_969_870
+    BOOT = 134_369_668_977_791_518  # a boot after the recorded process was created
+
+    def denied(self, **kwargs):
+        return BootKernel(handle=None, open_error=5, **kwargs)
+
+    def test_a_stamp_older_than_the_boot_reads_dead_for_an_unreadable_pid(self):
+        for name, kernel in (('access denied', self.denied(boot=self.BOOT)),
+                             ('failed times', BootKernel(times_ok=False, times_error=5, boot=self.BOOT))):
+            with self.subTest(name):
+                obs = common.observe_process(9012, self.RECORDED, k32=kernel)
+                self.assertEqual((obs['state'], obs['reason'], obs['exists']), (common.DEAD, 'predates_boot', True))
+
+    def test_no_boot_proof_leaves_the_identity_unknown(self):
+        cases = {'boot unreadable': self.denied(boot=None), 'boot invalid': self.denied(boot=0),
+                 'boot a string': self.denied(boot='1'), 'boot raises': self.denied(boot_raises=True),
+                 'stamp not older': self.denied(boot=self.RECORDED),
+                 'stamp newer': self.denied(boot=self.RECORDED - 1),
+                 'kernel without a boot reader': SnapshotKernel(handle=None, open_error=5)}
+        for name, kernel in cases.items():
+            with self.subTest(name):
+                obs = common.observe_process(9012, self.RECORDED, k32=kernel)
+                self.assertEqual((obs['state'], obs['reason']), (common.UNKNOWN, 'access_denied'))
+
+    def test_a_readable_identity_never_consults_the_boot_time(self):
+        kernel = BootKernel(creation=self.RECORDED, boot=self.BOOT)
+        self.assertEqual(common.observe_process(9012, self.RECORDED, k32=kernel)['state'], common.ALIVE)
+        self.assertNotIn('boot', kernel.calls)
+        mismatch = BootKernel(creation=self.RECORDED + 5, boot=self.BOOT)
+        obs = common.observe_process(9012, self.RECORDED, k32=mismatch)
+        self.assertEqual((obs['state'], obs['reason']), (common.DEAD, 'creation_mismatch'))
+        self.assertNotIn('boot', mismatch.calls)
+
+    def test_a_kernel_without_a_boot_reader_is_never_given_the_real_one(self):
+        with mock.patch.object(common, '_win_boot_created', side_effect=AssertionError('real boot time')):
+            obs = common.observe_process(9012, self.RECORDED, k32=FakeKernel(handle=None, open_error=5))
+        self.assertEqual(obs['state'], common.UNKNOWN)
+
+    def test_pid_state_reads_dead_only_with_the_boot_proof(self):
+        for boot, want in ((self.BOOT, common.DEAD), (None, common.UNKNOWN), (self.RECORDED, common.UNKNOWN)):
+            with self.subTest(boot=boot), mock.patch.object(common, 'IS_WIN', True),                     mock.patch.object(common, '_win_process_info', return_value=(True, None)),                     mock.patch.object(common, '_win_boot_created', return_value=boot):
+                self.assertEqual(common.pid_state(9012, self.RECORDED), want)
+                self.assertEqual(common.pid_maybe_alive(9012, self.RECORDED), want != common.DEAD)
+                self.assertEqual(common.pid_state(9012), common.ALIVE)  # no stamp: nothing to prove, it exists
+                self.assertEqual(common.pid_state(9012, 'not-a-stamp'), common.UNKNOWN)
+
+    def test_kill_tree_never_kills_an_unreadable_pid_proved_older_than_the_boot(self):
+        with mock.patch.object(common, 'IS_WIN', True), \
+                mock.patch.object(common, '_win_process_info', return_value=(True, None)), \
+                mock.patch.object(common, '_win_boot_created', return_value=self.BOOT), \
+                mock.patch.object(common.subprocess, 'run', side_effect=AssertionError('taskkill')), \
+                mock.patch.object(os, 'kill', side_effect=AssertionError('os.kill')):
+            self.assertFalse(common.kill_tree(9012, self.RECORDED))
+
+    def test_the_real_boot_time_is_older_than_this_process(self):
+        boot = common._win_boot_created()
+        self.assertTrue(common._valid_stamp(boot))
+        self.assertLess(boot, common._win_own_created())
+        self.assertTrue(common._predates_boot(boot - 1))
+        self.assertFalse(common._predates_boot(boot))
+        self.assertFalse(common._predates_boot(common._win_own_created()))
+        with mock.patch.object(common, '_win_snapshot_data', return_value=None):
+            self.assertIsNone(common._win_boot_created())
+            self.assertFalse(common._predates_boot(boot - 1))
+
+
+class StrictObservationIdentity(unittest.TestCase):
+    """A malformed recorded identity is never probed and never DEAD."""
+
+    def test_malformed_identities_are_unknown_without_a_probe(self):
+        cases = [(True, None, 'bool'), (4242.0, None, 'float'), ('4242', None, 'not_an_int'), (0, None, 'out_of_range'),
+                 (-1, None, 'out_of_range'), (2 ** 32, None, 'out_of_range'), (None, None, 'missing'),
+                 (4242, True, None), (4242, 1.5, None), (4242, '99', None), (4242, 0, None), (4242, 2 ** 64, None)]
+        with mock.patch.object(common, '_win_observe', side_effect=AssertionError('probed')), \
+                mock.patch.object(common, '_posix_observe', side_effect=AssertionError('probed')):
+            for pid, created, problem in cases:
+                with self.subTest(pid=pid, created=created):
+                    obs = common.observe_process(pid, created)
+                    self.assertEqual((obs['state'], obs['reason']), (common.UNKNOWN, 'invalid_identity'))
+                    if problem:
+                        self.assertEqual(obs['pid_problem'], problem)
+                    else:
+                        self.assertIsNotNone(obs['expected_created_problem'])
+
+    def test_output_is_allowlisted_and_json_safe(self):
+        obs = common.observe_process(os.getpid(), common.process_created(os.getpid()))
+        self.assertEqual(obs['state'], common.ALIVE)
+        self.assertEqual(set(obs), {'platform', 'observer', 'pid', 'pid_problem', 'expected_created',
+                                    'expected_created_problem', 'actual_created', 'exists', 'state', 'reason', 'stages'})
+        self.assertEqual(json.loads(json.dumps(obs)), obs)
+        for s in obs['stages']:
+            self.assertLessEqual(set(s), {'stage', 'attempted', 'ok', 'last_error', 'exit_code', 'exception'})
+
+    def test_unknown_existence_is_unknown_for_pid_state_and_holders(self):
+        with mock.patch.object(common, 'IS_WIN', True), \
+                mock.patch.object(common, '_win_process_info', return_value=(None, None)):
+            self.assertEqual(common.pid_state(4242), common.UNKNOWN)
+            self.assertEqual(common.pid_state(4242, 99), common.UNKNOWN)
+            self.assertFalse(common.pid_alive(4242))
+            self.assertTrue(common.pid_maybe_alive(4242, 99))
+            self.assertIsNone(common.process_created(4242))
+            self.assertTrue(common._holder_alive(4242, 99))  # unconfirmed: held, bounded only by the item's age
+        with mock.patch.object(common, 'IS_WIN', True), \
+                mock.patch.object(common, '_win_process_info', return_value=(False, None)):
+            self.assertEqual(common.pid_state(4242, 99), common.DEAD)
+            self.assertFalse(common._holder_alive(4242, 99))
+
+    def test_legacy_missing_child_semantics_survive(self):
+        for pid in (None, '', 'x', 0, -5):
+            self.assertEqual(common.pid_state(pid), common.DEAD)
 
 
 if __name__ == '__main__':

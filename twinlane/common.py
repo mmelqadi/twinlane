@@ -13,12 +13,17 @@ import math
 import os
 import re
 import shutil
+import stat
+import struct
 import subprocess
 import sys
 import tempfile
 import time
 import uuid
 from contextlib import contextmanager
+from contextvars import ContextVar
+
+_PREFLIGHT_VERSIONS = ContextVar('codex_preflight_versions', default=None)
 
 HOME = os.path.expanduser('~')
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -168,14 +173,16 @@ def read_json(path: str, default=None, deadline: float | None = None):
     return default
 
 
-def _atomic_write(path: str, write, deadline: float | None = None) -> None:
+def _atomic_write(path: str, write, deadline: float | None = None, *, create_parent=True) -> None:
     """Temp file in the same directory, then os.replace (retried while a reader holds the target).
 
     With `deadline` (a time.monotonic() value) the retries are bounded by it: no replace is attempted and no
     sleep runs past it, TimeoutError is raised, the temp file is removed and `path` keeps its old content
-    (the replace is atomic, so `path` is only ever the old file or the complete new one)."""
+    (the replace is atomic, so `path` is only ever the old file or the complete new one).
+    `create_parent=False` never recreates a directory moved by another process."""
     d = os.path.dirname(os.path.abspath(path))
-    os.makedirs(d, exist_ok=True)
+    if create_parent:
+        os.makedirs(d, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix='.tmp-', dir=d)
     try:
         with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as h:
@@ -200,21 +207,24 @@ def _atomic_write(path: str, write, deadline: float | None = None) -> None:
                 pass
 
 
-def write_json(path: str, data, deadline: float | None = None) -> None:
-    _atomic_write(path, lambda h: json.dump(data, h, ensure_ascii=False, indent=2), deadline)
+def write_json(path: str, data, deadline: float | None = None, *, create_parent=True) -> None:
+    _atomic_write(path, lambda h: json.dump(data, h, ensure_ascii=False, indent=2), deadline,
+                  create_parent=create_parent)
 
 
-def write_text(path: str, text: str) -> None:
-    _atomic_write(path, lambda h: h.write(text))
+def write_text(path: str, text: str, *, create_parent=True) -> None:
+    _atomic_write(path, lambda h: h.write(text), create_parent=create_parent)
 
 
 @contextmanager
-def file_lock(path: str, timeout_s: float = 120, poll_s: float = 0.05):
+def file_lock(path: str, timeout_s: float = 120, poll_s: float = 0.05, *, create_parent=True):
     """Exclusive OS lock on one byte of `path` (LockFileEx / flock).
 
     The OS drops the lock when its holder dies, so there is no staleness guess and no
-    check-then-remove race. The lock file itself stays in place."""
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    check-then-remove race. The lock file itself stays in place. `create_parent=False`
+    requires an existing parent, for in-folder lifecycle locks during archival."""
+    if create_parent:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
     try:
         deadline = time.monotonic() + timeout_s
@@ -430,6 +440,15 @@ def _build_info(path: str, st: os.stat_result, want_version: bool = True, want_s
 
 
 def codex_version(path: str, st: os.stat_result) -> str | None:
+    reads = _PREFLIGHT_VERSIONS.get()
+    if reads is not None:
+        key = f'{os.path.normcase(path)}|{st.st_size}|{st.st_mtime_ns}|{st.st_ino}'
+        if key not in reads:
+            cached = read_json(os.path.join(BIN, _VERSIONS), {})
+            entry = cached.get(key) if isinstance(cached, dict) else None
+            version = entry.get('version') if isinstance(entry, dict) else entry
+            reads[key] = version if isinstance(version, str) else _read_codex_version(path)
+        return reads[key]
     return _build_info(path, st).get('version')
 
 
@@ -450,23 +469,32 @@ def _app_bin_dirs() -> list[str]:
     return [os.path.join(base, 'OpenAI', 'Codex', 'bin'), os.path.join(CODEX_DIR, 'plugins', '.plugin-appserver')]
 
 
+def _standalone_codex(path: str) -> bool:
+    """True for the standalone Codex CLI install (LOCALAPPDATA/Programs/OpenAI/Codex/bin): a separately updated CLI,
+    not one of the app's own builds, so it is never copied as an app source; preflight names it when it is too old."""
+    base = os.environ.get('LOCALAPPDATA') or os.path.join(HOME, 'AppData', 'Local')
+    return _norm(path).startswith(_norm(os.path.join(base, 'Programs', 'OpenAI', 'Codex', 'bin')) + os.sep)
+
+
 def _app_owned(path: str) -> bool:
     p = _norm(path)
     return any(p.startswith(_norm(d) + os.sep) for d in _app_bin_dirs())
 
 
-def _pick_codex_source() -> tuple[str | None, str, str | None]:
+def _pick_codex_source(*, ignore_env: bool = False) -> tuple[str | None, str, str | None]:
     """(path, origin, version): TWINLANE_CODEX_BIN as set ('env'); else the best complete app build ('app'); else
     (None, 'none', None). An explicit binary inside the app's own folders is an app source like any other: it is
     copied, never run in place. A build without every helper (the app mid-extract) is never a source;
     complete builds rank by version, then mtime, so an older build rewritten later does not beat a newer one."""
-    env = os.environ.get('TWINLANE_CODEX_BIN')
+    env = None if ignore_env else os.environ.get('TWINLANE_CODEX_BIN')
     if not IS_WIN:
         return (env, 'env', None) if env and os.path.isfile(env) else (None, 'none', None)
     if env and os.path.isfile(env) and not _app_owned(env):
         return env, 'env', None
-    found = [env] if env and os.path.isfile(env) else (
-        glob.glob(os.path.join(_app_bin_dirs()[0], '*', 'codex.exe')) + [os.path.join(_app_bin_dirs()[1], 'codex.exe')])
+    found = [env] if env and os.path.isfile(env) else []
+    for folder in _app_bin_dirs():
+        found.extend(glob.glob(os.path.join(folder, '*', 'codex.exe')))
+        found.append(os.path.join(folder, 'codex.exe'))
     ranked = []
     for path in found:
         try:
@@ -507,7 +535,13 @@ def resolve_codex() -> tuple[str | None, str]:
         return src, f'TWINLANE_CODEX_BIN as set: {src}'
     if src:
         try:
-            return _private_codex_copy(src, version), ''
+            note = ''
+            env = os.environ.get('TWINLANE_CODEX_BIN')
+            if env and _app_owned(env) and _norm(env) != _norm(src) and os.path.isfile(env):
+                old_version = codex_version(env, os.stat(env))
+                note = (f'TWINLANE_CODEX_BIN names app build {old_version}; '
+                        f'using the newer app build {version}')
+            return _private_codex_copy(src, version), note
         except OSError as e:
             why = f'cannot copy {src}: {clip(str(e) or type(e).__name__, 160)}'
     else:
@@ -577,7 +611,7 @@ def acquire_codex_binary(source: str = 'auto') -> tuple[str | None, str, str | N
         raise ValueError(f'codex.binary_source must be one of {", ".join(CODEX_SOURCES)}, not {source!r}')
     env = os.environ.get('TWINLANE_CODEX_BIN')
     why = ''
-    if source != 'path':
+    if source != 'path' or env and _app_owned(env):
         binary, why, lease = acquire_codex()
         if binary or source == 'app-copy':
             return binary, why, lease
@@ -586,7 +620,96 @@ def acquire_codex_binary(source: str = 'auto') -> tuple[str | None, str, str | N
     found = shutil.which('codex')
     if not found:
         return None, (f'{why}; ' if why else '') + 'no codex on PATH', None
+    found = os.path.realpath(os.path.abspath(found))
+    cwd = os.path.normcase(os.path.realpath(os.getcwd()))
+    resolved = os.path.normcase(found)
+    if resolved == cwd or resolved.startswith(cwd.rstrip(os.sep) + os.sep):
+        return None, 'refusing codex on PATH inside the current directory', None
     return found, (f'{why}; using the codex on PATH: {found}' if why else f'binary_source=path: {found}'), None
+
+
+# A preserving start (jobs.py) runs only an explicitly supplied standalone TWINLANE_CODEX_BIN: no PATH or app
+# lookup, private copy, lease, prune or version cache. Its identity is recorded at planning, checked again at
+# preflight and launch, and handed to the built-in runner, which checks it once more before the child starts.
+CODEX_BIN_QUALIFIED = 'TWINLANE_CODEX_BIN_QUALIFIED'
+CODEX_IDENTITY_KEYS = ('path', 'size', 'mtime_ns', 'file_id', 'dev', 'sha256')
+
+
+def codex_protected_roots() -> list[str]:
+    """Folders a preserving start never runs Codex from: the desktop app's builds, install and data, the
+    Codex home, and twinlane's shared private-copy store (bin/)."""
+    base = os.environ.get('LOCALAPPDATA') or os.path.join(HOME, 'AppData', 'Local')
+    roots = _app_bin_dirs() + [os.path.join(base, 'OpenAI'), CODEX_DIR, BIN]
+    if IS_WIN:
+        roots.append(os.path.join(os.environ.get('ProgramFiles') or r'C:\Program Files', 'WindowsApps'))
+    return roots
+
+
+def _codex_stat_key(st: os.stat_result) -> tuple:
+    return st.st_size, st.st_mtime_ns, st.st_ino, st.st_dev
+
+
+def qualify_explicit_codex_bin(value) -> dict:
+    """{path, size, mtime_ns, file_id, dev, sha256} of `value` (TWINLANE_CODEX_BIN) as an explicitly supplied
+    STANDALONE binary at LOCALAPPDATA/Programs/OpenAI/Codex/bin/codex.exe, or ValueError naming why it does not
+    qualify. Reads and hashes the file; never runs,
+    copies, leases or caches it. Qualifies only an absolute local path to a regular file with one hard link,
+    reached without any link, junction or short name, outside every codex_protected_roots() folder."""
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise ValueError('TWINLANE_CODEX_BIN is absent, empty or padded with spaces')
+    if any(ord(c) < 32 or c in '"<>|*?' for c in value) or (IS_WIN and ':' in value[2:]):
+        raise ValueError('TWINLANE_CODEX_BIN holds control, quoting, wildcard or stream characters')
+    if value.startswith(('\\\\', '//')):
+        raise ValueError('TWINLANE_CODEX_BIN is a network or device path; give a local standalone file')
+    if not os.path.isabs(value) or (IS_WIN and not re.match(r'[A-Za-z]:[\\/]', value)):
+        raise ValueError('TWINLANE_CODEX_BIN must be an absolute path to the binary (no PATH lookup)')
+    path = os.path.normpath(value)
+    try:
+        st = os.lstat(path)
+        canon = canon_path(path)
+    except OSError as e:
+        raise ValueError(f'TWINLANE_CODEX_BIN cannot be read ({type(e).__name__})') from e
+    if not stat.S_ISREG(st.st_mode):
+        raise ValueError('TWINLANE_CODEX_BIN is not a regular file (a link, folder or device)')
+    if os.path.normcase(path) != canon:
+        raise ValueError('TWINLANE_CODEX_BIN resolves through a link, junction or short name; give its final path')
+    if st.st_nlink != 1:
+        raise ValueError('TWINLANE_CODEX_BIN has other hard links; give a standalone copy')
+    for root in codex_protected_roots():
+        top = canon_path(root).rstrip(os.sep)
+        if canon == top or canon.startswith(top + os.sep):
+            raise ValueError(f'TWINLANE_CODEX_BIN is inside a protected Codex binary root ({root}): app-owned and '
+                             'shared copies are never run by a preserving start')
+    base = os.environ.get('LOCALAPPDATA') or os.path.join(HOME, 'AppData', 'Local')
+    approved = os.path.normcase(os.path.normpath(os.path.join(base,'Programs','OpenAI','Codex','bin','codex.exe')))
+    if canon != approved:
+        raise ValueError('preserving Codex starts require the explicit standalone Programs/OpenAI/Codex/bin/codex.exe location')
+    try:
+        digest = _sha256_file(path)
+        after = os.lstat(path)
+    except OSError as e:
+        raise ValueError(f'TWINLANE_CODEX_BIN cannot be hashed ({type(e).__name__})') from e
+    if _codex_stat_key(after) != _codex_stat_key(st):
+        raise ValueError('TWINLANE_CODEX_BIN changed while it was hashed')
+    return {'path': path, 'size': st.st_size, 'mtime_ns': st.st_mtime_ns, 'file_id': st.st_ino,
+            'dev': st.st_dev, 'sha256': digest}
+
+
+def codex_bin_identity_problem(recorded) -> str | None:
+    """Why TWINLANE_CODEX_BIN is no longer the binary a preserving start recorded (None when it still is):
+    the current value is qualified again from scratch and must match every recorded field."""
+    if not (isinstance(recorded, dict) and set(recorded) == set(CODEX_IDENTITY_KEYS)
+            and isinstance(recorded['path'], str) and isinstance(recorded['sha256'], str)
+            and re.fullmatch(r'[0-9a-f]{64}', recorded['sha256'])
+            and all(type(recorded[k]) is int for k in ('size', 'mtime_ns', 'file_id', 'dev'))):
+        return 'the job carries no well-formed qualified binary identity (runner hand-off unqualified)'
+    try:
+        current = qualify_explicit_codex_bin(os.environ.get('TWINLANE_CODEX_BIN'))
+    except ValueError as e:
+        return str(e)
+    if current != recorded:
+        return 'TWINLANE_CODEX_BIN is not the binary recorded when this job was planned (path, file or bytes changed)'
+    return None
 
 
 # Per-job settings twinlane passes itself: exec_config may not override them.
@@ -620,7 +743,10 @@ def codex_version_refusal(binary: str, minimum) -> str | None:
     want = codex_version_key(minimum) if isinstance(minimum, str) else None
     if want is None:
         return f'codex.min_cli_version {minimum!r} is not a version number (use X.Y.Z)'
-    version = _read_codex_version(binary)
+    try:
+        version = codex_version(binary, os.stat(binary))
+    except OSError:
+        version = _read_codex_version(binary)
     got = codex_version_key(version)
     if got is None:
         return f'cannot read the version of {binary} (codex --version), so codex.min_cli_version {minimum} is unproven'
@@ -628,6 +754,81 @@ def codex_version_refusal(binary: str, minimum) -> str | None:
         return (f'codex CLI {version} at {binary} is older than codex.min_cli_version {minimum}; '
                 'point TWINLANE_CODEX_BIN at a newer build or set codex.binary_source to app-copy')
     return None
+
+
+def codex_preflight(policy: dict) -> dict:
+    """Inspect dispatch's CLI choice without copying a build or taking a lease."""
+    token = _PREFLIGHT_VERSIONS.set({})
+    try:
+        return _codex_preflight(policy)
+    except OSError as e:
+        return dict(binary=None, origin='none', version=None, newest_app=None, note=None,
+                    refusal=f'no usable codex CLI: lookup failed: {e}')
+    finally:
+        _PREFLIGHT_VERSIONS.reset(token)
+
+
+def _codex_preflight(policy: dict) -> dict:
+    cx = policy.get('codex') or {}
+    out = dict(binary=None, origin='none', version=None, newest_app=None, refusal=None, note=None)
+    source = cx.get('binary_source') or 'auto'
+    if source not in CODEX_SOURCES:
+        out['refusal'] = f'codex.binary_source must be one of {", ".join(CODEX_SOURCES)}, not {source!r}'
+        return out
+    env = os.environ.get('TWINLANE_CODEX_BIN')
+    if env and not os.path.isfile(env):
+        out['refusal'] = f'TWINLANE_CODEX_BIN points at a missing file: {env}'
+        return out
+    newest, origin, newest_version = _pick_codex_source(ignore_env=True)
+    if origin == 'app':
+        out['newest_app'] = newest_version
+    if env and not _app_owned(env):
+        binary, origin, version = env, 'env', codex_version(env, os.stat(env))
+    elif source == 'path' and not env:
+        binary, origin, version = shutil.which('codex'), 'path', None
+    else:
+        binary, origin, version = _pick_codex_source()
+        if not binary:
+            # An existing verified private copy is also usable when the app is closed.
+            binary = _newest_valid_copy() if IS_WIN and source != 'path' else None
+            origin = 'app' if binary else 'none'
+        if not binary and source != 'app-copy':
+            binary, origin = shutil.which('codex'), 'path'
+    if not binary:
+        out['refusal'] = 'no usable codex CLI: no complete Codex app build or allowed CLI found'
+        return out
+    version = version or codex_version(binary, os.stat(binary))
+    out.update(binary=binary, origin=origin, version=version)
+    out['refusal'] = codex_version_refusal(binary, cx.get('min_cli_version'))
+    if out['refusal']:
+        return out
+    if env and not _app_owned(env):
+        got, best = codex_version_key(version), codex_version_key(newest_version)
+        if got is not None and best is not None and got < best and cx.get('allow_older_env_bin') is not True:
+            kind = ' (the standalone Codex CLI)' if _standalone_codex(binary) else ''
+            out['refusal'] = (f'TWINLANE_CODEX_BIN is codex {version} at {binary}{kind}, older than the Codex app build '
+                              f'{newest_version}; unset TWINLANE_CODEX_BIN (the app build is then copied and used), '
+                              'point it at a newer CLI, or set codex.allow_older_env_bin to true')
+        elif got is None:
+            out['note'] = f'cannot read the version of {binary}; codex.min_cli_version is not set'
+    return out
+
+
+def worktree_top(path: str) -> str | None:
+    """Find the nearest checkout root by stat only (including linked and nested checkouts)."""
+    folder = os.path.realpath(os.path.abspath(path))
+    while True:
+        if os.path.exists(os.path.join(folder, '.git')):
+            return folder
+        parent = os.path.dirname(folder)
+        if parent == folder:
+            return None
+        folder = parent
+
+
+def writer_key(path: str) -> str:
+    from . import observations
+    return observations.writer_key(path)
 
 
 def codex_bin() -> str | None:
@@ -698,14 +899,18 @@ def _uncertain_liveness_bound() -> int:
 
 
 def _holder_alive(pid: int, created: int, item: str | None = None) -> bool:
-    """A confirmed holder lives until exit. Unconfirmed identity expires after the policy bound."""
+    """A confirmed holder lives until exit. Unconfirmed identity expires after the policy bound.
+
+    This age bound is a legacy policy for Codex binary-copy leases and staging folders only. It is not the
+    writer-directory rule: a writer reservation (jobs._claim_writer) is never evicted by age, and an
+    unknown or unreadable owner keeps holding it until its owner is proven gone."""
     if IS_WIN:
         alive, actual = _win_process_info(pid)
     else:
         alive = pid_alive(pid)
         actual = _posix_start_time(pid) if alive else None
-    if not alive:
-        return False
+    if alive is False:
+        return False  # None (the probe failed) is unconfirmed, like an unreadable identity: bounded below
     if created and actual is not None:
         return actual == created
     if item and time.time() - _mtime(item) >= _uncertain_liveness_bound():
@@ -1037,6 +1242,7 @@ DETACHED_PROCESS, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW = 0x8, 0x200, 0x080
 CREATE_BREAKAWAY_FROM_JOB = 0x01000000
 JOB_LIMIT_BREAKAWAY_OK, JOB_LIMIT_SILENT_BREAKAWAY_OK, JOB_LIMIT_KILL_ON_JOB_CLOSE = 0x800, 0x1000, 0x2000
 _PROCESS_QUERY_LIMITED = 0x1000
+_PROCESS_TERMINATE, _SYNCHRONIZE = 0x0001, 0x00100000
 _JOB_EXTENDED_LIMITS = 9
 
 
@@ -1063,6 +1269,8 @@ def _k32():
     k32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
     k32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
     k32.GetProcessTimes.argtypes = (wintypes.HANDLE,) + (ctypes.POINTER(ctypes.c_uint64),) * 4
+    k32.TerminateProcess.argtypes = (wintypes.HANDLE, wintypes.UINT)
+    k32.TerminateProcess.restype = wintypes.BOOL
     k32.CloseHandle.argtypes = (wintypes.HANDLE,)
     k32.GetCurrentProcess.restype = wintypes.HANDLE
     k32.CreateJobObjectW.restype = wintypes.HANDLE
@@ -1092,24 +1300,292 @@ def _job_limits_struct():
     return Extended()
 
 
-def _win_process_info(pid: int) -> tuple[bool, int | None]:
-    """(exists, creation FILETIME) for a pid; creation is None when the process cannot be opened."""
+_ERROR_ACCESS_DENIED, _ERROR_INVALID_PARAMETER, _STILL_ACTIVE = 5, 87, 259
+_WIN_PID_MAX = 0xFFFFFFFF   # a Windows pid is a DWORD; a larger value would be silently truncated by ctypes
+_STAMP_MAX = 2 ** 64 - 1    # a creation FILETIME (or POSIX start time) is an unsigned 64-bit value
+
+
+def _valid_pid(pid, maximum: int = _WIN_PID_MAX) -> bool:
+    """A recorded pid that can name exactly one process: a real int (not a bool) in 1..maximum."""
+    return type(pid) is int and 0 < pid <= maximum
+
+
+def _valid_stamp(created) -> bool:
+    """A recorded creation stamp: a real int (not a bool, float or string) in 1..2**64-1."""
+    return type(created) is int and 0 < created <= _STAMP_MAX
+
+
+def _win_observe(pid, k32=None) -> dict:
+    """Raw OpenProcess / GetExitCodeProcess / GetProcessTimes evidence for one pid, failing closed.
+
+    Each call's last error is read immediately after it returns, before anything else can overwrite it, and
+    an opened handle is always closed. `exists` is True (STILL_ACTIVE), False only for qualified absence
+    (OpenProcess ERROR_INVALID_PARAMETER for a valid pid, or a readable exit code other than STILL_ACTIVE),
+    and None when the probe cannot establish existence (for example an unexpected open error or a failed
+    exit-code query). Access denial and a times failure after STILL_ACTIVE retain True with no identity.
+    `created` is the creation FILETIME when readable. `k32` is injectable for tests.
+
+    How callers (pid_state, observe_process) read the outcomes:
+      - an unexpected OpenProcess error, or a failed or raising exit-code query: existence unknown, so
+        UNKNOWN with or without a recorded stamp;
+      - OpenProcess access denied (5), or failed process times after STILL_ACTIVE: it exists but opening it
+        cannot read its identity. A process snapshot (_snapshot_identity) then supplies the creation stamp when
+        it can, and that stamp is compared like any other. Without one the identity is unreadable: UNKNOWN
+        against a recorded stamp and ALIVE when no stamp was recorded. ALIVE there still blocks a writer; it
+        never claims a matching identity or any context equivalence."""
     import ctypes
     from ctypes import wintypes
-    k32 = _k32()
-    h = k32.OpenProcess(_PROCESS_QUERY_LIMITED, False, pid)
-    if not h:
-        return ctypes.get_last_error() == 5, None  # access denied => it exists, identity unknown
+    obs = {'exists': None, 'created': None, 'reason': 'not_attempted', 'stages': []}
+
+    def stage(name, ok, error=None, **extra):
+        obs['stages'].append(dict({'stage': name, 'attempted': True, 'ok': ok, 'last_error': error}, **extra))
+
+    if not _valid_pid(pid):
+        obs['reason'] = 'invalid_pid'
+        return obs
     try:
+        k32 = k32 or _k32()
+    except Exception as e:  # noqa: BLE001 - no kernel32: nothing is proven
+        stage('kernel32', False, exception=type(e).__name__)
+        obs['reason'] = 'kernel_unavailable'
+        return obs
+    handle = None
+    try:
+        try:
+            ctypes.set_last_error(0)
+            handle = k32.OpenProcess(_PROCESS_QUERY_LIMITED, False, pid)
+            error = ctypes.get_last_error()
+        except Exception as e:  # noqa: BLE001
+            stage('open', False, exception=type(e).__name__)
+            obs['reason'] = 'open_raised'
+            handle = None
+            return obs
+        if not handle:
+            stage('open', False, error)
+            if error == _ERROR_ACCESS_DENIED:
+                obs.update(exists=True, reason='access_denied')  # it exists; opening it cannot read its identity
+                _snapshot_identity(obs, pid, k32, stage)
+            elif error == _ERROR_INVALID_PARAMETER:
+                obs.update(exists=False, reason='no_such_process')
+            else:
+                obs['reason'] = 'open_failed'
+            return obs
+        stage('open', True)
         code = wintypes.DWORD()
-        if not k32.GetExitCodeProcess(h, ctypes.byref(code)) or code.value != 259:  # STILL_ACTIVE
-            return False, None
-        t = [ctypes.c_uint64() for _ in range(4)]
-        if not k32.GetProcessTimes(h, *(ctypes.byref(x) for x in t)):
-            return True, None
-        return True, int(t[0].value)
+        try:
+            ctypes.set_last_error(0)
+            ok = k32.GetExitCodeProcess(handle, ctypes.byref(code))
+            error = ctypes.get_last_error()
+        except Exception as e:  # noqa: BLE001
+            stage('exit_code', False, exception=type(e).__name__)
+            obs['reason'] = 'exit_code_raised'
+            return obs
+        if not ok:
+            stage('exit_code', False, error)
+            obs['reason'] = 'exit_code_failed'
+            return obs
+        stage('exit_code', True, exit_code=int(code.value))
+        if code.value != _STILL_ACTIVE:
+            obs.update(exists=False, reason='exited')
+            return obs
+        times = [ctypes.c_uint64() for _ in range(4)]
+        try:
+            ctypes.set_last_error(0)
+            ok = k32.GetProcessTimes(handle, *(ctypes.byref(x) for x in times))
+            error = ctypes.get_last_error()
+        except Exception as e:  # noqa: BLE001
+            stage('times', False, exception=type(e).__name__)
+            obs.update(exists=True, reason='times_raised')
+            return obs
+        if not ok:
+            stage('times', False, error)
+            obs.update(exists=True, reason='times_failed')  # STILL_ACTIVE: it runs, identity unreadable
+            _snapshot_identity(obs, pid, k32, stage)
+            return obs
+        stage('times', True)
+        obs.update(exists=True, created=int(times[0].value), reason='running')
+        return obs
     finally:
-        k32.CloseHandle(h)
+        if handle:
+            try:
+                ctypes.set_last_error(0)
+                closed = k32.CloseHandle(handle)
+                error = ctypes.get_last_error()
+                stage('close', bool(closed), None if closed else error)
+            except Exception as e:  # noqa: BLE001 - a failed close never changes what was observed
+                stage('close', False, exception=type(e).__name__)
+
+
+_SYSTEM_PROCESS_INFORMATION = 5
+_STATUS_INFO_LENGTH_MISMATCH = 0xC0000004
+_SNAPSHOT_MAX_BYTES = 64 * 1024 * 1024
+_SNAPSHOT_MAX_ATTEMPTS = 8
+
+
+def _snapshot_processes_from(buf: bytes, ptr_size: int) -> list | None:
+    """Validated (pid, parent pid, creation FILETIME) rows, or None for a malformed snapshot.
+
+    Validate the entire chain before exposing any row, including a matching last row's offset.
+    NextEntryOffset is unsigned: a wrapped backwards offset is rejected by the upper bound.
+    Zero denotes the final entry, never a step back to the same entry."""
+    if ptr_size not in (4, 8):
+        return None
+    pid_at, pid_fmt = (0x50, '<Q') if ptr_size == 8 else (0x44, '<I')
+    # SYSTEM_PROCESS_INFORMATION's full fixed header and SYSTEM_THREAD_INFORMATION stride.
+    # The consumed pid prefix alone cannot bound the trailing NumberOfThreads payload.
+    need, thread_size = (0x100, 0x50) if ptr_size == 8 else (0xB8, 0x40)
+    offset, rows = 0, []
+    for _ in range(len(buf) // need):
+        if offset + need > len(buf):
+            return None
+        (step,) = struct.unpack_from('<I', buf, offset)
+        if step and (step < need or offset + step + need > len(buf)):
+            return None
+        entry_size = step or len(buf) - offset
+        (threads,) = struct.unpack_from('<I', buf, offset + 4)
+        if threads > (entry_size - need) // thread_size:
+            return None
+        entry = struct.unpack_from(pid_fmt, buf, offset + pid_at)[0]
+        parent = struct.unpack_from(pid_fmt, buf, offset + pid_at + ptr_size)[0]
+        created = struct.unpack_from('<q', buf, offset + 0x20)[0]
+        rows.append((entry, parent, created))
+        if step == 0:
+            return rows
+        offset += step
+    return None
+
+
+def _snapshot_created_from(buf: bytes, pid: int, ptr_size: int) -> int | None:
+    """Creation FILETIME of `pid`, or None for an absent pid or any malformed entry."""
+    if not _valid_pid(pid):
+        return None
+    rows = _snapshot_processes_from(buf, ptr_size)
+    for entry, _, created in rows or ():
+        if entry == pid:
+            return created if _valid_stamp(created) else None
+    return None
+
+
+def _win_own_created() -> int | None:
+    """This process's creation FILETIME from GetProcessTimes, or None."""
+    import ctypes
+    k32 = _k32()
+    times = [ctypes.c_uint64() for _ in range(4)]
+    if not k32.GetProcessTimes(k32.GetCurrentProcess(), *(ctypes.byref(x) for x in times)):
+        return None
+    return int(times[0].value) or None
+
+
+def _win_process_snapshot(query=None) -> bytes | None:
+    """Bounded NT query; an injected query has the same signature as NtQuerySystemInformation."""
+    import ctypes
+    try:
+        if query is None:
+            query = ctypes.WinDLL('ntdll').NtQuerySystemInformation
+            query.restype = ctypes.c_ulong
+            query.argtypes = (ctypes.c_ulong, ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong))
+        size = min(1 << 20, _SNAPSHOT_MAX_BYTES)
+        for _ in range(_SNAPSHOT_MAX_ATTEMPTS):
+            buf, needed = ctypes.create_string_buffer(size), ctypes.c_ulong(0)
+            status = query(_SYSTEM_PROCESS_INFORMATION, buf, size, ctypes.byref(needed))
+            if status == 0:
+                if needed.value > size:
+                    return None
+                return buf.raw[:needed.value] if needed.value else buf.raw
+            if status != _STATUS_INFO_LENGTH_MISMATCH:
+                return None
+            size = max(size * 2, needed.value + (1 << 16))
+            if size > _SNAPSHOT_MAX_BYTES:
+                return None
+    except Exception:  # noqa: BLE001 - a failed query proves nothing
+        pass
+    return None
+
+
+def _win_snapshot_data():
+    """(buffer, pointer size) of one SystemProcessInformation snapshot, or None.
+
+    The snapshot is trusted only when it gives THIS process the creation time GetProcessTimes gives it, which
+    checks the entry layout on this machine and bitness. Any failure is None."""
+    import ctypes
+    try:
+        data = _win_process_snapshot()
+        if data is None:
+            return None
+        ptr = ctypes.sizeof(ctypes.c_void_p)
+        own = _snapshot_created_from(data, os.getpid(), ptr)
+        if own is None or own != _win_own_created():
+            return None
+        return data, ptr
+    except Exception:  # noqa: BLE001 - no snapshot proves nothing
+        return None
+
+
+def _win_snapshot_created(pid: int) -> int | None:
+    """The creation FILETIME of `pid` from one NtQuerySystemInformation(SystemProcessInformation) snapshot.
+
+    The snapshot lists every process without opening any, so a process this token may not open (for example a
+    SYSTEM service that now holds a recycled pid) still has a readable creation time. Any failure is None:
+    the identity stays unreadable."""
+    snap = _win_snapshot_data()
+    return _snapshot_created_from(snap[0], pid, snap[1]) if snap else None
+
+
+_WIN_SYSTEM_PID = 4
+
+
+def _win_boot_created() -> int | None:
+    """When this boot began, as the creation FILETIME of the System process (pid 4) from the process snapshot,
+    or None. Every other process is created after it, so a recorded stamp EARLIER than this belongs to a
+    process that cannot still exist. Any failure is None: no boot proof."""
+    return _win_snapshot_created(_WIN_SYSTEM_PID)
+
+
+def _predates_boot(created, k32=None) -> bool:
+    """True only when the recorded creation stamp is provably older than this boot, so the process it names
+    is gone even though its pid now belongs to a process whose identity this token cannot read. A real kernel32
+    reads the real boot time; a scripted test kernel opts in with a `boot_created()` method. Not a Windows
+    probe, or any failure to read the boot time: False (the identity stays unreadable, never DEAD)."""
+    import ctypes
+    if not IS_WIN or not _valid_stamp(created):
+        return False
+    reader = _win_boot_created if k32 is None or isinstance(k32, ctypes.CDLL) else getattr(k32, 'boot_created', None)
+    if reader is None:
+        return False
+    try:
+        boot = reader()
+    except Exception:  # noqa: BLE001 - no boot time proves nothing
+        return False
+    return _valid_stamp(boot) and created < boot
+
+
+def _snapshot_identity(obs: dict, pid: int, k32, stage) -> None:
+    """Fill obs['created'] from a process snapshot when opening the process could not read it.
+
+    A real kernel32 uses the real snapshot; a scripted test kernel opts in with a `snapshot_created(pid)`
+    method, so a test never reads a real process by accident. Found: the stamp, compared by the caller
+    like any other. Not found or failed: obs is unchanged (exists, identity unreadable)."""
+    import ctypes
+    reader = _win_snapshot_created if isinstance(k32, ctypes.CDLL) else getattr(k32, 'snapshot_created', None)
+    if reader is None:
+        return
+    try:
+        created = reader(pid)
+    except Exception as e:  # noqa: BLE001 - a failed snapshot never changes what was observed
+        stage('snapshot', False, exception=type(e).__name__)
+        return
+    if _valid_stamp(created):
+        stage('snapshot', True)
+        obs['created'] = created
+    else:
+        stage('snapshot', False)
+
+
+def _win_process_info(pid: int, k32=None) -> tuple[bool | None, int | None]:
+    """(exists, creation FILETIME) for a pid. exists is None when it cannot be established (an API failure);
+    creation is None when the process cannot be opened or its times cannot be read."""
+    obs = _win_observe(pid, k32)
+    return obs['exists'], obs['created']
 
 
 def _posix_zombie(pid: int) -> bool:
@@ -1177,10 +1653,12 @@ ALIVE, DEAD, UNKNOWN = 'alive', 'dead', 'unknown'
 
 def pid_state(pid, created=None) -> str:
     """ALIVE, DEAD or UNKNOWN for a pid. With `created`, ALIVE means it is that same process (not a reused
-    pid) and a readable creation time that differs is DEAD. UNKNOWN is a process that exists but whose
-    creation time cannot be read (a restricted-token sandbox cannot open its host's runners): it is neither
-    provably ours nor provably gone, so callers must not call it dead and must not kill it. NEVER uses
-    os.kill on Windows (signal 0 would TerminateProcess)."""
+    pid) and a readable creation time that differs is DEAD. On Windows a process this token cannot open still
+    has its creation time read from a process snapshot, so a pid recycled by a SYSTEM service reads DEAD.
+    UNKNOWN is a process that exists but whose creation time cannot be read by either route, or a pid whose
+    existence the OS probe could not establish (with or without a stamp): it is neither provably ours nor
+    provably gone, so callers must not call it dead and must not kill it. NEVER uses os.kill on Windows
+    (signal 0 would TerminateProcess)."""
     try:
         pid = int(pid)
     except (TypeError, ValueError):
@@ -1200,16 +1678,29 @@ def pid_state(pid, created=None) -> str:
         if alive and _posix_zombie(pid):
             return DEAD
         actual = _posix_start_time(pid) if alive else None
+    if alive is None:
+        return UNKNOWN  # the probe itself failed: neither its existence nor its absence is proven
     if not alive:
         return DEAD
     if created in (None, ''):
         return ALIVE
     if actual is None:
-        return UNKNOWN
+        # Exists, identity unreadable: a recorded stamp older than this boot still names a gone process
+        # (the pid was recycled by something this token cannot read after a restart).
+        return DEAD if IS_WIN and _predates_boot(_stamp_or_none(created)) else UNKNOWN
     try:
         return ALIVE if int(created) == actual else DEAD
     except (TypeError, ValueError):
         return DEAD
+
+
+def _stamp_or_none(created):
+    """`created` as a valid stamp, or None (a malformed recorded value is never boot proof)."""
+    try:
+        value = int(created)
+    except (TypeError, ValueError):
+        return None
+    return value if _valid_stamp(value) else None
 
 
 def pid_alive(pid, created=None) -> bool:
@@ -1224,25 +1715,255 @@ def pid_maybe_alive(pid, created=None) -> bool:
     return pid_state(pid, created) != DEAD
 
 
+_POSIX_PID_MAX = 2 ** 31 - 1
+
+
+def _malformed(value, valid: bool) -> str | None:
+    """Why a recorded pid or stamp is unusable, as a fixed word (never the value itself)."""
+    if valid or value is None:
+        return None
+    if isinstance(value, bool):
+        return 'bool'
+    if isinstance(value, int):
+        return 'out_of_range'
+    if isinstance(value, float):
+        return 'float'
+    return 'not_an_int'
+
+
+def _posix_observe(pid: int) -> dict:
+    obs = {'exists': None, 'created': None, 'reason': 'not_attempted', 'stages': []}
+    try:
+        os.kill(pid, 0)
+        obs['stages'].append({'stage': 'signal0', 'attempted': True, 'ok': True, 'last_error': None})
+        obs['exists'] = True
+    except ProcessLookupError:
+        obs['stages'].append({'stage': 'signal0', 'attempted': True, 'ok': False, 'last_error': 'ESRCH'})
+        obs.update(exists=False, reason='no_such_process')
+        return obs
+    except PermissionError:
+        obs['stages'].append({'stage': 'signal0', 'attempted': True, 'ok': False, 'last_error': 'EPERM'})
+        obs['exists'] = True
+    except (OSError, OverflowError) as e:
+        obs['stages'].append({'stage': 'signal0', 'attempted': True, 'ok': False,
+                              'last_error': getattr(e, 'errno', None), 'exception': type(e).__name__})
+        obs['reason'] = 'signal0_failed'
+        return obs
+    if _posix_zombie(pid):
+        obs.update(exists=False, reason='exited')
+        return obs
+    created = _posix_start_time(pid)
+    obs['stages'].append({'stage': 'start_time', 'attempted': True, 'ok': created is not None, 'last_error': None})
+    obs.update(created=created, reason='running' if created is not None else 'times_failed')
+    return obs
+
+
+def observe_process(pid, expected_created=None, k32=None) -> dict:
+    """One JSON-safe, allowlisted observation of a recorded (pid, creation stamp) identity.
+
+    It is evidence seen by THIS process's token at this moment only: another process (for example the
+    real writer claimant) may see more or less, and nothing here claims context equivalence or grants
+    anything. Stamps are exact decimal strings (a FILETIME exceeds 2**53 and must not pass through a float).
+    The identity is validated strictly first: a bool, float, string or out-of-range pid or stamp is never
+    probed and never DEAD (`state` UNKNOWN). With a valid identity, DEAD needs qualified absence, a readable
+    exit, or a readable creation stamp that differs. Unknown existence (unexpected open errors or failed
+    exit-code queries) is UNKNOWN with or without a stamp.
+    A process that cannot be opened (access denied, or failed times while STILL_ACTIVE) is compared by its
+    snapshot creation stamp when one is readable (stage 'snapshot'); otherwise it is UNKNOWN against a stamp
+    and ALIVE without one: a conservative "it runs", never a matching identity.
+    No environment, token or command line is read or reported."""
+    pid_max = _WIN_PID_MAX if IS_WIN else _POSIX_PID_MAX
+    pid_ok = _valid_pid(pid, pid_max)
+    stamp_ok = expected_created is None or _valid_stamp(expected_created)
+    out = {'platform': 'win32' if IS_WIN else 'posix', 'observer': 'current-process-token',
+           'pid': pid if pid_ok else None, 'pid_problem': _malformed(pid, pid_ok) or (None if pid_ok else 'missing'),
+           'expected_created': str(expected_created) if stamp_ok and expected_created is not None else None,
+           'expected_created_problem': _malformed(expected_created, stamp_ok),
+           'actual_created': None, 'exists': None, 'state': UNKNOWN, 'reason': None, 'stages': []}
+    if not pid_ok or not stamp_ok:
+        out['reason'] = 'invalid_identity'
+        return out
+    raw = _win_observe(pid, k32) if IS_WIN or k32 is not None else _posix_observe(pid)
+    stages = []
+    for s in raw.get('stages') or []:
+        clean = {k: s.get(k) for k in ('stage', 'attempted', 'ok', 'last_error') if k in s}
+        if s.get('exit_code') is not None:
+            clean['exit_code'] = int(s['exit_code'])
+        if s.get('exception'):
+            clean['exception'] = str(s['exception'])
+        stages.append(clean)
+    actual = raw.get('created')
+    out.update(stages=stages, exists=raw.get('exists'), reason=raw.get('reason'),
+               actual_created=str(actual) if type(actual) is int else None)
+    if raw.get('exists') is None:
+        out['state'] = UNKNOWN
+    elif raw.get('exists') is False:
+        out['state'] = DEAD
+    elif expected_created is None:
+        out['state'] = ALIVE
+    elif type(actual) is not int:
+        if _predates_boot(expected_created, k32):
+            out['state'], out['reason'] = DEAD, 'predates_boot'
+        else:
+            out['state'], out['reason'] = UNKNOWN, out['reason'] or 'identity_unreadable'
+    elif actual == expected_created:
+        out['state'] = ALIVE
+    else:
+        out['state'], out['reason'] = DEAD, 'creation_mismatch'
+    return out
+
+
+def _win_process_tree_snapshot() -> list | None:
+    """Parent links from the same bounded, self-checked snapshot used by the identity fallback."""
+    import ctypes
+    try:
+        data = _win_process_snapshot()
+        if data is None:
+            return None
+        ptr = ctypes.sizeof(ctypes.c_void_p)
+        own = _snapshot_created_from(data, os.getpid(), ptr)
+        if own is None or own != _win_own_created():
+            return None
+        return _snapshot_processes_from(data, ptr)
+    except Exception:  # noqa: BLE001 - unknown tree membership is never permission to kill
+        return None
+
+
+def _win_process_identity(handle, k32, query=None) -> tuple | None:
+    """(pid, recorded parent pid, monotonic process sequence) from this process handle.
+
+    NtQueryInformationProcess classes 0 and 92 return PROCESS_BASIC_INFORMATION and
+    ProcessSequenceNumber (ULONGLONG). Unsupported queries refuse descendant membership;
+    a scripted kernel must opt in explicitly and never falls through to native APIs.
+    Layouts: https://github.com/winsiderss/phnt/blob/master/ntpsapi.h
+    """
+    import ctypes
+    try:
+        if query is None and not isinstance(k32, ctypes.CDLL):
+            reader = getattr(k32, 'process_identity', None)
+            identity = reader(handle) if reader else None
+        else:
+            if query is None:
+                query = ctypes.WinDLL('ntdll').NtQueryInformationProcess
+                query.restype = ctypes.c_long
+                query.argtypes = (ctypes.c_void_p, ctypes.c_ulong, ctypes.c_void_p,
+                                  ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong))
+            # The first four pointer-sized slots cover ExitStatus/padding, PEB,
+            # affinity and priority/padding; pid and inherited pid are slots 4 and 5.
+            basic = (ctypes.c_void_p * 6)()
+            size = ctypes.c_ulong()
+            if query(handle, 0, ctypes.byref(basic), ctypes.sizeof(basic), ctypes.byref(size)) != 0 \
+                    or size.value != ctypes.sizeof(basic):
+                return None
+            sequence, size = ctypes.c_uint64(), ctypes.c_ulong()
+            if query(handle, 92, ctypes.byref(sequence), ctypes.sizeof(sequence), ctypes.byref(size)) != 0 \
+                    or size.value != ctypes.sizeof(sequence):
+                return None
+            identity = (int(basic[4] or 0), int(basic[5] or 0), int(sequence.value))
+        if not isinstance(identity, tuple) or len(identity) != 3:
+            return None
+        pid, parent, sequence = identity
+        if _valid_pid(pid) and type(parent) is int and 0 <= parent <= _WIN_PID_MAX and _valid_stamp(sequence):
+            return identity
+    except Exception:  # noqa: BLE001 - no ordering proof means no descendant permission
+        pass
+    return None
+
+
+def _win_kill_tree(pid: int, created=None, k32=None) -> bool:
+    """Pin each verified process object until termination; never kill by numeric pid.
+
+    A failed root verification kills nothing. Unverifiable descendants are skipped individually;
+    False reports incomplete enumeration, verification or termination to callers.
+    The snapshot bounds membership in time: children born after it may survive."""
+    import ctypes
+    handles = []
+    try:
+        if not _valid_pid(pid):
+            return False
+        k32 = k32 or _k32()
+
+        def acquire(target, expected=None):
+            handle = k32.OpenProcess(_PROCESS_TERMINATE | _PROCESS_QUERY_LIMITED | _SYNCHRONIZE, False, target)
+            if not handle:
+                return None
+            handles.append(handle)  # even failed/raising identity queries must close it
+            times = [ctypes.c_uint64() for _ in range(4)]
+            if not k32.GetProcessTimes(handle, *(ctypes.byref(x) for x in times)):
+                return None
+            stamp = int(times[0].value)
+            if not _valid_stamp(stamp) or (expected is not None and stamp != expected):
+                return None
+            return handle, stamp
+
+        expected = None if created in (None, '') else int(created)
+        root = acquire(pid, expected)
+        if root is None:
+            return False
+        rows = _win_process_tree_snapshot()
+        complete = rows is not None and (pid, root[1]) in {(p, c) for p, _, c in rows}
+        children = {}
+        if complete:
+            for child, parent, stamp in rows:
+                if _valid_pid(child):
+                    children.setdefault(parent, []).append((child, stamp))
+        root_identity = _win_process_identity(root[0], k32)
+        if root_identity is None or root_identity[0] != pid:
+            complete = False
+        targets, queue, seen = [root[0]], [], {pid}
+        if complete:
+            queue.append((pid, root_identity[2]))
+        for parent, parent_sequence in queue:
+            for child, stamp in children.get(parent, ()):
+                if child in seen:
+                    continue
+                seen.add(child)
+                if not _valid_stamp(stamp):
+                    complete = False
+                    continue
+                try:
+                    verified = acquire(child, stamp)
+                except Exception:  # noqa: BLE001 - one inaccessible child must not prevent the other kills
+                    verified = None
+                if verified is None:
+                    complete = False
+                    continue
+                identity = _win_process_identity(verified[0], k32)
+                if identity is None or identity[:2] != (child, parent) or identity[2] <= parent_sequence:
+                    complete = False
+                    continue
+                # Every ancestor stays pinned. An older orphan cannot belong to a
+                # later incarnation of its recorded parent pid, even across clock rollback.
+                queue.append((child, identity[2]))
+                targets.append(verified[0])
+        for handle in reversed(targets):
+            try:
+                if not k32.TerminateProcess(handle, 1):
+                    complete = False
+            except Exception:  # noqa: BLE001
+                complete = False
+        return complete
+    except Exception:  # noqa: BLE001 - no pid-only fallback on any failure
+        return False
+    finally:
+        for handle in reversed(handles):
+            try:
+                k32.CloseHandle(handle)
+            except Exception:  # noqa: BLE001 - still close the remaining handles
+                pass
+
+
 def kill_tree(pid, created=None) -> bool:
     """Kill a process tree. With `created`, refuses unless the pid is still that same process.
-    True only when the kill command reported success."""
+    True only when termination succeeded (on Windows, for every verified tree member)."""
     try:
         pid = int(pid)
     except (TypeError, ValueError):
         return False
+    if IS_WIN:
+        return _win_kill_tree(pid, created)
     if created not in (None, '') and not pid_alive(pid, created):
         return False  # a reused pid, or an identity that cannot be read: never kill what is not provably it
-    if IS_WIN:
-        r = subprocess.run(['taskkill', '/PID', str(pid), '/T', '/F'], capture_output=True,
-                           creationflags=no_window_flags())
-        if r.returncode == 0:
-            return True
-        try:
-            os.kill(pid, 9)
-            return True
-        except OSError:
-            return False
     try:
         group = os.getpgid(pid)
         if group == pid and group != os.getpgrp():

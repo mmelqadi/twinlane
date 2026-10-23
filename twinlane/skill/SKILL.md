@@ -110,3 +110,27 @@ full list in your installed version.
   check the diff before saying it is finished.
 - The guard that blocks risky shell commands only acts inside twinlane workers; it is a heuristic, not a
   sandbox. Interactive sessions are not guarded.
+
+## Lanes and attention
+
+Use `twinlane board`, `twinlane inbox`, `twinlane wip`, then `twinlane wt prune --merged-only` (preview).
+Never blocked: ask one question with `baton set SLUG --ask "Archive these 2 branches?" --record branches --count 2`.
+An inbox yes is not a live-write approval. Bind your session with `--bind-session SESSION_ID`.
+Batons are never auto-closed: landing marks landed; stale is derived from inactivity, and checkpoint snaps are
+not progress. Close explicitly or resume with `--state active`; park with `--state parked --park-for 8h`.
+`wip next` prints the retry command, never starts it, and keeps a full queue unless `--force` is given.
+Context is a `~` estimate. Use `land card --baton SLUG` before landing; archive defaults to a prune suggestion.
+`install --precompact` and `install --lane-state` preview settings diffs; Codex notify configuration is manual.
+
+## Wake the coordinating session
+
+Run `twinlane watch --name lead` in the background while coordinating lanes. Re-arm it after
+each wake: collect completed jobs with `twinlane result JOB`, inspect `twinlane board`, and
+handle the ranked waits before waiting again. Different watcher names have independent
+cursors; delivery is at least once. Watch only polls files and cached meters. Worker jobs
+are refused and must return their report instead of watching lead events.
+
+Use `twinlane run --owner SLUG` for an existing baton to record the job dependency and its
+completion. Use `baton set SLUG --waiting-on lead|user|job:JOB|lane:SLUG|none`; a user wait
+requires a yes/no `--ask`. Inbox answers never grant live-write approval. The capacity line
+is weekly-pace advice only; dispatch still follows policy and fresh meter checks.

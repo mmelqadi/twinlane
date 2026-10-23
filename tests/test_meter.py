@@ -67,7 +67,7 @@ class TempState(unittest.TestCase):
                   mock.patch.object(common, 'BIN', os.path.join(self.tmp, 'bin')),
                   mock.patch.object(common, 'CODEX_DIR', os.path.join(self.tmp, 'dotcodex')),
                   mock.patch.dict(os.environ, {'LOCALAPPDATA': os.path.join(self.tmp, 'local'),
-                                               'TWINLANE_TEST_ISOLATION': '1'})):
+                                               'TWINLANE_TEST_ISOLATION': '1', 'TWINLANE_CODEX_BIN': ''})):
             p.start()
             self.addCleanup(p.stop)
         self.policy = common.load_policy()
@@ -617,8 +617,9 @@ class CodexSourceTests(TempState):
         self.assertIsNone(meter.rollout_reading(os.path.join(self.tmp, 'nothing')))
 
     def test_missing_binary_is_noted_and_falls_back(self):
-        # no app build and no private copy means no codex, never the PATH CLI (0.149.1).
-        with mock.patch.object(common.shutil, 'which', return_value=os.path.join(self.tmp, 'no', 'codex.exe')):
+        # Neither an app build nor a PATH binary: remain unknown without launching.
+        with mock.patch.object(common, 'acquire_codex', return_value=(None, 'no app', None)), \
+                mock.patch.object(common.shutil, 'which', return_value=None):
             r = meter.read_codex_raw(sessions_root=os.path.join(self.tmp, 'none'))
         self.assertEqual(r['source'], 'none')
         self.assertIn('codex binary not found', r['note'])
@@ -796,6 +797,64 @@ for line in sys.stdin:
             r = meter.read_codex_raw(sessions_root=os.path.join(self.tmp, 'sessions'))
         self.assertEqual(r['source'], 'rollout')
         self.assertIn('lookup failed', r['note'])
+
+    def _rollout_fixture(self):
+        root = os.path.join(self.tmp, 'sessions', '2026', '10', '07')
+        os.makedirs(root)
+        shutil.copy(os.path.join(FIX, 'rollout_sample.jsonl'), os.path.join(root, 'rollout-fixture.jsonl'))
+        return os.path.join(self.tmp, 'sessions')
+
+    def test_no_rollout_leaves_a_failed_read_unknown(self):
+        # rollouts are present and would be used; with the fallback off they are never opened.
+        sessions = self._rollout_fixture()
+        with mock.patch.object(meter, 'read_app_server', return_value=(None, 'app-server exited 1')),                 mock.patch.object(meter, 'rollout_reading', side_effect=AssertionError('rollouts opened')) as rr:
+            r = meter.read_codex_raw(sessions_root=sessions, rollout_fallback=False)
+        rr.assert_not_called()
+        self.assertEqual(r['source'], 'none')
+        self.assertIn('app-server exited 1', r['note'])
+        self.assertIn('rollout fallback off', r['note'])
+        self.assertEqual(meter.finish_codex(r, self.policy)['status'], 'unknown')
+
+    def test_no_rollout_keeps_a_good_app_server_reading(self):
+        good = meter.parse_app_server(json.loads(fixture('app_server_ratelimits.json'))['result'])
+        with mock.patch.object(meter, 'read_app_server', return_value=(good, '')):
+            r = meter.read_codex_raw(rollout_fallback=False)
+        self.assertEqual(r['source'], 'app-server')
+
+    def test_rollout_fallback_policy(self):
+        self.assertTrue(meter.rollout_fallback_enabled({}))
+        self.assertTrue(meter.rollout_fallback_enabled({'meter': {'codex_rollout_fallback': True}}))
+        self.assertFalse(meter.rollout_fallback_enabled({'meter': {'codex_rollout_fallback': False}}))
+        # malformed fails closed: no session files
+        for bad in ('true', 1, None, 'yes'):
+            self.assertFalse(meter.rollout_fallback_enabled({'meter': {'codex_rollout_fallback': bad}}))
+
+    def _read_with_failed_server(self, policy, **kw):
+        sessions = self._rollout_fixture()
+        real = meter.rollout_reading
+        with mock.patch.object(meter, 'read_app_server', return_value=(None, 'app-server exited 1')),                 mock.patch.object(meter, 'rollout_reading', side_effect=lambda root=None, **_: real(sessions)):
+            return meter.read(fresh=True, policy=policy, _claude_reader=lambda: claude_raw(12), **kw)
+
+    def test_read_follows_policy_and_the_argument(self):
+        self.assertEqual(self._read_with_failed_server(self.policy)['codex']['source'], 'rollout')
+        shutil.rmtree(os.path.join(self.tmp, 'sessions'))
+        off = dict(self.policy, meter=dict(self.policy.get('meter') or {}, codex_rollout_fallback=False))
+        m = self._read_with_failed_server(off)
+        self.assertEqual(m['codex']['status'], 'unknown')
+        self.assertNotEqual(m['codex'].get('source'), 'rollout')
+        shutil.rmtree(os.path.join(self.tmp, 'sessions'))
+        m = self._read_with_failed_server(self.policy, rollout_fallback=False)
+        self.assertEqual(m['codex']['status'], 'unknown')
+        # the cache holds what was read: no rollout reading reached it
+        self.assertNotEqual(common.read_json(meter.meter_path())['codex'].get('source'), 'rollout')
+
+    def test_cli_no_rollout_flag(self):
+        sessions = self._rollout_fixture()
+        with mock.patch.object(meter, 'read_app_server', return_value=(None, 'app-server exited 1')),                 mock.patch.object(meter, 'rollout_reading', side_effect=AssertionError('rollouts opened')),                 mock.patch.object(meter, 'read_claude_raw', return_value=claude_raw(12)),                 mock.patch('sys.stdout', new_callable=io.StringIO) as out:
+            rc = meter.cli(['--fresh', '--no-rollout', '--json'])
+        self.assertEqual(rc, common.EXIT_OK)
+        self.assertEqual(json.loads(out.getvalue())['codex']['status'], 'unknown')
+        self.assertTrue(os.path.isdir(sessions))
 
     def test_app_server_hang_is_killed_at_deadline(self):
         pidfile = os.path.join(self.tmp, 'pid.txt')
@@ -1397,7 +1456,7 @@ class AutoRefreshTests(TempState):
         self.assertEqual(self.calls, [])
         self.assertEqual(m['claude']['status'], 'unknown')
 
-    def test_route_and_status_use_auto_refresh_but_a_forced_codex_route_does_not(self):
+    def test_route_uses_auto_refresh_but_a_forced_codex_route_does_not(self):
         from twinlane import route
         seen = []
 
@@ -1416,18 +1475,15 @@ class AutoRefreshTests(TempState):
         self.assertIn('note: Claude CLI token had expired: refreshed automatically', out.getvalue())
         self.assertIn('"meter_refresh"', out.getvalue())
 
-    def test_status_command_asks_for_the_automatic_refresh(self):
+    def test_status_command_reads_only_cached_observations(self):
         from twinlane import cli
-        seen = []
-
-        def fake_read(**kw):
-            seen.append(kw)
-            return {'read_at': common.iso(common.now()), 'claude': meter.finish_claude(claude_raw(10), self.policy),
-                    'codex': meter.finish_codex(codex_raw(10), self.policy)}
-
-        with mock.patch.object(meter, 'read', fake_read), redirect_stdout(io.StringIO()),                 mock.patch.object(common, 'JOBS', os.path.join(self.tmp, 'jobs')),                 mock.patch.object(common, 'BATONS', os.path.join(self.tmp, 'batons')):
-            cli.status([])
-        self.assertTrue(seen[0]['auto_refresh'])
+        with mock.patch.object(meter, 'read', side_effect=AssertionError('probe')), \
+                mock.patch.object(meter, 'cached_observation', return_value={}) as cached, \
+                redirect_stdout(io.StringIO()), \
+                mock.patch.object(common, 'JOBS', os.path.join(self.tmp, 'jobs')), \
+                mock.patch.object(common, 'BATONS', os.path.join(self.tmp, 'batons')):
+            self.assertEqual(cli.status(['--fresh']), 0)
+        cached.assert_called_once_with()
 
 
 class UsageHelperTests(TempState):
