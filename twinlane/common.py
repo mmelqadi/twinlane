@@ -242,7 +242,7 @@ def file_lock(path: str, timeout_s: float = 120, poll_s: float = 0.05, *, create
 
 def _try_lock_fd(fd: int) -> bool:
     try:
-        if IS_WIN:
+        if os.name == 'nt':  # the real OS, not the IS_WIN test seam: these are native lock calls
             import msvcrt
             os.lseek(fd, 0, 0)
             msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
@@ -256,7 +256,7 @@ def _try_lock_fd(fd: int) -> bool:
 
 def _unlock_fd(fd: int) -> None:
     try:
-        if IS_WIN:
+        if os.name == 'nt':
             import msvcrt
             os.lseek(fd, 0, 0)
             msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)

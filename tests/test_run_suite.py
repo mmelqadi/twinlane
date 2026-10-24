@@ -25,7 +25,7 @@ class SuiteRunnerTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="suite-fixtures-")
         self.addCleanup(test_support.cleanup_tempdir, self.temp)
-        self.root = Path(self.temp.name)
+        self.root = Path(os.path.realpath(self.temp.name))  # the runner reports resolved paths
         self.tests = self.root / "tests"
         self.tests.mkdir()
         self.marker = self.tests / "marker"

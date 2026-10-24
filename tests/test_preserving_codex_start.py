@@ -156,12 +156,13 @@ class PreservingCodexStartTests(unittest.TestCase):
         return jobs._run_parser().parse_args(['--brief', str(self.brief), '--cd', self.cwd, '--kind', 'intel',
                                               '--engine', engine, '--preserve-existing-metadata', *extra])
 
-    def plan(self, *extra):
+    def plan(self, *extra, args=None):
+        """`args`: arguments parsed beforehand, for a test that traps os.stat (argparse reads locale files)."""
         decision = {'engine': 'codex', 'refused': False, 'profile': 'intel', 'reason': 'synthetic'}
         with mock.patch.object(jobs, '_meter', return_value={}), \
                 mock.patch.object(jobs, '_route', return_value=decision), \
                 mock.patch.object(jobs, '_refresh_notice', return_value=None):
-            return jobs.plan_run(self.args(*extra), self.policy)
+            return jobs.plan_run(args or self.args(*extra), self.policy)
 
     def explicit(self, value):
         return mock.patch.dict(os.environ, {'TWINLANE_CODEX_BIN': value})
@@ -253,12 +254,13 @@ class PreservingCodexStartTests(unittest.TestCase):
     def test_network_path_is_refused_before_any_filesystem_access(self):
         def no_fs(*args, **kwargs):
             raise AssertionError('filesystem access to a network path')
+        args = self.args()
         with self.explicit(r'\\server.invalid\share\codex.exe'), \
                 mock.patch.object(os, 'stat', side_effect=no_fs), mock.patch.object(os, 'lstat', side_effect=no_fs), \
                 mock.patch.object(common, 'canon_path', side_effect=no_fs), \
                 mock.patch.object(common, 'real_path', side_effect=no_fs):
             with self.assertRaises(jobs.Refusal) as caught:
-                self.plan()
+                self.plan(args=args)
         self.assertIn('TWINLANE_CODEX_BIN', caught.exception.message)
         self.assertEqual(self.tripped, [])
 

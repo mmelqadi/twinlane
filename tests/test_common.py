@@ -659,7 +659,7 @@ class CodexBinary(unittest.TestCase):
     """The desktop-app CLI copy is Windows-only and fails closed rather than run an unverified binary."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp()
+        self.tmp = os.path.realpath(tempfile.mkdtemp())  # the code under test resolves links and short names
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.local = os.path.join(self.tmp, 'local')
         self.codex_dir = os.path.join(self.tmp, 'dotcodex')

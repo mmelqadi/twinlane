@@ -44,10 +44,10 @@ class ExplainCommand(unittest.TestCase):
             patch.start()
             self.addCleanup(patch.stop)
 
-    def run_cli(self, *args, table=None, observer=None):
+    def run_cli(self, *args, table=None, observer=None, allow=()):
         calls = []
         tripwires = [mock.patch.object(mod, name, side_effect=AssertionError(f'{name} must not be called'))
-                     for mod, name in FORBIDDEN]
+                     for mod, name in FORBIDDEN if name not in allow]
         out, err = io.StringIO(), io.StringIO()
         before = tree(self.s.root)
         with contextlib.ExitStack() as stack:
@@ -118,7 +118,9 @@ class ExplainCommand(unittest.TestCase):
         for cwd in ('repo\x00x', '\x00', ''):
             with self.subTest(cwd=repr(cwd)):
                 out, err = io.StringIO(), io.StringIO()
-                with mock.patch.object(os.path, 'realpath', side_effect=boom), \
+                # argparse reads locale files through os.stat unless the language is plain C
+                with mock.patch.dict(os.environ, {'LANGUAGE': 'C'}), \
+                        mock.patch.object(os.path, 'realpath', side_effect=boom), \
                         mock.patch.object(os.path, 'abspath', side_effect=boom), \
                         mock.patch.object(os.path, 'normcase', side_effect=boom), \
                         mock.patch.object(os, 'scandir', side_effect=boom), \
@@ -146,9 +148,11 @@ class ExplainCommand(unittest.TestCase):
     def test_real_self_observation_through_the_command(self):
         me = common.process_created(os.getpid())
         self.s.reservation({'id': 'owner', 'cwd': self.s.cwd, 'pid': os.getpid(), 'created': me})
-        _, out, _ = self.run_cli('--cwd', str(self.s.repo), '--json', observer=wa.common.observe_process)
+        # macOS reads a start time by running a read-only `ps`; nothing else may spawn a process.
+        _, out, _ = self.run_cli('--cwd', str(self.s.repo), '--json', observer=wa.common.observe_process,
+                                 allow=('Popen',) if sys.platform == 'darwin' else ())
         report = json.loads(out)
-        self.assertEqual(report['decision'], wa.BLOCKED)
+        self.assertEqual(report['decision'], wa.BLOCKED, out)
         self.assertEqual(report['reservation']['owner']['state'], ALIVE)
 
 

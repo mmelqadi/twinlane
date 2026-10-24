@@ -23,7 +23,7 @@ class Fixture(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory(prefix='twinlane-p0c-')
         self.addCleanup(test_support.cleanup_tempdir, temp)
-        self.tmp = Path(temp.name)
+        self.tmp = Path(os.path.realpath(temp.name))  # the code under test resolves links and short names
         for name in ('STATE', 'JOBS', 'BATONS', 'BIN'):
             patch = mock.patch.object(common, name, str(self.tmp / name.lower()))
             patch.start()
@@ -570,6 +570,11 @@ class MeterBinaryPolicy(Fixture):
                     which.assert_not_called()
 
     def test_auto_fallback_and_relative_path_resolve_absolutely(self):
+        here = self.tmp / 'cwd'  # relpath cannot cross drives, so make the temp dir the current directory's neighbour
+        here.mkdir()
+        previous = os.getcwd()
+        os.chdir(here)
+        self.addCleanup(os.chdir, previous)
         relative = os.path.relpath(self.tmp / 'external' / 'codex.exe')
         for source in ('auto', 'path'):
             result, _, _, exchange = self.read(source, None, relative)

@@ -12,7 +12,7 @@ import time
 if 'twinlane.common' in sys.modules:
     raise RuntimeError('test_support must load before twinlane.common; context was not changed')
 
-_HOME = tempfile.mkdtemp(prefix='twinlane-tests-')
+_HOME = os.path.realpath(tempfile.mkdtemp(prefix='twinlane-tests-'))  # code under test resolves links, short names
 atexit.register(shutil.rmtree, _HOME, ignore_errors=True)
 os.environ['TWINLANE_HOME'] = _HOME
 os.environ['TWINLANE_TEST_ISOLATION'] = '1'
