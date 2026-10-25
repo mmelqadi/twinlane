@@ -185,7 +185,7 @@ class Watchdog(unittest.TestCase):
         def wait(timeout):
             calls.append(timeout)
             if len(calls) == 1:
-                time.sleep(timeout)  # a real wait blocks for its slice
+                time.sleep(timeout + 0.05)  # a real wait blocks for its slice (a coarse clock must see it)
                 clock.t = 5
                 raise subprocess.TimeoutExpired('x', timeout)
             return -9
@@ -207,7 +207,7 @@ class Watchdog(unittest.TestCase):
             def wait(timeout, clock=clock, seen=seen):
                 seen.append(timeout)
                 if len(seen) == 1:
-                    time.sleep(timeout)
+                    time.sleep(timeout + 0.05)
                     clock.t = 5
                     raise subprocess.TimeoutExpired('x', timeout)
                 return 0  # the root exits cleanly; its children are another matter
