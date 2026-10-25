@@ -210,8 +210,8 @@ def _kill_posix_tree(process):
                 if pid in table and table[pid][1] == birth and not table[pid][2].startswith("Z"):
                     try:
                         os.kill(pid, signal.SIGSTOP)
-                    except ProcessLookupError:
-                        pass
+                    except (ProcessLookupError, PermissionError):
+                        pass  # macOS answers EPERM for a zombie; the stabilization check below is the arbiter
             newer = _process_table()
             unseen = any(parent in known and pid not in known and parent in newer
                          and newer[parent][1] == known[parent]
@@ -235,15 +235,15 @@ def _kill_posix_tree(process):
             if pid in table and table[pid][1] == birth:
                 try:
                     os.kill(pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+                except (ProcessLookupError, PermissionError):
+                    pass  # EPERM on a zombie (macOS); a live survivor is reported by the check below
                 except OSError as error:
                     errors.append(str(error))
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         errors.append(str(error))
     try:
         os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError):
         pass
     deadline = time.monotonic() + 3
     while True:

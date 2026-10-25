@@ -252,13 +252,18 @@ class PreservingCodexStartTests(unittest.TestCase):
         self.assertEqual((before, shielded, self.tripped), (self.foreign(), self.protected(), []))
 
     def test_network_path_is_refused_before_any_filesystem_access(self):
-        def no_fs(*args, **kwargs):
-            raise AssertionError('filesystem access to a network path')
+        def trap(real):
+            def no_fs(*args, **kwargs):  # only the network path is off limits; the work folder is read normally
+                if args and 'server.invalid' in str(args[0]):
+                    raise AssertionError('filesystem access to a network path')
+                return real(*args, **kwargs)
+            return no_fs
         args = self.args()
         with self.explicit(r'\\server.invalid\share\codex.exe'), \
-                mock.patch.object(os, 'stat', side_effect=no_fs), mock.patch.object(os, 'lstat', side_effect=no_fs), \
-                mock.patch.object(common, 'canon_path', side_effect=no_fs), \
-                mock.patch.object(common, 'real_path', side_effect=no_fs):
+                mock.patch.object(os, 'stat', side_effect=trap(os.stat)), \
+                mock.patch.object(os, 'lstat', side_effect=trap(os.lstat)), \
+                mock.patch.object(common, 'canon_path', side_effect=trap(common.canon_path)), \
+                mock.patch.object(common, 'real_path', side_effect=trap(common.real_path)):
             with self.assertRaises(jobs.Refusal) as caught:
                 self.plan(args=args)
         self.assertIn('TWINLANE_CODEX_BIN', caught.exception.message)
