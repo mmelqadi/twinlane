@@ -245,7 +245,7 @@ class HandlePinnedKill(unittest.TestCase):
 
     def test_a_genuine_child_born_after_rollback_uses_sequence_order(self):
         kernel = KillKernel(stamps={42: 100, 43: 99})
-        self.assertTrue(self.kill(kernel, rows=[(42, 1, 100), (43, 42, 99)]))
+        self.assertFalse(self.kill(kernel, rows=[(42, 1, 100), (43, 42, 99)]))
         self.assertEqual([h[0] for h in kernel.terminated], [43, 42])
 
     def test_unknown_root_sequence_kills_only_verified_root(self):
@@ -293,7 +293,7 @@ class HandlePinnedKill(unittest.TestCase):
 
     def test_kill_uses_the_same_handle_that_supplied_the_identity(self):
         kernel = KillKernel()
-        self.assertTrue(self.kill(kernel))
+        self.assertFalse(self.kill(kernel))
         self.assertEqual([h[0] for h in kernel.terminated], [44, 43, 42])
         self.assertEqual(kernel.access, [(p, 0x101001, False) for p in (42, 43, 44)])
 
@@ -301,7 +301,7 @@ class HandlePinnedKill(unittest.TestCase):
         kernel = KillKernel()
         def replace_pid():
             kernel.stamps[42] = 900
-        self.assertTrue(self.kill(kernel, before_snapshot=replace_pid))
+        self.assertFalse(self.kill(kernel, before_snapshot=replace_pid))
         self.assertEqual(kernel.terminated[-1], kernel.opened[0])
         self.assertEqual(kernel.terminated[-1][1], 100)
 
@@ -351,7 +351,7 @@ class HandlePinnedKill(unittest.TestCase):
                 self.assertIn(42, [h[0] for h in kernel.terminated])
 
     def test_close_exception_does_not_leak_remaining_handles(self):
-        self.assertTrue(self.kill(KillKernel(fail=('close_raise', 44))))
+        self.assertFalse(self.kill(KillKernel(fail=('close_raise', 44))))
 
     def test_root_termination_failures_still_close_every_handle(self):
         for failure in ('terminate', 'terminate_raise'):
@@ -403,7 +403,7 @@ class RealWindowsTreeKill(unittest.TestCase):
 
     def test_right_identity_terminates_root_and_child(self):
         root, child, stamp, child_stamp = self.start_tree()
-        self.assertTrue(common.kill_tree(root.pid, stamp))
+        self.assertFalse(common.kill_tree(root.pid, stamp))  # snapshot-only: unconfirmed
         root.wait(timeout=10)
         deadline = time.monotonic() + 10
         while common.pid_maybe_alive(child, child_stamp) and time.monotonic() < deadline:

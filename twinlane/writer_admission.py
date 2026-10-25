@@ -39,8 +39,10 @@ _RANK = {None: 0, UNKNOWN: 1, BLOCKED: 2}
 
 # File names as jobs.py writes them (tests check they stay equal).
 SURVIVOR, CHILD_STARTING, RUNNER_LOCK, RUNNER_PID = 'survivor.json', 'child-starting.json', 'runner.lock', 'runner.pid'
-JOB_FILES = ('job.json', 'status.json', 'result.json', SURVIVOR, CHILD_STARTING, RUNNER_PID, RUNNER_LOCK)
-PRESENCE_MARKERS = ('status.json', RUNNER_PID, RUNNER_LOCK, SURVIVOR, CHILD_STARTING)  # as in _claim_writer
+TREE_UNRESOLVED = jobs.TREE_UNRESOLVED
+JOB_FILES = ('job.json', 'status.json', 'result.json', SURVIVOR, CHILD_STARTING, RUNNER_PID, RUNNER_LOCK,
+             TREE_UNRESOLVED)
+PRESENCE_MARKERS = ('status.json', RUNNER_PID, RUNNER_LOCK, SURVIVOR, CHILD_STARTING, TREE_UNRESOLVED)
 KNOWN_STATUSES = ('queued', 'running', 'done', 'failed', 'timeout', 'limit_hit', 'refused', 'stopped', 'lost',
                   'interrupted')
 READ_RETRIES = 8
@@ -518,6 +520,15 @@ def _busy(snap: dict, job_id: str, entry: dict | None) -> tuple:
         f.add(BLOCKED, 'status_not_an_object')
     st = st if isinstance(st, dict) else {}
     states = []
+    tree_kind, _ = _json(files, TREE_UNRESOLVED)
+    pending_kind, pending_tree = _json(files, CHILD_STARTING)
+    tree_marker = TREE_UNRESOLVED if tree_kind != 'absent' else CHILD_STARTING \
+        if pending_kind == 'ok' and isinstance(pending_tree, dict) and pending_tree.get('unresolved_tree') is True \
+        else None
+    if tree_marker:
+        f.add(BLOCKED, tree_marker + ': unresolved tree; a person must run twinlane stop JOB --tree-gone')
+        detail['unresolved_tree'] = {'marker': tree_marker}
+        states.append(common.UNKNOWN)
     # the engine child recorded in status.json (None/absent: none was recorded)
     if st.get('child_pid') is None:
         detail['child'] = {'recorded': False}

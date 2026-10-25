@@ -711,6 +711,7 @@ def collect(show_all: bool = False, finished_n: int = FINISHED_DEFAULT, now=None
                             key=lambda b: (b.get('waiting_since') or '', b['slug'])) for kind in ('lead', 'user')}
     capacity_line = capacity.line('?' if busy is None else len(busy), (policy.get('wip') or {}).get('max_writers', 5),
                                   len(wip.queue()), meters, now)
+    host_line, queue = host_and_queue(jobs_data['live'], policy)
     for row in lane_sessions:
         if (row.get('context') or {}).get('flag'):
             signals.append(_item(P_INFO, 'context', row['id'], context.label(row['context']) + ' (estimate)'))
@@ -721,8 +722,33 @@ def collect(show_all: bool = False, finished_n: int = FINISHED_DEFAULT, now=None
         b.pop('root', None)
     return _scrub({'generated_at': common.iso(now), 'all': show_all, 'meters': meters, 'attention': attention,
                    'signals': signals, 'sessions': lane_sessions, 'waiting': waiting, 'capacity': capacity_line,
+                   'host': host_line, 'queue': queue,
                    'lanes': {'busy': '?' if busy is None else len(busy), 'max': (policy.get('wip') or {}).get('max_writers', 5), 'idle': idle},
                    'jobs': jobs_data, 'batons': batons, 'worktrees': worktrees})
+
+
+def host_and_queue(live: list, policy: dict) -> tuple:
+    """The host-load line, and every job waiting for a slot with the reason it waits, in service order."""
+    from . import hostload, jobs
+    try:
+        reading = hostload.sample(policy)
+    except Exception:  # noqa: BLE001 - a sensor failure never breaks the board
+        reading = None
+    configured = max([int((policy.get(e) or {}).get('max_parallel') or 4) for e in ENGINES] or [4])
+    waiting = []
+    for r in live:
+        if r.get('status') != 'queued':
+            continue
+        st = common.read_json(jobs._p(r['id'], 'status.json'), {}) or {}
+        if not isinstance(st, dict):
+            continue
+        waiting.append({'id': r['id'], 'engine': r.get('engine'), 'kind': r.get('kind'), 'name': r.get('name'),
+                        'reason': st.get('queue_reason') or 'waiting for a slot',
+                        'waiting_since': st.get('waiting_since'), 'priority': st.get('queue_priority', 1)})
+    waiting.sort(key=lambda w: (w['engine'] or '', w['priority'], str(w['waiting_since'] or ''), w['id']))
+    for w in waiting:
+        w['waiting_age'] = common.fmt_age(common.age_s(w['waiting_since']))
+    return hostload.line(reading, configured, policy), waiting
 
 
 # ---------------------------------------------------------------- rendering
@@ -882,6 +908,8 @@ def render_text(data: dict) -> str:
             L.append(f"  note {e}: {v['note']}")
     L.append(_route_text(m))
     L.append(data.get('capacity', ''))
+    if data.get('host'):
+        L.append(data['host'])
     L.append(f"idle lanes: {data.get('lanes', {}).get('idle', 0)}")
     for kind in ('lead', 'user'):
         L.append(f'== Waiting on {kind}')
@@ -904,6 +932,10 @@ def render_text(data: dict) -> str:
     L += ['  ' + _live_text(r) for r in live] or ['  none running']
     if more:
         L.append(_more(more))
+    if data.get('queue'):
+        L.append(f"== QUEUE ({len(data['queue'])} waiting for a slot)")
+        L += [f"  {i}. {w['id']}  {w['engine'] or '-':6} {w['kind'] or '-':9} waited {w.get('waiting_age') or '?':>4}  {w['reason']}"
+              for i, w in enumerate(data['queue'], 1)]
     from . import context
     L.append('== SESSIONS (context is estimated)')
     L += [f"  {r['engine']} {r['id']} {r['state']} {context.label(r.get('context'))}"
@@ -955,6 +987,8 @@ def render_md(data: dict) -> str:
     L.append('- ' + _engine_line('codex', m.get('codex')))
     L.append('- ' + _route_text(m))
     L.append('- ' + data.get('capacity', ''))
+    if data.get('host'):
+        L.append('- ' + data['host'])
     L.append(f"- idle lanes: {data.get('lanes', {}).get('idle', 0)}")
     for kind in ('lead', 'user'):
         L += ['', f'**Waiting on {kind}**']
@@ -980,6 +1014,11 @@ def render_md(data: dict) -> str:
                   _model_text(r), r['name'], r['worktree']] for r in live]) or ['- none running']
     if more:
         L.append(f'- ... +{more} more (`--all`)')
+    if data.get('queue'):
+        L += ['', f"**Queue ({len(data['queue'])} waiting for a slot)**"]
+        L += _table(['#', 'job', 'engine', 'kind', 'waited', 'reason'],
+                    [[i, _code(w['id']), w['engine'], w['kind'], w.get('waiting_age'), w['reason']]
+                     for i, w in enumerate(data['queue'], 1)])
     from . import context
     L += ['', '**Sessions** (estimated context)']
     L += _table(['engine', 'session', 'state', 'context', 'startedBy', 'custody'],

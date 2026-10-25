@@ -979,7 +979,7 @@ def _self_reason(args: list[str], label: str) -> str | None:
         return why.format(pos[0])
     if pos[:2] == ['jobs', 'archive'] and any(a == '--a' or a.startswith('--ap') for a in low):
         return why.format('jobs archive --apply')
-    if pos[0] in ('inbox', 'wip') and any(a in ('answer', 'next') for a in pos[1:]):
+    if pos[0] in ('inbox', 'wip') and any(a in ('answer', 'next', 'pump') for a in pos[1:]):
         return why.format(' '.join(pos[:2]))
     if pos[0] == 'wt' and (len(pos) < 2 or pos[1] not in SELF_WT_ALLOWED or 'prune' in pos or
                            any(a in ('--prune', '--fix') for a in low)):

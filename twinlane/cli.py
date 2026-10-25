@@ -13,7 +13,7 @@
   twinlane compare GROUP [--wait] [--test] [--json|--md]                        (compare a --best-of group)
   twinlane land card|enqueue|status|next|run|release|dequeue|log ...   (land finished worktree branches, one at a time)
   twinlane ship plan|run ...                                      (release manifest for landed work)
-  twinlane wt doctor|prune ...                                    (inspect and prune linked worktrees)
+  twinlane wt doctor [--fix]|prune ...                            (inspect, release stale claims, prune worktrees)
   twinlane wt gc [--repo DIR] [--apply]                            (zero-unique cleanup; dry run by default)
   twinlane wip [next] [--json]                                    (writer lanes and manual FIFO admission queue)
   twinlane inbox [--all] [--json] | inbox answer ID --grant WORDS | --deny REASON

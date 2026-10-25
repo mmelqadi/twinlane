@@ -11,6 +11,7 @@ import hashlib
 import json
 import math
 import os
+import secrets
 import shlex
 import subprocess
 from contextlib import contextmanager
@@ -248,7 +249,8 @@ current_lanes = collect
 
 
 def check(cwd, kind, ident, policy=None, argv=None, preserve=False, slots=1, new_worktree=False):
-    """Call while holding lock(), and publish the admitted job/baton before release."""
+    """Call while holding lock(), and publish the admitted job/baton before release. Returns the request id when
+    admitted (a pumped request is removed by `acknowledge` once its job exists), raises WipError when queued."""
     policy = policy or common.load_policy()
     maximum = (policy.get('wip') or {}).get('max_writers', 5)
     if type(maximum) is not int or maximum < 1:
@@ -259,16 +261,198 @@ def check(cwd, kind, ident, policy=None, argv=None, preserve=False, slots=1, new
     # A not-yet-created nested checkout still resolves to its parent's writer key.
     # Creation always consumes new capacity, including every requested contestant.
     key = os.path.normcase(os.path.realpath(os.path.abspath(cwd))) if new_worktree else common.writer_key(cwd)
-    if (not new_worktree and slots == 1 and any(x['worktree'] == key for x in lanes)) or len(lanes) + slots <= maximum:
-        return
-    pending = queue()
     import json
     request_id = hashlib.sha256(json.dumps([kind, key, argv or ident], sort_keys=True).encode()).hexdigest()[:16]
-    if not preserve and not any(x.get('id') == request_id for x in pending):
-        pending.append({'id': request_id, 'kind': kind, 'name': ident, 'worktree': key,
+    if (not new_worktree and slots == 1 and any(x['worktree'] == key for x in lanes)) or len(lanes) + slots <= maximum:
+        return request_id
+    pending = queue()
+    held = [x for x in pending if x.get('id') == request_id]
+    if not preserve and held:
+        # The run a pump started for this request was refused again: the request is queued once more, not lost.
+        # Only that run (it carries the claim token) may release the claim; an identical command typed by hand
+        # while the pump is still starting it must not.
+        mine = os.environ.get(CLAIM_ENV)
+        for x in held:
+            if mine and x.get('claim') == mine and x.pop('pumping_at', None) is not None:
+                x.pop('claim', None)
+                save_queue(pending)
+    if not preserve and not held:
+        pending.append({'id': request_id, 'kind': kind, 'name': ident, 'worktree': key, 'cwd': os.getcwd(),
                         'queued_at': common.iso(common.now()), 'argv': list(argv or (['baton', 'new', ident, '--goal', '<goal>', '--cd', key] if kind == 'baton' else ['run', '--write', '--cd', key, '--brief', '<brief>']))})
         save_queue(pending)
     raise WipError(f'queued: {len(lanes)}/{maximum} writer lanes busy; twinlane wip next')
+
+
+def acknowledge(request_id, claim):
+    """The job a pumped request started now exists on disk: the request is done. Caller holds lock(). Until
+    this runs the request stays claimed, so a run refused or lost between `check` and job creation leaves it.
+    A claimed request goes only to the run carrying the pump's claim token; an unclaimed one is satisfied by any
+    admitted run of the same command, so a hand-typed repeat is not run a second time by the pump."""
+    try:
+        rows = queue()
+    except WipError:
+        return
+
+    def done(row):
+        if row.get('id') != request_id:
+            return False
+        if row.get('claim') or row.get('pumping_at'):
+            return bool(claim) and row.get('claim') == claim
+        return True
+
+    keep = [r for r in rows if not done(r)]
+    if len(keep) != len(rows):
+        save_queue(keep)
+
+
+CLAIM_ENV = 'TWINLANE_WIP_CLAIM'  # the token of the pump claim a replayed run carries
+PUMP_MAX_AGE_S = 86400  # a request older than this was probably forgotten: never launched unseen
+PUMP_CLAIM_S = 300      # a pump's claim on a request; an older one is a pump that died, and needs a human
+
+
+def _brief_path(row):
+    argv = row.get('argv') or []
+    for i, a in enumerate(argv):
+        if a == '--brief' and i + 1 < len(argv):
+            return argv[i + 1]
+        if a.startswith('--brief='):
+            return a[len('--brief='):]
+    return None
+
+
+def launchable(row, now=None):
+    """None when the queued request can be re-run as it was typed, else why not.
+
+    Only a `run` whose argv is concrete qualifies: no placeholder, a brief that still exists, and recent."""
+    argv = row.get('argv')
+    if row.get('kind') != 'run' or not isinstance(argv, list) or not argv or argv[0] != 'run' \
+            or not all(isinstance(a, str) for a in argv):
+        return 'not a run request'
+    if any(a.startswith('<') and a.endswith('>') for a in argv):
+        return 'argv has a placeholder'
+    brief = _brief_path(row)
+    if not brief:
+        return 'no --brief'
+    base = row.get('cwd')
+    if not base:  # queued before the invocation directory was recorded: only absolute paths replay safely
+        cd = argv[argv.index('--cd') + 1] if '--cd' in argv[:-1] else None
+        if not os.path.isabs(brief) or not cd or not os.path.isabs(cd):
+            return 'invocation directory not recorded and a path is relative'
+        base = os.path.dirname(brief)
+    elif not os.path.isdir(base):
+        return 'invocation directory is gone'
+    if not os.path.isfile(brief if os.path.isabs(brief) else os.path.join(base, brief)):
+        return 'brief file is gone'
+    claimed = common.parse_time(row.get('pumping_at'))
+    if row.get('pumping_at') is not None:
+        if claimed is not None and (now or common.now()).timestamp() - claimed.timestamp() <= PUMP_CLAIM_S:
+            return 'a pump is starting it'
+        return 'an earlier pump claimed it and did not finish: check `twinlane jobs`, then `twinlane wip next`'
+    queued = common.parse_time(row.get('queued_at'))
+    if queued is None or (now or common.now()).timestamp() - queued.timestamp() > PUMP_MAX_AGE_S:
+        return 'request is too old to run unseen'
+    return None
+
+
+def _priority(row):
+    argv = row.get('argv') or []
+    return 0 if '--kind' in argv and argv[argv.index('--kind') + 1:][:1] == ['review'] else 1
+
+
+def _spawn(row):
+    """Re-run the queued command in a detached process; it goes through full admission again."""
+    import sys
+    log = os.path.join(common.STATE, 'wip-pump.log')
+    env = dict(os.environ)
+    if row.get('claim'):
+        env[CLAIM_ENV] = row['claim']  # the replayed run proves it is the one this pump started
+    return common.spawn_detached_ex([sys.executable, common.TWINLANE_PY] + list(row['argv']),
+                                    cwd=row.get('cwd') or None, env=env, log_path=log)
+
+
+def pump(policy=None, dry_run=False, busy=None, spawn=None, reading=None):
+    """Launch the next queued writer request when a lane is free and the host can take it.
+
+    FIFO, reviews first. Returns {'launched': [...], 'skipped': [...], 'note': str}. The request is claimed
+    (pumping_at) before it starts and removed only when the run it started is admitted, so a pump or a child
+    that dies leaves it queued; a claim older than PUMP_CLAIM_S is left for a human. The new process runs full admission again
+    with current authority, so nothing is admitted here that `twinlane run` itself would refuse; if admission
+    queues it again it simply returns to the queue. Requests it cannot re-run as typed stay queued for `wip next`."""
+    from . import hostload
+    policy = policy or common.load_policy()
+    out = {'launched': [], 'skipped': [], 'note': ''}
+    if (policy.get('wip') or {}).get('autopump') is False:
+        out['note'] = 'wip.autopump is false'
+        return out
+    maximum = (policy.get('wip') or {}).get('max_writers', 5)
+    if type(maximum) is not int or maximum < 1:
+        raise WipError('wip.max_writers must be a positive integer')
+    reading = hostload.sample(policy) if reading is None else reading
+    usable, host_why = hostload.effective_parallel(maximum, reading, policy)
+    with lock():
+        pending = queue()
+        if not pending:
+            out['note'] = 'queue empty'
+            return out
+        lanes = len(collect(policy)) if busy is None else busy
+        if lanes >= usable:
+            out['note'] = host_why or f'{lanes}/{maximum} writer lanes busy'
+            if host_why:
+                out['note'] += f' ({lanes} lanes busy, {usable} allowed)'
+            return out
+        now = common.now()
+        in_flight = sum(1 for r in pending if r.get('pumping_at') is not None and launchable(r, now) == 'a pump is starting it')
+        free = usable - lanes - in_flight
+        ranked = sorted(range(len(pending)), key=lambda i: (_priority(pending[i]), str(pending[i].get('queued_at')), i))
+        chosen = []
+        for i in ranked:
+            why = launchable(pending[i], now)
+            if why:
+                out['skipped'].append({'id': pending[i].get('id'), 'why': why})
+            elif len(chosen) < free:
+                chosen.append(i)
+        if dry_run:
+            out['launched'] = [{'id': pending[i].get('id'), 'argv': pending[i]['argv'], 'launched': False} for i in chosen]
+            return out
+        stamp = common.iso(now)
+        for i in chosen:  # claimed, not removed: a pump that dies from here on leaves the request in the queue
+            pending[i]['pumping_at'] = stamp
+            pending[i]['claim'] = secrets.token_hex(8)
+        if chosen:
+            save_queue(pending)
+        rows = [pending[i] for i in chosen]
+    for row in rows:
+        try:
+            (spawn or _spawn)(row)
+            out['launched'].append({'id': row.get('id'), 'argv': row['argv'], 'launched': True})
+            _settle(row, stamp, started=True)
+        except Exception as e:  # noqa: BLE001 - a request that failed to start stays queued, never lost
+            _settle(row, stamp, started=False)
+            out['skipped'].append({'id': row.get('id'), 'why': f'could not start: {type(e).__name__}'})
+    return out
+
+
+def _settle(row, stamp, started):
+    """After the spawn. A started run keeps its claim: the request leaves the queue only when that run is admitted
+    (`check` removes it), so a child that dies at once, or is ended with a job object it was born into, leaves a
+    claimed request for a person instead of nothing. A run that did not start gives the claim back."""
+    if started:
+        return
+    with lock():
+        rows = queue()
+        for r in rows:
+            if r.get('id') == row.get('id') and r.get('pumping_at') == stamp and r.get('claim') == row.get('claim'):
+                r.pop('pumping_at', None)
+                r.pop('claim', None)
+        save_queue(rows)
+
+
+def pump_quietly(policy=None):
+    """The end-of-job hook: never raises, never blocks a runner for long."""
+    try:
+        return pump(policy)
+    except Exception:  # noqa: BLE001 - a failed pump leaves the queue as it was
+        return None
 
 
 @contextmanager
@@ -282,12 +466,25 @@ def admission(cwd, kind, ident, policy=None, argv=None, preserve=False, new_work
 def cli(argv):
     from . import baton
     ap = argparse.ArgumentParser(prog='twinlane wip')
-    ap.add_argument('action', nargs='?', choices=['next'])
+    ap.add_argument('action', nargs='?', choices=['next', 'pump'])
+    ap.add_argument('--dry-run', action='store_true')
     ap.add_argument('--json', action='store_true')
     ap.add_argument('--force', action='store_true')
     a = ap.parse_args(argv)
     try:
-        if a.action == 'next':
+        if a.action == 'pump':
+            from . import projects
+            refused = projects.refuse_in_worker('wip pump')
+            if refused is not None:
+                return refused
+            res = pump(dry_run=a.dry_run)
+            rows = res['launched']
+            human = (f"{'would launch' if a.dry_run else 'launched'} {len(rows)}: "
+                     + ', '.join(r['id'] or '?' for r in rows) if rows else f"nothing launched: {res['note'] or 'no request is ready'}")
+            if res['skipped']:
+                human += ''.join(f"\n  left queued {x['id']}: {x['why']}" for x in res['skipped'])
+            common.emit(baton.redact_obj(res), a.json, baton.redact(human))
+        elif a.action == 'next':
             from . import projects
             refused = projects.refuse_in_worker('wip next')
             if refused is not None:

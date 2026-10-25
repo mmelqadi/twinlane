@@ -116,7 +116,7 @@ class WmiSurvivesAKillOnCloseJob(_Tmp):
         with open(log, encoding='utf-8') as h:
             self.assertIn(f'sleeper cwd={self.tmp} mark=from-caller', h.read())
         # The stop path: kill_tree (taskkill /T) works on it.
-        self.assertTrue(common.kill_tree(r['pid'], r['created']))
+        self.assertIs(common.kill_tree(r['pid'], r['created']), not common.IS_WIN)
         self.assertTrue(_wait(lambda: not common.pid_alive(r['pid'], r['created'])))
 
 
@@ -147,7 +147,9 @@ class TwinlaneStopKillsAWmiRunner(_Tmp):
         self.assertEqual(r.returncode, 0, r.stderr[-2000:])
         receipt = json.loads(r.stdout)
         self.assertEqual(receipt['status'], 'stopped')
-        self.assertEqual(receipt['killed_pids'], [d['pid']])
+        self.assertEqual(receipt['killed_pids'], [] if common.IS_WIN else [d['pid']])
+        if common.IS_WIN:
+            self.assertEqual(receipt['kill_failed_pids'], [d['pid']])
         self.assertTrue(_wait(lambda: not common.pid_alive(d['pid'], d['created'])))
 
 
@@ -232,7 +234,7 @@ def _tree_kill(shell):
     """What an app exit can do: terminate its shell's process tree (taskkill /T), launcher still alive.
     The launcher's death then closes its job handles, so the chain's kill-on-close jobs fire too."""
     assert shell.twinlane_created is not None, 'the owned shell has no recorded creation stamp'
-    assert common.kill_tree(shell.pid, shell.twinlane_created), 'identity-checked shell tree kill failed'
+    assert common.kill_tree(shell.pid, shell.twinlane_created) is (not common.IS_WIN), 'snapshot-only Windows kill must stay unconfirmed'
     shell.wait(timeout=30)
 
 
@@ -319,7 +321,7 @@ class NestedJobChain(_Tmp):
         with open(mark, encoding='utf-8') as h:
             self.assertEqual(h.read(), 'from-caller')
         self.assertFalse(os.path.exists(os.path.join(self.tmp, 'runner.env.json')))
-        self.assertTrue(common.kill_tree(r['pid'], r['created']))
+        self.assertIs(common.kill_tree(r['pid'], r['created']), not common.IS_WIN)
         self.assertTrue(_wait(lambda: not common.pid_alive(r['pid'], r['created'])))
 
 

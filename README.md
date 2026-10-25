@@ -152,7 +152,8 @@ Credits and extra usage are checked only when a job starts. A long Codex job can
 | Land finished work, one branch at a time | `twinlane land enqueue SLUG`, then `twinlane land run SLUG` |
 | List exactly what landed, for a release | `twinlane ship plan` |
 | Check or clean up worktrees | `twinlane wt doctor`, then `twinlane wt prune` (dry run unless asked) |
-| See writer capacity and queued requests | `twinlane wip`; `twinlane wip next` pops one request without launching it |
+| See writer capacity and queued requests | `twinlane wip`; `twinlane wip next` pops one request without launching it; `twinlane wip pump` starts ready ones |
+| See why a job is waiting, and how busy the host is | `twinlane board` (host-load line and QUEUE section) |
 | See questions that need a person | `twinlane inbox` (ranked questions and hidden count; `--all` shows every question) |
 | Record a question's answer | `twinlane inbox answer task:H1 --grant "verbatim words"` or `--deny "reason"` |
 | Clean up worktrees with no unique patches | `twinlane wt gc` (preview), then `twinlane wt gc --apply` |
@@ -309,15 +310,38 @@ twinlane ship run --manifest PATH --execute --confirm 1a2b3c4d
 
 `ship run --execute` needs a configured `ship.command`, a passing dry-run receipt for the same manifest that is younger than `ship.dry_run_max_age_s` and not used yet, and `--confirm` equal to the first 8 hex digits of the manifest sha256. A receipt is good for one execute. A manifest is accepted only in the exact canonical bytes `ship plan` writes. Without `ship.command`, `ship run` only prints the manifest path and exits 3. Workers cannot run `ship run`.
 
+## Overload handling
+
+On a busy machine twinlane queues work instead of piling it on. Nothing is ever refused for load.
+
+- **Host-load admission.** Each job waits for a slot, and the number of usable slots per engine falls as the host gets busy and recovers as it clears (never below `hostload.min_parallel`). CPU, free RAM and the count of live Codex and sandbox processes are read from kernel counters only (no WMI): Windows system calls, Linux `/proc`, and on macOS the load average, `vm_stat` and `ps`. A waiting job shows `host busy: cpu 97%` (or the RAM or process reason) in `twinlane board`.
+- **Order.** Waiting jobs start first-in-first-out per engine, reviews first. The board's QUEUE section shows the order and each reason.
+- **Hung-worker watchdog.** A worker whose output files do not change for `watchdog.stall_s` (default 900 s) has its process tree killed through its recorded creation stamp. The job is requeued once; a second stall fails it with `host overload`. A stalled attempt never carries a verdict, so a review that did not run is `failed`, never a pass or a block. The retry happens only when the kill of the whole tree reported success; on Windows the runner starts each engine suspended, assigns it to an attempt Job Object with kill-on-close, then resumes its main thread through Toolhelp (Python closes the original thread handle). TerminateJobObject is confirmed only when its accounting reports zero active processes within five seconds, including descendants whose parents already exited. Assignment failure uses snapshot cleanup and cannot confirm a kill. The handle closes after the engine result is read, reaping strays. Cross-process stops have no attempt handle and cannot confirm tree exit from snapshots. Otherwise the tree may still hold running children, so the job fails with `host overload`, is not retried, and leaves a `tree-unresolved.json` marker that keeps the worktree claim (and refuses a second writer there) until a person has looked and runs `twinlane stop JOB --tree-gone`, which logs the release. If that marker cannot be written, the job's launch marker is rewritten without a pid and kept instead; it holds the claim the same way, and no check of the dead root removes it. An unresolved tree counts as live uncertainty everywhere a pid would: job status, slot counts, continuation, archive and worktree cleanup checks. A retry that cannot even start (for example the state directory becomes unwritable) ends the job `failed` with the stall evidence kept, never `stalled`. The marker is also written when the runner is interrupted after an unconfirmed stall kill, and both admission checks of a pumped run name the same queued request, so a lane that fills in between returns the original request to the queue instead of adding a placeholder. Nothing is killed from that marker. A stall never causes a third attempt: a job runs at most twice.
+- **Queued writer requests.** `twinlane wip pump` (also run when a writer job ends) re-runs the oldest ready request that `wip` queued, when a lane is free and the host can take it. It runs the stored command exactly as typed, from the directory it was typed in, through full admission again; the request stays claimed until the run's job exists on disk, so a run that dies at once, or is refused after it was admitted (routing, binary checks), leaves a claimed request for a person instead of losing it. Each claim carries a token that the pump hands to the run it starts; only that run may acknowledge or give the claim back, so an identical command typed by hand cannot take it. It leaves anything with a placeholder, a missing brief file or an age over a day in the queue. Set `wip.autopump` to false to turn it off.
+
+Settings, all optional, in the user config:
+
+```json
+{"hostload": {"enabled": true, "cpu_soft": 80, "cpu_hard": 98, "ram_free_soft_mb": 2048,
+              "ram_free_hard_mb": 512, "procs_soft": 16, "procs_hard": 32, "min_parallel": 2},
+ "watchdog": {"enabled": true, "stall_s": 900, "poll_s": 15},
+ "wip": {"autopump": true}}
+```
+
+Between `soft` and `hard` the usable slots shrink linearly from `max_parallel` to `min_parallel`. A reading that cannot be taken never throttles.
+
 ## Worktree health
 
 ```sh
-twinlane wt doctor [--all] [--md | --json]    # read-only report
+twinlane wt doctor [--all] [--md | --json]    # report (and stale writer claims)
+twinlane wt doctor --fix                       # release stale writer claims
 twinlane wt prune                              # dry run
 twinlane wt prune --yes [--include-empty]      # remove what passed every check
 ```
 
 `wt doctor` reports each linked worktree: merged, unlanded, empty, detached or missing; stale; uncommitted changes; what uses it (a live job, a baton, a land queue entry); missing or dangling dependency folders; and the Windows long-path risk. `--all` also covers every project in your config.
+
+`wt doctor` also lists stale writer claims: a claim whose job has finished (terminal receipt, no survivor marker) and whose runner and engine are gone, or whose pid can no longer be read because the host is overloaded, once the receipt is older than two minutes. `wt doctor --fix` releases them and logs each release to `custody-releases.jsonl`; the same check runs automatically when a new writer is refused by such a claim. Workers cannot run `--fix`.
 
 `wt prune` is a dry run unless `--yes`. It removes a worktree only when its branch is merged and had commits of its own, it is clean, nothing uses it, and its last activity is older than `wt.prune_min_age_s`. Links (junctions and symlinks) inside it are unlinked first, without being followed. The branch is deleted with `git branch -d` only; an unmerged branch is never deleted. Every action is recorded in `prune.jsonl`. Workers cannot run `prune`.
 

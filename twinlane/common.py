@@ -1240,6 +1240,7 @@ def strip_secret_env(env: dict, extra_patterns: list[str] | None = None) -> tupl
 # Windows process-creation and job-object constants.
 DETACHED_PROCESS, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW = 0x8, 0x200, 0x08000000
 CREATE_BREAKAWAY_FROM_JOB = 0x01000000
+CREATE_SUSPENDED = 0x00000004
 JOB_LIMIT_BREAKAWAY_OK, JOB_LIMIT_SILENT_BREAKAWAY_OK, JOB_LIMIT_KILL_ON_JOB_CLOSE = 0x800, 0x1000, 0x2000
 _PROCESS_QUERY_LIMITED = 0x1000
 _PROCESS_TERMINATE, _SYNCHRONIZE = 0x0001, 0x00100000
@@ -1271,12 +1272,24 @@ def _k32():
     k32.GetProcessTimes.argtypes = (wintypes.HANDLE,) + (ctypes.POINTER(ctypes.c_uint64),) * 4
     k32.TerminateProcess.argtypes = (wintypes.HANDLE, wintypes.UINT)
     k32.TerminateProcess.restype = wintypes.BOOL
+    k32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    k32.WaitForSingleObject.restype = wintypes.DWORD
     k32.CloseHandle.argtypes = (wintypes.HANDLE,)
     k32.GetCurrentProcess.restype = wintypes.HANDLE
     k32.CreateJobObjectW.restype = wintypes.HANDLE
     k32.CreateJobObjectW.argtypes = (ctypes.c_void_p, wintypes.LPCWSTR)
     k32.SetInformationJobObject.argtypes = (wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD)
     k32.AssignProcessToJobObject.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
+    k32.TerminateJobObject.argtypes = (wintypes.HANDLE, wintypes.UINT)
+    k32.TerminateJobObject.restype = wintypes.BOOL
+    k32.CreateToolhelp32Snapshot.argtypes = (wintypes.DWORD, wintypes.DWORD)
+    k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    k32.Thread32First.argtypes = (wintypes.HANDLE, ctypes.c_void_p)
+    k32.Thread32Next.argtypes = (wintypes.HANDLE, ctypes.c_void_p)
+    k32.OpenThread.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    k32.OpenThread.restype = wintypes.HANDLE
+    k32.ResumeThread.argtypes = (wintypes.HANDLE,)
+    k32.ResumeThread.restype = wintypes.DWORD
     k32.IsProcessInJob.argtypes = (wintypes.HANDLE, wintypes.HANDLE, ctypes.POINTER(wintypes.BOOL))
     k32.QueryInformationJobObject.argtypes = (wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
                                               ctypes.POINTER(wintypes.DWORD))
@@ -1298,6 +1311,132 @@ def _job_limits_struct():
         _fields_ = [('Basic', Basic), ('Io', ctypes.c_uint64 * 6), ('m', ctypes.c_size_t * 4)]
 
     return Extended()
+
+
+# Private to this runner process. A handle names the attempt's kernel object even
+# after its root exits; descendants cannot escape by losing an intermediate parent.
+_ENGINE_JOBS = {}
+_UNCONTAINED = set()  # engine pids resumed without a job: nothing can later prove their descendants gone
+
+
+def _win_resume_engine(proc, k32):
+    """Popen closes the primary thread handle. Find that still-suspended thread
+    through Toolhelp and resume it only after job assignment has been attempted."""
+    import ctypes
+
+    class ThreadEntry(ctypes.Structure):
+        _fields_ = [('dwSize', ctypes.c_uint32), ('cntUsage', ctypes.c_uint32),
+                    ('th32ThreadID', ctypes.c_uint32), ('th32OwnerProcessID', ctypes.c_uint32),
+                    ('tpBasePri', ctypes.c_int32), ('tpDeltaPri', ctypes.c_int32),
+                    ('dwFlags', ctypes.c_uint32)]
+
+    snapshot = k32.CreateToolhelp32Snapshot(0x4, 0)  # TH32CS_SNAPTHREAD
+    if snapshot in (None, 0, -1, ctypes.c_void_p(-1).value):
+        raise OSError('cannot enumerate the suspended engine thread')
+    try:
+        entry = ThreadEntry()
+        entry.dwSize = ctypes.sizeof(entry)
+        found = k32.Thread32First(snapshot, ctypes.byref(entry))
+        for _ in range(1_000_000):  # bounded even if a broken API never ends the enumeration
+            if not found:
+                break
+            if entry.th32OwnerProcessID == proc.pid:
+                thread = k32.OpenThread(0x2, False, entry.th32ThreadID)  # THREAD_SUSPEND_RESUME
+                if not thread:
+                    raise OSError('cannot open the suspended engine thread')
+                try:
+                    if k32.ResumeThread(thread) != 1:
+                        raise OSError('cannot resume the suspended engine thread')
+                    return
+                finally:
+                    k32.CloseHandle(thread)
+            entry.dwSize = ctypes.sizeof(entry)
+            found = k32.Thread32Next(snapshot, ctypes.byref(entry))
+        raise OSError('suspended engine thread not found')
+    finally:
+        k32.CloseHandle(snapshot)
+
+
+def contain_engine(proc, before_resume=None):
+    """Called immediately after a CREATE_SUSPENDED Popen, before any engine code
+    runs. Nesting/assignment failure permits a snapshot-only, unconfirmed kill.
+    `before_resume(contained)` runs while the engine is still suspended; if it raises, the engine is never
+    resumed (the runner's post-start cleanup kills it). Resume failure raises into the same cleanup path."""
+    if not IS_WIN:
+        return
+    import ctypes
+    k32 = _k32()
+    handle = None
+    try:
+        try:
+            handle = k32.CreateJobObjectW(None, None)
+            if handle:
+                limits = _job_limits_struct()
+                limits.Basic.LimitFlags = JOB_LIMIT_KILL_ON_JOB_CLOSE
+                if k32.SetInformationJobObject(handle, _JOB_EXTENDED_LIMITS, ctypes.byref(limits),
+                                               ctypes.sizeof(limits)) \
+                        and k32.AssignProcessToJobObject(handle, int(proc._handle)):
+                    _ENGINE_JOBS[proc.pid] = (k32, handle, proc)
+                    handle = None  # registry owns it until the attempt's result has been read
+        except Exception:  # unavailable job APIs/nesting: resume with conservative snapshot cleanup
+            pass
+    finally:
+        if handle:
+            k32.CloseHandle(handle)
+    contained = proc.pid in _ENGINE_JOBS
+    if not contained:
+        _UNCONTAINED.add(proc.pid)
+    if before_resume is not None:
+        before_resume(contained)
+    _win_resume_engine(proc, k32)
+
+
+def close_engine_job(proc) -> bool:
+    """After reading the exited engine's output (or failed-attempt cleanup): end whatever the root left in the
+    job and let go of it. True when there was no job or it reported zero active processes; False means a
+    descendant may still run, and the caller must keep the worktree claim. Never closes an unrelated handle."""
+    if proc is None:
+        return True
+    if proc.pid in _UNCONTAINED:  # no job ever held it: the root's exit proves nothing about its descendants
+        _UNCONTAINED.discard(proc.pid)
+        return False
+    entry = _ENGINE_JOBS.get(proc.pid)
+    if not entry:
+        return True
+    k32, handle = entry[:2]
+    try:
+        return _win_kill_job(entry)
+    finally:  # an interrupt during the drain still lets go: KILL_ON_JOB_CLOSE then reaps the descendants
+        if k32.CloseHandle(handle):
+            _ENGINE_JOBS.pop(proc.pid, None)
+
+
+def _win_kill_job(entry) -> bool:
+    """Only a successful accounting query with ActiveProcesses == 0 proves exit.
+    TerminateJobObject itself merely requests termination, like TerminateProcess."""
+    import ctypes
+
+    class Accounting(ctypes.Structure):
+        _fields_ = [('times', ctypes.c_int64 * 4), ('TotalPageFaultCount', ctypes.c_uint32),
+                    ('TotalProcesses', ctypes.c_uint32), ('ActiveProcesses', ctypes.c_uint32),
+                    ('TotalTerminatedProcesses', ctypes.c_uint32)]
+
+    k32, handle = entry[:2]
+    try:
+        k32.TerminateJobObject(handle, 1)
+        deadline = time.monotonic() + 5
+        while True:
+            counts = Accounting()
+            if not k32.QueryInformationJobObject(handle, 1, ctypes.byref(counts), ctypes.sizeof(counts), None):
+                return False  # JobObjectBasicAccountingInformation unavailable: retain custody
+            if counts.ActiveProcesses == 0:
+                return True
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return False
+            time.sleep(min(0.05, left))
+    except Exception:
+        return False
 
 
 _ERROR_ACCESS_DENIED, _ERROR_INVALID_PARAMETER, _STILL_ACTIVE = 5, 87, 259
@@ -1870,12 +2009,30 @@ def _win_process_identity(handle, k32, query=None) -> tuple | None:
     return None
 
 
+def _win_tree_gone(handles, members, before, k32) -> bool:
+    """Best-effort wait for snapshot targets. Snapshots cannot prove tree exit:
+    an intermediate parent can exit between them, hiding its surviving children.
+    Only a runner-owned job's zero ActiveProcesses can confirm a Windows kill."""
+    wait = getattr(k32, 'WaitForSingleObject', None)
+    if wait is None:
+        return False
+    deadline = time.monotonic() + 5
+    for handle in handles:
+        if wait(handle, max(0, int((deadline - time.monotonic()) * 1000))) != 0:  # WAIT_OBJECT_0
+            return False
+    after = _win_process_tree_snapshot()
+    if after is None or before is None:
+        return False
+    return False  # even no new direct child is not proof about transient parents
+
+
 def _win_kill_tree(pid: int, created=None, k32=None) -> bool:
     """Pin each verified process object until termination; never kill by numeric pid.
 
     A failed root verification kills nothing. Unverifiable descendants are skipped individually;
     False reports incomplete enumeration, verification or termination to callers.
-    The snapshot bounds membership in time: children born after it may survive."""
+    The snapshot bounds membership in time: children born after it may survive.
+    Snapshot-only cleanup therefore always reports False."""
     import ctypes
     handles = []
     try:
@@ -1942,6 +2099,8 @@ def _win_kill_tree(pid: int, created=None, k32=None) -> bool:
                     complete = False
             except Exception:  # noqa: BLE001
                 complete = False
+        if complete and not _win_tree_gone(targets, seen, rows, k32):
+            complete = False
         return complete
     except Exception:  # noqa: BLE001 - no pid-only fallback on any failure
         return False
@@ -1955,12 +2114,25 @@ def _win_kill_tree(pid: int, created=None, k32=None) -> bool:
 
 def kill_tree(pid, created=None) -> bool:
     """Kill a process tree. With `created`, refuses unless the pid is still that same process.
-    True only when termination succeeded (on Windows, for every verified tree member)."""
+    On Windows only an owned job's zero ActiveProcesses confirms the whole tree;
+    snapshot-only cleanup is best effort and always reports False."""
     try:
         pid = int(pid)
     except (TypeError, ValueError):
         return False
     if IS_WIN:
+        entry = _ENGINE_JOBS.get(pid)
+        if entry is not None:
+            if created not in (None, ''):
+                import ctypes
+                try:
+                    times = [ctypes.c_uint64() for _ in range(4)]
+                    if not entry[0].GetProcessTimes(int(entry[2]._handle), *(ctypes.byref(x) for x in times)) \
+                            or times[0].value != int(created):
+                        return False
+                except Exception:
+                    return False
+            return _win_kill_job(entry)
         return _win_kill_tree(pid, created)
     if created not in (None, '') and not pid_alive(pid, created):
         return False  # a reused pid, or an identity that cannot be read: never kill what is not provably it
