@@ -3675,6 +3675,10 @@ def cmd_stop(argv) -> int:
         print(f'twinlane stop: {e}', file=sys.stderr)
         return common.EXIT_USAGE
     if args.tree_gone:
+        from . import projects
+        refused = projects.refuse_in_worker('stop --tree-gone')  # custody is released by a person, never a worker
+        if refused is not None:
+            return refused
         return _clear_tree_unresolved(jid, args.json)
     _request_stop(jid)
     spec = common.read_json(_p(jid, 'job.json'), {}) or {}

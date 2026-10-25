@@ -516,6 +516,13 @@ class StallFlow(tj.JobsBase):
         return {'kind': 'run', 'name': 'x', 'worktree': common.writer_key(self.work), 'argv': argv,
                 'queued_at': common.iso(common.now())}
 
+    def test_a_worker_cannot_release_custody_with_tree_gone(self):
+        rc, out, jid = self._unsure_run()
+        with mock.patch.dict(os.environ, {'TWINLANE_ENGINE_JOB': 'x'}):
+            rc, out, _ = self.cli('stop', jid, '--tree-gone')
+        self.assertEqual(rc, common.EXIT_REFUSED, out)
+        self.assertTrue(os.path.exists(jobs._p(jid, jobs.TREE_UNRESOLVED)))  # the claim is still held
+
     def test_tree_gone_with_nothing_to_clear_changes_nothing(self):
         os.environ['FAKE_SLEEP'] = '0'
         rc, out, _ = self.cli('run', '--brief', self.brief, '--cd', self.work, '--kind', 'review')
