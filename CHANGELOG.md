@@ -1,6 +1,47 @@
 # Changelog
 
-## 0.2.0 - 2026-10-13
+## Unreleased
+
+- Baton `waiting_on` dependencies and stable `waiting_since`, ranked board waits and idle counts.
+- `run --owner` completion history and inbox collection notices; file-only `watch` with independent,
+  resumable cursors and cached usage/context crossings. Coordinating sessions re-arm after each wake.
+- Weekly-pace capacity advice on board and status; worker guards refuse watch.
+- Plain-text evidence, truncation warnings with full history, meter CLI discovery without worker
+  environment changes, development version with source commit, and finished-job status output.
+
+### Fixed
+- Windows tree termination verifies and kills through the same open handles, rejects stale parent links, and bounds process snapshot parsing and query retries.
+- Job archival preserves mixed-version lifecycle locking, refuses nonquiescent homes, coordinates marker and baton writes, and retains moved evidence on uncertain index durability. Unrecognized job folders block writer admission and worktree cleanup.
+- A job whose recorded child pid is now held by a process this token cannot read no longer keeps its WIP slot after a restart: a recorded creation stamp older than this boot (the System process's creation time from the process snapshot) proves the process is gone, so `stop`, `status` and `wip` settle a timed-out job whose runner died (`_win_boot_created`, `_predates_boot`). No boot proof keeps the identity UNKNOWN.
+- A writer whose child pid was recycled by a process this token cannot open (a SYSTEM service) no longer holds its WIP slot forever: on Windows the creation time comes from a self-checked process snapshot, so the recycled pid reads dead. Nothing is killed.
+- Codex failures retain error text and completion time; binary qualification and writer admission happen before dispatch.
+- Land requires a configured gate when requested, verifies tree identity, records interrupted landing intent and recovers without duplicate events. Unverified ranges cannot ship.
+- Removal restores unlinked dependencies when a custom command leaves the worktree folder behind.
+- Single-writer job receipts: `stop` can no longer overwrite a receipt the runner publishes while it stops it. Stop writes
+  `stopped` only from the runner role; while a runner may be alive it exits 4 (`stop_requested`) and the runner records
+  the outcome. A stop that arrives after the work finished keeps the `done` receipt.
+- A WIP claims provider whose temporary file cannot be created or read is a WIP error (writer count unknown), not a
+  crash of board or status.
+- `wt gc` / `wt prune` re-read the session supervisor, bypassing its cache, at the recheck right before a removal, so a
+  session that started after the scan protects its worktree. A session in an unknown or unrecognised state protects
+  its worktree, or blocks cleanup when its directory cannot be read. Idle sessions keep protecting theirs.
+
+### New
+- Parallel test runner with structured verdicts, isolated and serial-module failure triage, verified process-tree timeouts and zero-test rejection. Test modules get an empty stdin, so a runner started with an open pipe cannot stall their child processes.
+- `jobs archive` previews or moves old, collected terminal jobs into a monthly archive while keeping id lookups working.
+- Worktree WIP cap, versioned FIFO retry queue, `wip` and `wip next` (print only, no launch).
+- Baton progress clock, bound sessions, parked state and derived stale. Landings mark landed and increment a count; batons are never auto-closed.
+- Ranked cross-project inbox with hidden counts. Answers never become live-write approvals; board ATTENTION and SIGNALS are separate.
+- `wt prune --merged-only`, thin `wt gc` alias, `--only`, minimum age and interactive-session protections.
+- Context estimates labelled `~`; supervisor and local hook lane states with transcript fallback.
+- Session-bound PreCompact, installer dry-run settings diffs and optional lane-state hooks; Codex notify configuration is printed only.
+- Read-only `land card` and optional post-land worktree archive with prune safety.
+
+### Changed
+- Sandbox setup failures and read-only violations are failed outcomes. Codex qualification refusals exit 3 before dispatch.
+- Preserving Codex starts use a qualified explicit binary and never fall back to another engine.
+
+## 0.2.0 - 2026-10-14
 
 ### New commands
 - `land`: a per-repository first-in-first-out queue and one integrator lock (token, heartbeat; a dead holder is broken only with `--break --reason`). Landing is fast-forward only, runs the project's `land.gate` on the tree that will land, and appends the exact landed range to a ledger. `--rebase` rebases a linear branch; `--dry-run` takes no lock.
@@ -8,6 +49,14 @@
 - `wt doctor` / `wt prune`: a health report for linked worktrees; prune is a dry run by default, unlinks junctions and symlinks first without following them, deletes branches with `git branch -d` only, and records `prune.jsonl`.
 - `run --best-of` and `compare`: the same brief on several engines in separate worktrees, then a side-by-side comparison, optionally running the project's test command.
 - `resume`: lists jobs lost to a reboot or app quit with the likely cause, and with `--yes` continues each once. Never automatic.
+
+### Workers, meters and coordination
+- `meter --no-rollout` and the policy key `meter.codex_rollout_fallback` (default `true`): with the fallback off, a failed Codex app-server read stays `unknown` and no rollout session file is opened. A non-boolean value counts as off.
+- `run --preserve-existing-metadata` (Claude only): a start that never alters existing job metadata; it reads only a meter cache that is already fresh and never refreshes it, renews a token or acquires a Codex binary. Design notes: `docs/design/metadata-preserving-start.md`.
+- `explain-writer-admission --cwd DIR [--job-id ID] [--json]`: a read-only explanation of the writer-directory check (reservation, relevant jobs, uncertainty). It creates no directories or locks. Design notes: `docs/design/writer-admission-explain.md`.
+- Claude receipts carry `model_calls` (distinct main-loop model responses) and `subagent_model_calls` next to `num_turns`, with a `turns_note`: `num_turns` is the Claude CLI's own counter, a different unit from the `--max-turns` limit the CLI enforces. `twinlane result` prints `model_calls=` and `cli_turns=`.
+- `run --resume-owner` (with `--task-id ... --continue-job ID`): the recorded coordinator continues the current owner's own finished job. It adds no ancestry and changes no ownership, epoch or revision. It is refused unless the predecessor is the owner's latest dispatch in the epoch, finished `done`, `--continue-job` names that job, no receipt is given, and every dispatch in the epoch is terminal. Workers cannot use it. Without the flag the envelope and fingerprint are unchanged, and the ownership and ancestor-cycle refusals apply as before.
+- README "Common tasks" table and "Fresh readings" section; an agent skill in `skills/twinlane/SKILL.md`.
 
 ### Configuration
 - Per-project settings in the `projects` map of the user config only, never read from repository content: argv-list commands with the placeholders `{repo}`, `{worktree}`, `{branch}`, `{slug}`, `{target}`, `{manifest}`, `{source_commit}` and `{base}`. Values with line breaks are refused; `.bat` and `.cmd` commands receive only plain values.

@@ -121,9 +121,9 @@ PROGRAM_RUNNERS = {'wsl', 'npx', 'bunx', 'pnpx', 'uvx', 'pipx', 'uv', 'poetry', 
                    'asdf', 'dotnet', 'cargo', 'go', 'runas', 'gsudo'}
 # twinlane itself: the commands that dispatch a job or change shared state are refused inside a job.
 SELF_NAME = 'twinlane'
-SELF_DENIED = {'run', '_job', 'land', 'ship', 'resume', 'install', 'stop', 'handoff', 'dispatch', 'job', 'best-of'}
+SELF_DENIED = {'watch', 'run', '_job', 'land', 'ship', 'resume', 'install', 'stop', 'handoff', 'dispatch', 'job', 'best-of'}
 SELF_WT_ALLOWED = {'doctor'}  # `twinlane wt doctor` only reads; every other `wt` verb (prune, ...) is refused
-SELF_VERB_LITERAL = re.compile(r'[\'"](?:run|_job|land|ship|resume|install|stop|handoff|dispatch|job|prune)[\'"]|--best', re.I)
+SELF_VERB_LITERAL = re.compile(r'[\'"](?:watch|run|_job|land|ship|resume|install|stop|handoff|dispatch|job|prune|answer|next)[\'"]|--best', re.I)
 # Flags that make an otherwise read-only command write a file or run a program.
 WRITE_FLAGS = re.compile(r'(^|\s)(--output(=|\s|$)|--ext-diff|--pre(=|\s|$))')
 WRITE_VERBS = re.compile(r'(^|[\s;&|(])(cp|mv|rm|rmdir|del|erase|copy|move|ren|rename|robocopy|xcopy|mkdir|md|touch|'
@@ -892,7 +892,7 @@ def _compile_config(key: str) -> dict:
     alt = '|'.join(re.escape(n) for n in sorted(names))
     # A script path followed by a verb: `.../twinlane/cli.py land`, `twinlane.py run`, `tl.py ship`.
     self_text = re.compile(r'(?<![\w.-])(?:' + alt + r')(?:[\\/](?:cli|__main__))?\.pyw?["\']?\s+["\']?'
-                           r'(?:run|_job|land|ship|resume|install|wt\s+["\']?prune)\b|(?:' + alt +
+                           r'(?:run|_job|land|ship|resume|install|watch|wt\s+["\']?(?:prune|gc)|inbox\s+["\']?answer|wip\s+["\']?next)\b|(?:' + alt +
                            r')[\\/](?:cli|__main__)\.pyw?["\']?\s.*--best', re.I)
     return {'allow_subagents': allow, 'self_names': frozenset(names), 'deny_commands': tuple(deny_commands),
             'deny_text': tuple(deny_text), 'self_text': self_text}
@@ -977,6 +977,10 @@ def _self_reason(args: list[str], label: str) -> str | None:
                'twinlane job'
     if pos[0] in SELF_DENIED:
         return why.format(pos[0])
+    if pos[:2] == ['jobs', 'archive'] and any(a == '--a' or a.startswith('--ap') for a in low):
+        return why.format('jobs archive --apply')
+    if pos[0] in ('inbox', 'wip') and any(a in ('answer', 'next') for a in pos[1:]):
+        return why.format(' '.join(pos[:2]))
     if pos[0] == 'wt' and (len(pos) < 2 or pos[1] not in SELF_WT_ALLOWED or 'prune' in pos or
                            any(a in ('--prune', '--fix') for a in low)):
         return why.format(' '.join(['wt'] + pos[1:2]))
@@ -2470,6 +2474,8 @@ def intel_shell_ok(command: str, allow: list[str]) -> str | None:
     if WRITE_FLAGS.search(command or ''):
         return 'output/exec flags (--output, --ext-diff, --pre) can write files or run programs'
     prefixes = _bash_prefixes(allow)
+    # The common self-hazard scan above still denies every apply spelling.
+    prefixes += ['twinlane jobs archive']
     for seg in segments(command):
         if not any(seg == p or seg.startswith(p + ' ') for p in prefixes):
             return f'not a read-only command in the intel allow-list: {common.clip(seg, 80)}'

@@ -148,8 +148,16 @@ def _lock(task):
 
 
 def _fingerprint(plan):
+    mode = plan.get('preserve_existing_metadata', False)
+    intent = plan.get('caller_intent')
+    if type(mode) is not bool or (intent is not None and (not isinstance(intent, dict) or
+            type(intent.get('preserve_existing_metadata', False)) is not bool
+            or intent.get('preserve_existing_metadata', False) != mode)):
+        raise Refusal('metadata preservation mode differs from admitted caller intent')
     # Meter timestamps and routing narration vary on replay; executable intent must not.
     payload = plan.get('caller_intent') or {key: plan.get(key) for key in FINGERPRINT_KEYS}
+    if mode and not plan.get('caller_intent'):
+        payload['preserve_existing_metadata'] = True
     return hashlib.sha256(json.dumps(payload, sort_keys=True, allow_nan=False).encode()).hexdigest()
 
 
@@ -251,9 +259,50 @@ def record_transition(task, receipt, *, authority, kind, actor, recipient,
         _save(data)
 
 
+def _resume_requested(e) -> bool:
+    if 'resume_owner' not in e:
+        return False
+    if e['resume_owner'] is not True:
+        raise Refusal('resume_owner must be exactly true when present')
+    return True
+
+
+def _admit_owner_resume(data, e, parent, plan) -> None:
+    """The recorded coordinator continues the current owner's own finished job.
+
+    Ownership is unchanged and no ancestry is added, so the cycle rule still governs every
+    delegation. Refused unless the predecessor is the owner's latest dispatch in this epoch,
+    finished `done`, and nothing in the epoch is still running or of unknown state.
+    """
+    from . import jobs  # lazy: jobs imports this module
+    if worker_ids():
+        raise Refusal('workers cannot resume an owner; report result to coordinator')
+    if e.get('receipt'):
+        raise Refusal('owner resume takes no transition receipt')
+    if e['actor'] != data['coordinator']:
+        raise Refusal('only the recorded coordinator may resume the owner')
+    if e['recipient'] != data['owner'] or parent['recipient'] != data['owner']:
+        raise Refusal("owner resume must name the current owner and the owner's own predecessor")
+    if plan.get('continue_job') != parent['job']:
+        raise Refusal("owner resume must continue the predecessor's own job (--continue-job)")
+    current = [d for d in data['dispatches'].values() if d.get('epoch') == data['epoch']]
+    # Registry order is allocation order; job-id timestamps can tie within a second.
+    owned = [d for d in current if d['recipient'] == data['owner']]
+    if not owned or owned[-1] is not parent:
+        raise Refusal("owner resume must continue the owner's latest dispatch")
+    for d in current:
+        status = jobs.job_status(d['job']) if d.get('ready') else 'unknown'
+        if status not in jobs.TERMINAL:
+            raise Refusal(f"task work is running or of unknown state ({d['job']}: {status}); no resume")
+    if jobs.job_status(parent['job']) != 'done':
+        raise Refusal('owner resume needs the predecessor job finished done')
+
+
 def allocate(plan, factory):
     """Validate before job allocation; reserve identity before any job files are written."""
     e = _envelope(plan)
+    if plan.get('preserve_existing_metadata') is True and e.get('receipt'):
+        raise Refusal('preserving start cannot consume or alter an existing transition receipt')
     task, request = e['task'], e['dispatch']
     if plan.get('engine') not in ENGINES:
         raise Refusal('dispatch engine is unknown; no allocation')
@@ -272,6 +321,8 @@ def allocate(plan, factory):
                 raise Refusal('existing dispatch job is missing or changed; no replacement launch')
             return entry['job']
         if data is None:
+            if _resume_requested(e):
+                raise Refusal('owner resume needs an existing task registry; no allocation')
             if e.get('parent') or e.get('receipt') or e['actor'] == e['recipient']:
                 raise Refusal('initial dispatch requires distinct coordinator and owner')
             data = dict(version=VERSION, task=task, coordinator=e['actor'], owner=e['recipient'],
@@ -282,7 +333,10 @@ def allocate(plan, factory):
             receipt = data['receipts'].get(e.get('receipt')) if e.get('receipt') else None
             if not parent or not parent['ready'] or parent['epoch'] != data['epoch']:
                 raise Refusal('dispatch requires a current admitted predecessor')
-            if e['actor'] != parent['recipient']:
+            resume = _resume_requested(e)
+            if resume:
+                _admit_owner_resume(data, e, parent, plan)
+            elif e['actor'] != parent['recipient']:
                 raise Refusal('sender does not own the predecessor delegation')
             lineage = list(parent['lineage'])
             if receipt:
@@ -309,9 +363,12 @@ def allocate(plan, factory):
                 receipt['used_by'] = request
             elif e.get('receipt'):
                 raise Refusal('no trusted host acceptance receipt exists')
+            elif resume:
+                pass  # the owner continues its own finished job in place: no new ancestry to check
             elif e['recipient'] in lineage:
                 raise Refusal('ancestor delegation cycle refused; report result to coordinator')
-            lineage.append(e['recipient'])
+            if not resume:
+                lineage.append(e['recipient'])
         for _ in range(20):
             jid = f'{common.stamp()}-{plan["engine"]}-{secrets.token_hex(2)}'
             # Existing baton/job readers require four hex digits. Never overwrite

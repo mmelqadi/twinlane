@@ -2,23 +2,33 @@
 """twinlane - use Claude Code and Codex together: meter, route, run, baton, handoff.
 
   twinlane status                       both meters + running jobs + batons (one screen)
+  twinlane status JOB                   job state, exit code, completion time and receipt
+  twinlane watch [--name lead] [--timeout 3300] [--interval 5] [--json]   wait for coordination events
+  twinlane --version                    development version and best-effort source commit
   twinlane board [--json | --md] [--all] [--finished N] [--watch SECONDS]   one read-only screen for a lead session
   twinlane meter [--json] [--fresh]
   twinlane route <kind> [--urgent] [--engine claude|codex] [--json]
   twinlane run --brief F --cd DIR [--kind K] [--engine auto|claude|codex] [--write] [--bg] ...
   twinlane run --best-of ENGINE[,ENGINE...] --brief F --cd DIR [--kind K] ...   (same brief on several engines)
   twinlane compare GROUP [--wait] [--test] [--json|--md]                        (compare a --best-of group)
-  twinlane land enqueue|status|next|run|release|dequeue|log ...   (land finished worktree branches, one at a time)
+  twinlane land card|enqueue|status|next|run|release|dequeue|log ...   (land finished worktree branches, one at a time)
   twinlane ship plan|run ...                                      (release manifest for landed work)
   twinlane wt doctor|prune ...                                    (inspect and prune linked worktrees)
+  twinlane wt gc [--repo DIR] [--apply]                            (zero-unique cleanup; dry run by default)
+  twinlane wip [next] [--json]                                    (writer lanes and manual FIFO admission queue)
+  twinlane inbox [--all] [--json] | inbox answer ID --grant WORDS | --deny REASON
   twinlane resume [JOB ...] [--all-lost] [--yes]                  (restart jobs lost to a host restart)
   twinlane jobs | wait JOB... [--any] [--timeout S] | result JOB [--full] | stop JOB
+  twinlane jobs archive [--older-than DAYS] [--include-unread] [--apply] [--json]
+  twinlane explain-writer-admission --cwd DIR [--job-id ID] [--json]   (read-only; a proposal, never a grant)
   twinlane baton new|set|snap|show|list ...
   twinlane handoff (SLUG | --cd DIR | --session ID) [--to claude|codex] [--out F]
   twinlane handoff --session ID [--session ID ...] [--to claude|codex] --out-dir DIR   (one file per session)
   twinlane sessions [--engine claude|codex|all] [--since 48h] [--cwd DIR] [--limit N] [--jobs] [--json|--md]
-  twinlane hook                          (Claude Code UserPromptSubmit hook; reads JSON on stdin)
+  twinlane hook                          (UserPromptSubmit/PreCompact/lane state hook; reads JSON on stdin)
   twinlane guard                         (PreToolUse guard inside twinlane jobs only; reads JSON on stdin)
+
+Never blocked: ask one question. An inbox yes is not a live-write approval.
 
 kinds: code intel plan review (Claude first) | parallel sweep integrate verify
 Policy: packaged defaults merged with TWINLANE_CONFIG or <home>/config.json
@@ -40,23 +50,47 @@ if __name__ == '__main__' and sys.argv[1:2] == ['_job']:
             sys.exit(5)  # EXIT_FAILED: never run a job with the wrong environment
 
 try:
-    from twinlane import common  # noqa: E402
+    from twinlane import common, observations  # noqa: E402
 except BaseException:
     if sys.argv[1:2] == ['guard'] and os.environ.get('TWINLANE_ENGINE_JOB'):
         sys.exit(2)  # guard bootstrap cannot silently bypass enforcement on an import failure
     raise
 
 
+@observations.command
 def status(argv):
     from twinlane import baton, jobs, meter
     as_json = '--json' in argv
-    m = meter.read(fresh='--fresh' in argv, auto_refresh=True)
+    ids = [arg for arg in argv if not arg.startswith('-')]
+    if ids:
+        try:
+            jid = jobs.resolve_job(ids[0])
+        except LookupError as e:
+            print(f'twinlane status: {e}', file=sys.stderr)
+            return common.EXIT_USAGE
+        receipt = common.read_json(jobs._p(jid, 'result.json'), {}) or {}
+        data = {'id': jid, 'status': jobs.job_status(jid), 'receipt_status': receipt.get('status'),
+                'exit_code': receipt.get('exit_code'), 'finished_at': receipt.get('finished_at'),
+                'receipt_path': jobs._p(jid, 'result.json') if receipt else None}
+        common.emit(data, as_json, f"{jid}: {data['status']} exit={data['exit_code']} "
+                    f"finished_at={data['finished_at']} receipt_status={data['receipt_status']} receipt={data['receipt_path']}")
+        return 0
+    m = meter.cached_observation()
     js = [j for j in jobs.list_jobs(limit=50) if j.get('status') in ('queued', 'running', 'orphaned', 'unknown')]
     bs = baton.list_batons()[:10]
+    from twinlane import capacity, wip
+    try:
+        writers = len(wip.collect())
+    except wip.WipError as e:  # status still reports; only writer admission fails closed
+        writers = '?'
+        print(f'twinlane: writer count unknown: {e}', file=sys.stderr)
+    cap = capacity.line(writers, (common.load_policy().get('wip') or {}).get('max_writers', 5),
+                        len(wip.queue()), m, common.now())
     if as_json:
-        common.emit({'meter': m, 'running_jobs': js, 'batons': bs}, True)
+        common.emit({'meter': m, 'running_jobs': js, 'batons': bs, 'capacity': cap}, True)
         return 0
     print(meter.format_line(m))
+    print(cap)
     print(f'running jobs: {len(js)}' + ''.join(f"\n  {j.get('id')}  {j.get('engine')}  {j.get('name') or ''}  "
                                                f"{j.get('status')}  {j.get('cwd') or ''}" for j in js))
     print(f'batons: {len(bs)}' + ''.join(f"\n  {b.get('slug')}  owner={b.get('owner')}  age={b.get('age')}  "
@@ -64,14 +98,15 @@ def status(argv):
     return 0
 
 
-def fail_open(name):
+def fail_open(name, argv=None):
     """Advisory hooks fail open; a worker's enforcement guard must block on bootstrap failure too."""
     try:
         common.utf8_stdio()
-        common.ensure_dirs()
+        if name != 'hook':
+            common.ensure_dirs()
         if name == 'hook':
             from twinlane import hook
-            return hook.main()
+            return hook.main(argv=argv)
         from twinlane import guard
         return guard.main()
     except BaseException:  # noqa: BLE001 - preserve the enforcement boundary before guard.main loads
@@ -88,18 +123,40 @@ def wants_best_of(args):
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     if argv and argv[0] in ('hook', 'guard'):
-        return fail_open(argv[0])
+        return fail_open(argv[0], argv[1:])
     common.utf8_stdio()
+    if argv == ['--version']:
+        from twinlane import __version__
+        import subprocess
+        suffix = ''
+        try:
+            proc = subprocess.run(['git', '-C', os.path.dirname(os.path.dirname(__file__)),
+                                   'rev-parse', '--short', 'HEAD'], capture_output=True, text=True, timeout=1)
+            if proc.returncode == 0 and proc.stdout.strip():
+                suffix = ' (' + proc.stdout.strip() + ')'
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        print('twinlane ' + __version__ + suffix)
+        return 0
+    if argv and argv[0] == 'status':  # read-only, including an absent home
+        return status(argv[1:])
+    if argv and argv[0] == 'watch':
+        from twinlane import watch
+        return watch.cli(argv[1:])
     if argv and argv[0] == 'board':  # read-only: dispatched before ensure_dirs, so it creates no directory
         from twinlane import board
         return board.cli(argv[1:])
+    if argv and argv[0] == 'explain-writer-admission':  # read-only too: no lock, no write, no directory
+        from twinlane import writer_admission
+        return writer_admission.cli(argv[1:])
     common.ensure_dirs()
     if not argv or argv[0] in ('-h', '--help', 'help'):
         print(__doc__.strip())
         return 0
     cmd, rest = argv[0], argv[1:]
-    if cmd == 'status':
-        return status(rest)
+    if cmd in ('wip', 'inbox'):
+        from importlib import import_module
+        return import_module('twinlane.' + cmd).cli(rest)
     if cmd == 'meter':
         from twinlane import meter
         return meter.cli(rest)

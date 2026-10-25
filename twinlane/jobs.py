@@ -8,6 +8,8 @@ engine at most once, and only after a usage-limit hit.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+from contextvars import ContextVar, copy_context
 import hashlib
 import json
 import os
@@ -19,12 +21,35 @@ import sys
 import threading
 import time
 
-from . import common, envhandoff, guard
+from . import common, envhandoff, guard, observations
 
 # Test hooks: meter.py / route.py / baton.py are imported lazily, and tests replace these.
 _read_meter = None      # callable(policy) -> meter dict
 _decide = None          # callable(kind, meter, policy, urgent, engine) -> decision dict
 _record_baton = None    # callable(slug, receipt) -> None
+_PRESERVING_METADATA = ContextVar('twinlane_preserving_metadata', default=False)
+_CURRENT_JOB = ContextVar('twinlane_current_metadata_job', default=None)
+_REAPED_CHILDREN = ContextVar('twinlane_reaped_children', default=None)
+
+
+@contextmanager
+def preserving_metadata(job_id=None):
+    """Observations retain other jobs' metadata; only this new job owns its lifecycle files.
+
+    Context-local rather than an environment flag: persist the option in job.json for the
+    detached runner, and explicitly copy it into the usage scan thread.
+    """
+    mode = _PRESERVING_METADATA.set(True)
+    owner = _CURRENT_JOB.set(job_id)
+    try:
+        yield
+    finally:
+        _CURRENT_JOB.reset(owner)
+        _PRESERVING_METADATA.reset(mode)
+
+
+def _preserve_job(job_id):
+    return _PRESERVING_METADATA.get() and job_id != _CURRENT_JOB.get()
 CONTAIN = True          # runner joins a kill-on-close job object (tests running in-process turn it off)
 
 POLL_S = 2.0
@@ -62,11 +87,71 @@ CALLER_BRIEF = 'caller-brief.md'  # jobs/<id>/: the brief as the caller wrote it
 # ---------------------------------------------------------------- paths / small io
 
 def job_dir(job_id: str) -> str:
-    return os.path.join(common.JOBS, job_id)
+    active = os.path.join(common.JOBS, job_id)
+    if os.path.isfile(os.path.join(active, 'job.json')):
+        return active
+    from . import archive, baton
+    if baton.JOB_ID_RE.fullmatch(job_id):
+        return archive.archived_ids().get(job_id, active)
+    return active
 
 
 def _p(job_id: str, name: str) -> str:
     return os.path.join(job_dir(job_id), name)
+
+
+def lock_paths(job_id: str, name: str | None = None) -> tuple[str, str | None]:
+    """Outer archive coordination, then the canonical pre-upgrade lifecycle lock."""
+    return (os.path.join(common.STATE, 'job-locks', job_id + '.archive'), _p(job_id, name) if name else None)
+
+
+_ARCHIVE_LOCKS = threading.local()
+
+
+@contextmanager
+def archive_lock(job_id: str, timeout_s=30):
+    # Reentrant only within this thread. A copied context in another thread must
+    # still take the OS lock. Never retain a resolved evidence path across it.
+    path, _ = lock_paths(job_id)
+    held = getattr(_ARCHIVE_LOCKS, 'held', set())
+    if path in held:
+        yield
+        return
+    with common.file_lock(path, timeout_s):
+        _ARCHIVE_LOCKS.held = held | {path}
+        try:
+            yield
+        finally:
+            _ARCHIVE_LOCKS.held = held
+
+
+@contextmanager
+def lifecycle_lock(job_id: str, name: str, timeout_s=30):
+    with archive_lock(job_id, timeout_s):
+        _, inner = lock_paths(job_id, name)
+        with common.file_lock(inner, timeout_s, create_parent=False):
+            yield
+
+
+def _write_job_file(job_id, name, write):
+    """Resolve and write without creating evidence directories, even on retry."""
+    with archive_lock(job_id):
+        for attempt in range(2):
+            path = _p(job_id, name)
+            try:
+                write(path)
+                return
+            except FileNotFoundError:
+                if attempt:
+                    raise
+
+
+def _write_job_json(job_id, name, data):
+    _write_job_file(job_id, name, lambda path: common.write_json(path, data, create_parent=False))
+
+
+def _write_job_text(job_id, name, text):
+    _write_job_file(job_id, name, lambda path: common.write_text(path, text, create_parent=False))
 
 
 def _read_text(path: str) -> str:
@@ -109,6 +194,31 @@ def _meter(policy: dict, fresh: bool = False, auto_refresh: bool = True) -> dict
     if _read_meter is not None:
         return _read_meter(policy)
     from . import meter
+    if _PRESERVING_METADATA.get():
+        # A fresh read of BOTH accounts can lease/prune Codex binaries even for Claude.
+        # Only reuse the ordinary TTL-qualified cache; never renew tokens, run a model,
+        # acquire shared binaries or write cache state to obtain admission evidence.
+        cached = meter._cached_meter(policy)
+        if cached is None:
+            raise Refusal(common.EXIT_REFUSED, 'preserving start requires existing fresh meter evidence; no refresh or shared binary-cache acquisition')
+        # The envelope TTL is not the lifetime of each underlying allowance reading.
+        # _cached_meter recalculates age but does not reclassify its old status. Only
+        # downgrade stale/unreadable/future-dated evidence; never invent a fresh read.
+        cached = dict(cached)
+        now = common.now()
+        for engine in ENGINES:
+            section = dict(cached[engine])
+            stamp = common.parse_time(section.get('reading_at'))
+            age = common.age_s(section.get('reading_at'))
+            limit = (policy.get(engine) or {}).get('stale_reading_max_age_s', 1800)
+            if type(limit) is not int or limit < 0:
+                raise Refusal(common.EXIT_REFUSED, f'{engine} freshness policy is invalid')
+            if stamp is None or age is None or age > limit or (stamp - now).total_seconds() > meter.FUTURE_SKEW_S:
+                section['status'] = 'unknown'
+                section['note'] = '; '.join(filter(None, (section.get('note'),
+                    'cached underlying allowance is stale, unreadable or future-dated; no refresh performed')))
+            cached[engine] = section
+        return cached
     return meter.read(fresh=fresh, policy=policy, auto_refresh=auto_refresh)
 
 
@@ -306,13 +416,13 @@ def guard_settings(job_dir_path: str, deny: list[str] | None = None) -> str:
     profile's extra deny rules (kept off the command line, which Windows caps at 32 KB)."""
     py = sys.executable.replace('\\', '/')
     command = f'"{py}" "{common.TWINLANE_PY.replace(chr(92), "/")}" guard'
-    path = os.path.join(job_dir_path, 'guard-settings.json')
+    job_id = os.path.basename(job_dir_path)
     data = {'hooks': {'PreToolUse': [
         {'matcher': GUARD_MATCHER, 'hooks': [{'type': 'command', 'command': command, 'timeout': 15}]}]}}
     if deny:
         data['permissions'] = {'deny': list(deny)}
-    common.write_json(path, data)
-    return path
+    _write_job_json(job_id, 'guard-settings.json', data)
+    return _p(job_id, 'guard-settings.json')
 
 
 def worker_env(env: dict, job_id: str) -> dict:
@@ -379,6 +489,11 @@ def build_argv(params: dict, policy: dict, brief_path: str, cwd: str, out_dir: s
 
 # ---------------------------------------------------------------- stream parsing
 
+TURNS_NOTE = ('model_calls counts distinct main-loop model responses (subagent_model_calls those of subagents); '
+              'num_turns is the Claude CLI result counter, a different unit from the --max-turns limit the CLI '
+              'enforces itself. A run the CLI stopped at that limit ends with subtype error_max_turns.')
+
+
 class ClaudeStream:
     """Incremental parser for `claude -p --output-format stream-json` lines."""
 
@@ -393,6 +508,12 @@ class ClaudeStream:
         self.bad_lines = 0
         self.tool_uses = []
         self.errors = []
+        # Model responses, counted by distinct message id: the CLI splits one response across several
+        # `assistant` events, one per content block. An event without an id counts once on its own.
+        self.main_calls: set = set()
+        self.sub_calls: set = set()
+        self.unkeyed_main = 0
+        self.unkeyed_sub = 0
 
     def feed(self, line: str) -> None:
         """Never raises: a malformed event is counted, and the caller keeps draining the pipe."""
@@ -428,6 +549,7 @@ class ClaudeStream:
             if isinstance(info, dict) and str(info.get('status', '')).lower() == 'rejected':
                 self.limit_hit = True
         elif kind == 'assistant':
+            self._count_call(ev)
             text = _message_text(ev.get('message'))
             if text:
                 self.last_text = text
@@ -438,6 +560,17 @@ class ClaudeStream:
                 self.session_id = ev['session_id']
             if ev.get('is_error') and LIMIT_TEXT.search(str(ev.get('result') or '')):
                 self.limit_hit = True
+
+    def _count_call(self, ev: dict) -> None:
+        msg = ev.get('message') if isinstance(ev.get('message'), dict) else {}
+        sub = bool(ev.get('parent_tool_use_id'))
+        mid = msg.get('id')
+        if isinstance(mid, str) and mid:
+            (self.sub_calls if sub else self.main_calls).add(mid)
+        elif sub:
+            self.unkeyed_sub += 1
+        else:
+            self.unkeyed_main += 1
 
     def _record_tool_uses(self, msg) -> None:
         for c in _content_items(msg):
@@ -457,6 +590,8 @@ class ClaudeStream:
                 'permission_mode': self.permission_mode, 'tools_count': self.tools_count,
                 'limit_hit': self.limit_hit, 'has_result': self.result is not None,
                 'subtype': r.get('subtype'), 'is_error': r.get('is_error'), 'num_turns': r.get('num_turns'),
+                'model_calls': len(self.main_calls) + self.unkeyed_main,
+                'subagent_model_calls': len(self.sub_calls) + self.unkeyed_sub,
                 'duration_ms': r.get('duration_ms'), 'duration_api_ms': r.get('duration_api_ms'),
                 'total_cost_usd': r.get('total_cost_usd'), 'served_models': served,
                 'usage': r.get('usage') if isinstance(r.get('usage'), dict) else None,
@@ -522,6 +657,27 @@ def _codex_limit_event(line: str) -> bool:
     return any(m in fields for m in CODEX_LIMIT_MARKERS)
 
 
+def _error_text(text: str) -> str:
+    from . import baton
+    return common.clip(baton.redact(' '.join(text.split())), 500)
+
+
+def codex_error_text(lines) -> str | None:
+    """Newest structured error only; agent messages and command output are not error events."""
+    for line in reversed(list(lines)):
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(ev, dict) or ev.get('type') not in CODEX_ERROR_EVENTS:
+            continue
+        error = ev.get('error')
+        for text in (ev.get('message'), error.get('message') if isinstance(error, dict) else error):
+            if isinstance(text, str) and text.strip():
+                return _error_text(text)
+    return None
+
+
 def parse_codex_out(out_dir: str) -> dict:
     """Codex runner evidence: last-message.md, result.txt, events.jsonl."""
     first = common.first_line(os.path.join(out_dir, 'result.txt')).strip()
@@ -537,7 +693,8 @@ def parse_codex_out(out_dir: str) -> dict:
             if m:
                 sid = m.group(1)
                 break
-    return {'session_id': sid, 'model': kv.get('model'), 'effort': kv.get('effort'), 'sandbox': kv.get('sandbox'),
+    error = codex_error_text(events) or next((_error_text(s) for s in stderr if 'error' in s.lower()), None)
+    return {'error_text': error, 'session_id': sid, 'model': kv.get('model'), 'effort': kv.get('effort'), 'sandbox': kv.get('sandbox'),
             'tokens': kv.get('tokens'), 'reported_exit': kv.get('exit'), 'limit_hit': limit,
             'final_text': _read_text(os.path.join(out_dir, 'last-message.md')), 'result_line': first}
 
@@ -613,6 +770,9 @@ def _self_created():
 
 
 def _pid_state(pid, created) -> str:
+    if _PRESERVING_METADATA.get() and not (pid is None and created is None):
+        if not common._valid_pid(pid) or not common._valid_stamp(created):
+            return common.UNKNOWN
     return common.pid_state(pid, created) if pid else common.DEAD
 
 
@@ -654,17 +814,35 @@ def _child_pending(job_id: str) -> bool:
     path = _p(job_id, CHILD_STARTING)
     if not os.path.exists(path):
         return False
-    pending = common.read_json(path)
-    if isinstance(pending, dict) and isinstance(pending.get('pid'), int) \
-            and isinstance(pending.get('created'), int) \
-            and _pid_state(pending['pid'], pending['created']) == common.DEAD:
+    if _preserve_job(job_id) or observations.active():
+        # Observe without reclaim. Pin bytes around the native check: a changed/unreadable
+        # marker or invalid recorded identity holds; only definitive exact-stamp DEAD clears
+        # the logical uncertainty. The file remains untouched, even across other tasks.
         try:
-            os.remove(path)
-        except OSError:
+            with open(path, 'rb') as handle:
+                before = handle.read()
+            pending = json.loads(before)
+            if not isinstance(pending, dict) or not common._valid_pid(pending.get('pid')) \
+                    or not common._valid_stamp(pending.get('created')):
+                return True
+            state = _pid_state(pending['pid'], pending['created'])
+            with open(path, 'rb') as handle:
+                after = handle.read()
+            return before != after or state != common.DEAD
+        except (OSError, ValueError, RecursionError):
             return True
-        return False
-    return True
-
+    with archive_lock(job_id):
+        path = _p(job_id, CHILD_STARTING)
+        pending = common.read_json(path)
+        if isinstance(pending, dict) and isinstance(pending.get('pid'), int) \
+                and isinstance(pending.get('created'), int) \
+                and _pid_state(pending['pid'], pending['created']) == common.DEAD:
+            try:
+                os.remove(path)
+            except OSError:
+                return True
+            return False
+        return True
 
 def _engine_state(job_id: str, st: dict) -> str:
     """The strongest evidence that a job's engine process still runs: the child recorded in status.json or the
@@ -709,7 +887,7 @@ def _note_survivor(job_id: str, engine: str, proc, created, why: str) -> None:
         except OSError:
             created = None
     try:
-        common.write_json(_p(job_id, SURVIVOR), {'engine': engine, 'pid': proc.pid, 'created': created, 'why': why,
+        _write_job_json(job_id, SURVIVOR, {'engine': engine, 'pid': proc.pid, 'created': created, 'why': why,
                                                  'at': common.iso(common.now())})
     except OSError:
         pass
@@ -736,9 +914,15 @@ def _clear_child_starting(job_id: str, proc=None) -> None:
     Persisting identity is insufficient: later cleanup and survivor persistence can both fail.
     Keep the durable marker for the entire child lifetime so a terminal receipt cannot hide it.
     """
+    if _preserve_job(job_id):
+        return
     try:
         if proc is None or proc.poll() is not None:
-            os.remove(_p(job_id, CHILD_STARTING))
+            reaped = _REAPED_CHILDREN.get()
+            if proc is not None and reaped is not None:
+                reaped[job_id] = proc.pid
+            with archive_lock(job_id):
+                os.remove(_p(job_id, CHILD_STARTING))
     except OSError:
         pass  # retained uncertainty is safer than silently allowing another worker
 
@@ -765,12 +949,33 @@ def running_count(engine: str, exclude: str | None = None) -> int:
         if not isinstance(st, dict):
             # Unreadable mid-write: a live runner still holds a slot (over-counting only delays a job).
             spec = common.read_json(_p(jid, 'job.json'), {}) or {}
+            if _PRESERVING_METADATA.get():
+                primary = spec.get('primary') if isinstance(spec, dict) else None
+                declared = primary.get('engine') if isinstance(primary, dict) else None
+                pid, created = _runner_pid(jid)
+                if declared not in ENGINES or (declared == engine and (
+                        not common._valid_pid(pid) or not common._valid_stamp(created))):
+                    n += 1
+                    continue
             surv = _survivor(jid)
             if (spec.get('primary') or {}).get('engine') == engine and (
                     _alive(*_runner_pid(jid)) or surv and _survivor_state(surv) != common.DEAD):
                 n += 1
             continue
+        if _PRESERVING_METADATA.get() and st.get('engine') not in ENGINES:
+            # An object-shaped status can still omit/mangle its engine. Neither
+            # engine may assume capacity is free while its recorded runner/child
+            # is live, UNKNOWN or lacks a qualified identity.
+            pid, created = (st.get('pid'), st.get('pid_created')) if st.get('pid') else _runner_pid(jid)
+            if not common._valid_pid(pid) or not common._valid_stamp(created) \
+                    or _alive(pid, created) or _engine_state(jid, st) != common.DEAD:
+                n += 1
+            continue
         if st.get('engine') != engine:
+            continue
+        if _PRESERVING_METADATA.get() and st.get('status') == 'running' and (
+                not common._valid_pid(st.get('pid')) or not common._valid_stamp(st.get('pid_created'))):
+            n += 1
             continue
         if st.get('status') == 'running' and _alive(st.get('pid'), st.get('pid_created')):
             n += 1
@@ -800,20 +1005,20 @@ def acquire_slot(job_id: str, engine: str, attempt: int, policy: dict) -> bool:
 
 
 def _write_status(job_id: str, status: str, **extra) -> None:
-    with common.file_lock(_p(job_id, 'status.lock'), 30):
+    with lifecycle_lock(job_id, 'status.lock'):
         st = {'status': status, 'pid': os.getpid(), 'pid_created': _self_created(),
               'updated_at': common.iso(common.now())}
         old = common.read_json(_p(job_id, 'status.json'), {}) or {}
         st['started_at'] = old.get('started_at') or (st['updated_at'] if status == 'running' else None)
         st.update(extra)
-        common.write_json(_p(job_id, 'status.json'), st)
+        _write_job_json(job_id, 'status.json', st)
 
 
 def _merge_status(job_id: str, **fields) -> None:
-    with common.file_lock(_p(job_id, 'status.lock'), 30):
+    with lifecycle_lock(job_id, 'status.lock'):
         st = common.read_json(_p(job_id, 'status.json'), {}) or {}
         st.update(fields)
-        common.write_json(_p(job_id, 'status.json'), st)
+        _write_job_json(job_id, 'status.json', st)
 
 
 # ---------------------------------------------------------------- preflight
@@ -851,12 +1056,37 @@ def codex_credit_refusal(meter: dict, params: dict, policy: dict) -> str | None:
     return None
 
 
+def _preserving_engine_refusal(spec: dict, engine: str) -> str | None:
+    """A preserving start runs only its own primary engine; Codex only with the binary recorded at planning.
+    Checked before any meter read, so a refusal has no binary-cache or provider effect."""
+    primary = (spec.get('primary') or {}).get('engine')
+    if engine != primary:
+        return (f'preserving {primary} start never fails over to {engine}'
+                + ('; a Claude preserving start stays Claude only' if primary == 'claude' else ''))
+    if engine == 'claude':
+        return None
+    if engine != 'codex':
+        return f'preserving start does not support engine {engine!r}'
+    if common.CODEX_RUN:
+        return 'preserving Codex start refused: a TWINLANE_CODEX_RUN adapter cannot verify the qualified binary hand-off'
+    problem = common.codex_bin_identity_problem(spec.get('codex_binary'))
+    return f'preserving Codex start refused at preflight: {problem}' if problem else None
+
+
 def preflight(spec: dict, params: dict, policy: dict, fresh: bool,
               seen: dict | None = None) -> tuple[str | None, str | None]:
     """Re-check the meter right before an attempt starts: a queued job may have waited while the
     engine crossed its stop line. Returns (refusal reason, wait_until) or (None, None).
     `seen` (optional) keeps the first meter read here: the job's 'before' usage reading."""
     engine = params['engine']
+    if spec.get('write') or spec.get('profile') == 'code':
+        why = writer_readiness(spec.get('cwd'), policy)
+        if why:
+            return why, None
+    if spec.get('preserve_existing_metadata') is True:
+        why = _preserving_engine_refusal(spec, engine)
+        if why:
+            return why, None
     try:
         meter = _meter(policy, fresh=fresh, auto_refresh=engine != 'codex')
         if seen is not None and 'meter' not in seen:
@@ -871,6 +1101,37 @@ def preflight(spec: dict, params: dict, policy: dict, fresh: bool,
         if why:
             return why, None
     return None, None
+
+
+def writer_readiness(cwd, policy):
+    from . import worktrees, projects
+    # This check qualifies configured dependencies. Existing writer admission owns
+    # Git/worktree qualification; a project with no dependencies needs no probe.
+    entries = policy.get('projects') or {}
+    configured = (policy.get('wt') or {}).get('deps_dirs') or any(
+        isinstance(entry, dict) and isinstance(entry.get('wt'), dict) and entry['wt'].get('deps_dirs')
+        for entry in entries.values())
+    if not configured:
+        return None
+    try:
+        _, project = projects.resolve(cwd, policy)
+        mode = (project.get('wt') or {}).get('preflight', 'refuse')
+        if mode == 'off':
+            return None
+        problems = worktrees.preflight(common.worktree_top(cwd) or cwd, project)
+    except projects.ProjectError as e:
+        return f'writer worktree preflight: {e}'
+    if problems:
+        message = 'worktree not ready: ' + '; '.join(problems)
+        setup = (project.get('wt') or {}).get('setup_command')
+        if setup:
+            message += '; run: ' + str(setup)
+        if mode == 'warn':
+            print(message, file=sys.stderr)
+        else:
+            return message
+
+    return None
 
 
 # ---------------------------------------------------------------- attempts
@@ -901,12 +1162,14 @@ def run_attempt(job_id: str, n: int, params: dict, brief_path: str, spec: dict, 
         a.update(_run_claude(job_id, argv, spec, params, brief_path, files, policy))
     else:
         a['argv'] = argv
-        a.update(_run_codex(job_id, argv, spec['cwd'], params['timeout_s'] + CODEX_GRACE_S, files, params, policy))
+        preserving = spec.get('preserve_existing_metadata') is True or _PRESERVING_METADATA.get()
+        a.update(_run_codex(job_id, argv, spec['cwd'], params['timeout_s'] + CODEX_GRACE_S, files, params, policy,
+                            **({'qualified': spec.get('codex_binary')} if preserving else {})))
     a['ended_at'] = common.iso(common.now())
     a['duration_s'] = round((common.now() - started).total_seconds(), 1)
     text = a.pop('final_text', '') or ''
     if text:
-        common.write_text(files['final'], text)
+        _write_job_text(job_id, os.path.basename(files['final']), text)
         a['final_path'] = files['final']
     return a
 
@@ -941,7 +1204,7 @@ def _run_claude(job_id, argv, spec, params, brief_path, files, policy) -> dict:
     env = claude_env(job_id, params['profile'], cwd, stripped, common.extra_secret_patterns(policy))
     proc = None
     try:
-        common.write_json(_p(job_id, CHILD_STARTING), {'engine': 'claude'})
+        _write_job_json(job_id, CHILD_STARTING, {'engine': 'claude'})
         with open(brief_path, 'rb') as fin, open(files['stderr'], 'wb') as ferr, open(files['events'], 'wb') as fev:
             proc = subprocess.Popen(argv, cwd=cwd, env=env, stdin=fin,
                                     stdout=subprocess.PIPE, stderr=ferr, creationflags=NO_WINDOW,
@@ -949,7 +1212,7 @@ def _run_claude(job_id, argv, spec, params, brief_path, files, policy) -> dict:
             child_created = None
             try:
                 child_created = common.process_created(proc.pid)
-                common.write_json(_p(job_id, CHILD_STARTING),
+                _write_job_json(job_id, CHILD_STARTING,
                                   {'engine': 'claude', 'pid': proc.pid, 'created': child_created})
                 _merge_status(job_id, child_pid=proc.pid if child_created else None, child_created=child_created)
                 reader = threading.Thread(target=_pump, args=(proc, fev, stream, errors), daemon=True)
@@ -975,7 +1238,8 @@ def _run_claude(job_id, argv, spec, params, brief_path, files, policy) -> dict:
     finally:
         _clear_child_starting(job_id, proc)
     s = stream.summary()
-    out = {k: s[k] for k in ('session_id', 'served_models', 'served_models_note', 'num_turns', 'subtype', 'is_error', 'duration_ms',
+    out = {k: s[k] for k in ('session_id', 'served_models', 'served_models_note', 'num_turns', 'model_calls',
+                             'subagent_model_calls', 'subtype', 'is_error', 'duration_ms',
                              'duration_api_ms', 'total_cost_usd', 'permission_denials', 'permission_mode',
                              'tools_count', 'limit_hit', 'final_text', 'bad_lines')}
     out.update(exit_code=rc, events_path=files['events'], stderr_path=files['stderr'])
@@ -990,6 +1254,8 @@ def _run_claude(job_id, argv, spec, params, brief_path, files, policy) -> dict:
     if errors or s['parse_errors']:
         out['stream_errors'] = (errors + s['parse_errors'])[:10]
     out['status'] = _claude_status(s, rc, timed_out)
+    if out['status'] == 'failed' and s['has_result'] and not s['is_error'] and s['subtype'] == 'success' and rc != 0:
+        out['error'] = f'claude reported success but exited rc {rc}'
     return out
 
 
@@ -1048,10 +1314,11 @@ def _codex_tokens(session_id, events_path: str, run_tokens) -> dict | None:
     else the runner's total. None when none of them has one."""
     from . import meter
     got = None
-    try:
-        got = meter.rollout_token_usage(session_id)
-    except OSError:
-        pass
+    if not _PRESERVING_METADATA.get():  # a preserving start never reads the private session rollouts
+        try:
+            got = meter.rollout_token_usage(session_id)
+        except OSError:
+            pass
     got = got or _codex_events_tokens(events_path)
     if not got and isinstance(run_tokens, str) and run_tokens.isdigit():
         got = {'source': 'built-in-runner', 'total_tokens': int(run_tokens)}
@@ -1063,7 +1330,7 @@ def _claude_status(s: dict, rc, timed_out: bool) -> str:
         return 'timeout'
     ok = s['has_result'] and not s['is_error'] and s['subtype'] == 'success'
     if ok:
-        return 'done'
+        return 'done' if rc == 0 else 'failed'
     if s['limit_hit']:
         return 'limit_hit'
     return 'failed'
@@ -1087,8 +1354,23 @@ def _sandbox_setup_failed(files: dict) -> bool:
     return False
 
 
-def _run_codex(job_id, argv, cwd, timeout_s, files, params, policy=None) -> dict:
+_ORDINARY = object()  # _run_codex(qualified=...) default: an ordinary start acquires its binary as usual
+
+
+def _preserving_launch_refusal(argv, qualified) -> str | None:
+    """Why a preserving Codex attempt must not launch: only the built-in runner verifies the hand-off, and the
+    explicit binary must still be the one recorded at planning."""
+    if common.CODEX_RUN or list(argv[:2]) != codex_launcher():
+        return 'preserving Codex start refused: only the built-in runner verifies the qualified binary hand-off'
+    problem = common.codex_bin_identity_problem(qualified)
+    return f'preserving Codex start refused at launch: {problem}' if problem else None
+
+
+def _run_codex(job_id, argv, cwd, timeout_s, files, params, policy=None, qualified=_ORDINARY) -> dict:
+    """`qualified` (a preserving start): the binary identity recorded at planning, the only binary it may run."""
     timed_out = False
+    preserving = qualified is not _ORDINARY or _PRESERVING_METADATA.get()
+    qualified = None if qualified is _ORDINARY else qualified
     # preflight() (codex_credit_refusal) is what keeps credits from being spent; the adapter flag is belt and braces.
     env = worker_env(os.environ, job_id)
     if common.CODEX_RUN:
@@ -1106,22 +1388,40 @@ def _run_codex(job_id, argv, cwd, timeout_s, files, params, policy=None) -> dict
         env, stripped = common.strip_secret_env(env, extra_secrets)
     # Fail closed: never "whatever codex is first on PATH" unless codex.binary_source allows it. The lease covers
     # lookup to child start; after that Windows refuses to delete the running codex.exe. A child whose kill
-    # failed keeps its lease.
-    try:
-        binary, why, lease = common.acquire_codex_binary(cx.get('binary_source') or 'auto')
-    except (OSError, RuntimeError, ValueError) as e:
-        binary, why, lease = None, f'lookup failed: {common.clip(str(e) or type(e).__name__, 200)}', None
+    # failed keeps its lease. A preserving start never looks up, copies or leases: it runs the qualified binary.
+    if preserving:
+        refused = _preserving_launch_refusal(argv, qualified)
+        if refused:
+            return {'status': 'refused', 'exit_code': common.EXIT_REFUSED, 'error': refused}
+        binary, why, lease = qualified['path'], f"TWINLANE_CODEX_BIN as set (qualified standalone): {qualified['path']}", None
+    else:
+        try:
+            binary, why, lease = common.acquire_codex_binary(cx.get('binary_source') or 'auto')
+        except (OSError, RuntimeError, ValueError) as e:
+            binary, why, lease = None, f'lookup failed: {common.clip(str(e) or type(e).__name__, 200)}', None
     if not binary:
         return {'status': 'failed', 'exit_code': common.EXIT_MISSING, 'error': f'no usable codex CLI: {why}'}
     too_old = common.codex_version_refusal(binary, cx.get('min_cli_version'))
     if too_old:
         common.release_codex(lease)
-        return {'status': 'failed', 'exit_code': common.EXIT_MISSING, 'error': f'codex CLI refused: {too_old}'}
+        return {'status': 'refused', 'exit_code': common.EXIT_REFUSED, 'error': f'codex CLI refused: {too_old}'}
+    if preserving:
+        if cx.get('min_cli_version') not in (None, ''):  # the version probe ran the file: still the recorded bytes?
+            refused = _preserving_launch_refusal(argv, qualified)
+            if refused:
+                return {'status': 'refused', 'exit_code': common.EXIT_REFUSED, 'error': refused}
+        env[common.CODEX_BIN_QUALIFIED] = json.dumps(qualified, sort_keys=True)
+        # Mode is explicit on argv as well: losing the environment hand-off must never
+        # downgrade a preserving runner to ordinary binary/PATH lookup.
+        if '--preserve-existing-metadata' not in argv:
+            argv.append('--preserve-existing-metadata')  # retain the actual child argv in the attempt receipt
+    else:
+        env.pop(common.CODEX_BIN_QUALIFIED, None)  # a stray hand-off never constrains an ordinary start
     env['TWINLANE_CODEX_BIN'] = binary
     child_alive = False
     proc = None
     try:
-        common.write_json(_p(job_id, CHILD_STARTING), {'engine': 'codex'})
+        _write_job_json(job_id, CHILD_STARTING, {'engine': 'codex'})
         with open(files['codex_log'], 'wb') as log:
             proc = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=log,
                                     stderr=subprocess.STDOUT, creationflags=NO_WINDOW,
@@ -1129,7 +1429,7 @@ def _run_codex(job_id, argv, cwd, timeout_s, files, params, policy=None) -> dict
             child_created = None
             try:
                 child_created = common.process_created(proc.pid)
-                common.write_json(_p(job_id, CHILD_STARTING),
+                _write_job_json(job_id, CHILD_STARTING,
                                   {'engine': 'codex', 'pid': proc.pid, 'created': child_created})
                 _merge_status(job_id, child_pid=proc.pid if child_created else None, child_created=child_created)
                 try:
@@ -1167,7 +1467,8 @@ def _run_codex(job_id, argv, cwd, timeout_s, files, params, policy=None) -> dict
         out['token_usage'] = tokens
     if why:  # an older copy, the PATH, or an explicit binary instead of the current app build
         out['codex_note'] = f'codex CLI: {why}'
-    if _sandbox_setup_failed(files):
+    sandbox_failed = _sandbox_setup_failed(files)
+    if sandbox_failed:
         out['codex_note'] = common.clip(f"{out.get('codex_note', 'codex CLI:')} | the Codex sandbox could not set up "
                                         f"('{SANDBOX_SETUP_MARKER}'): its commands may not have run, so treat the "
                                         'result as unverified', 600)
@@ -1185,6 +1486,15 @@ def _run_codex(job_id, argv, cwd, timeout_s, files, params, policy=None) -> dict
         out['status'], out['limit_hit'] = 'limit_hit', True
     else:
         out['status'] = 'failed'
+    out['codex_error'] = c.get('error_text')
+    if sandbox_failed and out['status'] == 'done':
+        out['status'] = 'failed'
+        out['error'] = ("the Codex sandbox could not set up ('setup refresh had errors'); "
+                        'its commands may not have run: result unverified')
+    if out['status'] in ('failed', 'limit_hit', 'timeout') and not out.get('error'):
+        out['error'] = c.get('error_text') or f'codex exited rc {rc} with no error event'
+        if out['status'] == 'timeout':
+            out['error'] = f'timed out after {timeout_s} s' + (f": {c['error_text']}" if c.get('error_text') else '')
     return out
 
 
@@ -1248,14 +1558,21 @@ def _claim_runner(job_id: str) -> tuple[int, int | None] | None:
     """Become the job's only runner: create runner.lock with O_EXCL. Returns None when claimed, or
     the (pid, created) of the LIVE runner that holds it. A lock naming a dead process is stale and
     taken over; the claim runs under a short OS lock so two runners cannot both take it over."""
-    path, me = _p(job_id, RUNNER_LOCK), (os.getpid(), _self_created())
+    me = (os.getpid(), _self_created())
     if me[1] is None:
         raise OSError('runner creation stamp is unavailable; refusing an unstamped lock')
-    with common.file_lock(_p(job_id, 'runner.claim'), 30):
+    with lifecycle_lock(job_id, 'runner.claim'):
+        path = _p(job_id, RUNNER_LOCK)
         try:
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
         except FileExistsError:
             parts = _read_text(path).split()
+            if _PRESERVING_METADATA.get():
+                # A prior/ambiguous runner claim is protected, even if now DEAD or ours.
+                if len(parts) == 2 and len(parts[0]) <= 10 and len(parts[1]) <= 20 \
+                        and all(p.isascii() and p.isdigit() for p in parts):
+                    return int(parts[0]), int(parts[1])
+                return 0, None
             pid = int(parts[0]) if parts and parts[0].isdigit() else None
             created = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
             # Unknown (exists, identity unreadable) holds the lock too: two runners on one job is the worse failure.
@@ -1270,8 +1587,10 @@ def _claim_runner(job_id: str) -> tuple[int, int | None] | None:
 
 
 def _release_runner(job_id: str) -> None:
-    path = _p(job_id, RUNNER_LOCK)
-    with common.file_lock(_p(job_id, 'runner.claim'), 30):
+    with lifecycle_lock(job_id, 'runner.claim'):
+        path = _p(job_id, RUNNER_LOCK)
+        if _PRESERVING_METADATA.get() and _read_text(path).split() != [str(os.getpid()), str(_self_created())]:
+            return
         if _read_text(path).split()[:1] == [str(os.getpid())]:
             try:
                 os.remove(path)
@@ -1280,7 +1599,7 @@ def _release_runner(job_id: str) -> None:
 
 
 def _writer_cwd(cwd: str) -> str:
-    return os.path.normcase(os.path.realpath(os.path.abspath(cwd)))
+    return common.writer_key(cwd)
 
 
 def _writer_path(cwd: str) -> str:
@@ -1289,7 +1608,7 @@ def _writer_path(cwd: str) -> str:
 
 
 def _writer_job_busy(job_id: str) -> bool:
-    """Recorded live/unknown engines hold the directory even after their runner wrote a receipt."""
+    """Live/unknown engines hold the directory, except qualified post-exit child PID reuse."""
     path = _p(job_id, 'status.json')
     st = common.read_json(path)
     if st is None and os.path.exists(path):
@@ -1298,7 +1617,9 @@ def _writer_job_busy(job_id: str) -> bool:
         return True
     if os.path.exists(_p(job_id, SURVIVOR)) and _survivor(job_id) is None:
         return True
-    return _engine_state(job_id, st or {}) != common.DEAD
+    engine = _engine_state(job_id, st or {})
+    return engine != common.DEAD and not (engine == common.UNKNOWN and
+                                         _finished_child_pid_reused(job_id, st or {}))
 
 
 def _claim_writer(spec: dict) -> str | None:
@@ -1310,21 +1631,33 @@ def _claim_writer(spec: dict) -> str | None:
     if spec.get('profile') != 'code':
         return None
     cwd, jid = _writer_cwd(spec['cwd']), spec['id']
+    rc, top = common.git(spec['cwd'], 'rev-parse', '--show-toplevel')
+    if rc == 0 and os.path.normcase(os.path.realpath(top.strip())) != cwd:
+        raise Refusal(common.EXIT_REFUSED,
+                      f'cannot establish the worktree root: git says {top.strip()}, the folder walk says {cwd}')
     path = _writer_path(cwd)
     with common.file_lock(os.path.join(common.STATE, 'writers.lock'), 30):
         if os.path.exists(path):
+            if _PRESERVING_METADATA.get():
+                raise Refusal(common.EXIT_REFUSED, 'existing writer reservation is protected; no replacement or cleanup')
             owner = common.read_json(path)
             if not isinstance(owner, dict) or owner.get('cwd') != cwd or not isinstance(owner.get('id'), str) \
                     or not isinstance(owner.get('pid'), int) or not isinstance(owner.get('created'), int):
                 raise Refusal(common.EXIT_REFUSED, 'writer reservation is unreadable or incomplete; ownership is unknown')
             if _pid_state(owner['pid'], owner['created']) != common.DEAD or _writer_job_busy(owner['id']):
                 raise Refusal(common.EXIT_REFUSED, f"writer directory is owned by {owner['id']} (live or unknown); wait for its owner")
+            receipt = common.read_json(_p(owner['id'], 'result.json'))
+            if isinstance(receipt, dict) and receipt.get('status') in TERMINAL \
+                    and _repair_finished_status(owner['id'], require_dead_runner=True) == 'rejected':
+                raise Refusal(common.EXIT_REFUSED, f"writer directory is owned by {owner['id']} (live or unknown); wait for its owner")
         # Include pre-reservation runners, which can still exist when an installation is upgraded.
         with os.scandir(common.JOBS) as entries:
             existing = list(entries)
         for entry in existing:
-            if not entry.is_dir() or entry.name == jid:
+            if entry.name == 'archive' or not entry.is_dir() or entry.name == jid:
                 continue
+            if not observations.JOB_DIRECTORY_RE.fullmatch(entry.name):
+                raise Refusal(common.EXIT_REFUSED, f'cannot verify writer ownership: nonmatching job folder {entry.name}')
             spec_path = os.path.join(entry.path, 'job.json')
             if not os.path.exists(spec_path) and not any(os.path.exists(os.path.join(entry.path, f))
                     for f in ('status.json', 'runner.pid', RUNNER_LOCK, SURVIVOR, CHILD_STARTING)):
@@ -1345,6 +1678,9 @@ def _claim_writer(spec: dict) -> str | None:
                     and not st.get('attempt') and not _writer_job_busy(entry.name):
                 continue
             pid, created = ((st['pid'], st.get('pid_created')) if (st or {}).get('pid') else _runner_pid(entry.name))
+            if _PRESERVING_METADATA.get() and (
+                    not common._valid_pid(pid) or not common._valid_stamp(created)):
+                raise Refusal(common.EXIT_REFUSED, f'writer identity of {entry.name} is incomplete or malformed; ownership is unknown')
             if other.get('writer_reservation_version') != 1 and (
                     not (st or {}).get('status') or (st or {}).get('status') == 'queued' or not pid):
                 receipt = common.read_json(os.path.join(entry.path, 'result.json'))
@@ -1352,6 +1688,10 @@ def _claim_writer(spec: dict) -> str | None:
                     raise Refusal(common.EXIT_REFUSED,
                                   f'legacy writer {entry.name} has unqualified prelaunch ownership; recovery required')
             if _alive(pid, created) or _writer_job_busy(entry.name):
+                raise Refusal(common.EXIT_REFUSED, f'writer directory is owned by {entry.name} (live or unknown); wait for its owner')
+            receipt = common.read_json(_p(entry.name, 'result.json'))
+            if isinstance(receipt, dict) and receipt.get('status') in TERMINAL \
+                    and _repair_finished_status(entry.name, require_dead_runner=True) == 'rejected':
                 raise Refusal(common.EXIT_REFUSED, f'writer directory is owned by {entry.name} (live or unknown); wait for its owner')
         created = _self_created()
         if created is None:
@@ -1370,10 +1710,34 @@ def _release_writer(path: str, job_id: str) -> None:
         pass  # keep an uncertain owner; another claimant must establish it is gone
 
 
-def run_job(job_id: str) -> dict:
+def run_job(job_id: str, *, preserve_existing_metadata=False) -> dict:
+    spec = common.read_json(_p(job_id, 'job.json'))
+    required = preserve_existing_metadata or _PRESERVING_METADATA.get()
+    if (required and not isinstance(spec, dict)) or (isinstance(spec, dict) and (
+            ('preserve_existing_metadata' in spec and type(spec['preserve_existing_metadata']) is not bool)
+            or (required and spec.get('preserve_existing_metadata') is not True))):
+        return {'id': job_id, 'status': 'refused', 'exit_code': common.EXIT_REFUSED,
+                'notes': ['metadata preservation mode missing or malformed; no runner claimed']}
+    token = _REAPED_CHILDREN.set({})
+    try:
+        if isinstance(spec, dict) and spec.get('preserve_existing_metadata') is True:
+            with preserving_metadata(job_id):
+                return _run_job(job_id)
+        return _run_job(job_id)
+    finally:
+        _REAPED_CHILDREN.reset(token)
+
+
+def _run_job(job_id: str) -> dict:
     spec = common.read_json(_p(job_id, 'job.json'))
     if not isinstance(spec, dict):
         raise SystemExit(f'twinlane: no job {job_id}')
+    if _PRESERVING_METADATA.get() and spec.get('preserve_existing_metadata') is not True:
+        return {'id': job_id, 'status': 'refused', 'exit_code': common.EXIT_REFUSED,
+                'notes': ['metadata preservation mode changed; no runner claimed']}
+    if _PRESERVING_METADATA.get() and os.path.exists(_p(job_id, 'result.json')):
+        return {'id': job_id, 'status': 'refused', 'exit_code': common.EXIT_REFUSED,
+                'notes': ['existing terminal job is protected; no replay or runner claimed']}
     holder = _claim_runner(job_id)
     if holder:
         # Another live runner owns this job: touch nothing (no status, no receipt, no engine).
@@ -1383,6 +1747,7 @@ def run_job(job_id: str) -> dict:
     try:
         done = common.read_json(_p(job_id, 'result.json'))
         if isinstance(done, dict):
+            repair_owner(job_id)
             # Finished (or stopped/refused before this runner started): never run it again.
             return {**done, 'duplicate_runner': True,
                     'notes': [f'job {job_id} already has a receipt ({done.get("status")}); this runner exits']}
@@ -1406,7 +1771,7 @@ def run_job(job_id: str) -> dict:
                 receipt = {'id': job_id, 'engine': spec['engine'], 'status': 'refused',
                            'exit_code': common.EXIT_REFUSED, 'error': str(e),
                            'notes': ['no engine started; coordination admission refused']}
-                common.write_json(_p(job_id, 'result.json'), receipt)
+                _write_receipt(job_id, receipt)
                 _write_status(job_id, 'refused', engine=spec['engine'])
                 return receipt
         try:
@@ -1415,7 +1780,7 @@ def run_job(job_id: str) -> dict:
             receipt = build_receipt(spec, [{'n': 1, 'engine': spec['primary']['engine'], 'status': 'refused',
                                             'error': str(error)}], {}, common.now(), None,
                                     ['writer admission refused; no engine started'], meter_after=None)
-            common.write_json(_p(job_id, 'result.json'), receipt)
+            _write_receipt(job_id, receipt)
             return receipt
         return _run_claimed(job_id, spec)
     finally:
@@ -1438,7 +1803,7 @@ def _run_claimed(job_id: str, spec: dict) -> dict:
         notes.append('stop requested before the runner started; nothing launched')
         receipt = build_receipt(spec, attempts, trip, t0, failover, notes, linked)
         receipt['status'] = 'stopped'
-        common.write_json(_p(job_id, 'result.json'), receipt)
+        _write_receipt(job_id, receipt)  # nothing launched: status.json stays as the queue left it
         return receipt
     stop_hit = interrupted = False
     policy, seen = None, {}
@@ -1469,14 +1834,18 @@ def _run_claimed(job_id: str, spec: dict) -> dict:
                 break
             a = run_attempt(job_id, n, params, brief_path, spec, policy, resume)
             attempts.append(a)
-            if a['status'] != 'limit_hit' or n == MAX_ATTEMPTS or not spec.get('failover') or _stopped(job_id):
+            if a['status'] != 'limit_hit' or n == MAX_ATTEMPTS or not spec.get('failover') or _stop_requested(job_id):
                 break
             nxt, why = plan_failover(spec, a, policy)
+            if nxt and nxt['engine'] == 'codex':
+                pf = common.codex_preflight(policy)
+                if pf['refusal']:
+                    nxt, why = None, pf['refusal']
             if nxt is None:
                 a['failover_refused'] = why
                 break
             brief_path = _p(job_id, 'brief-a2.md')
-            common.write_text(brief_path, continuation_brief(job_id, nxt['engine'], spec['profile'],
+            _write_job_text(job_id, os.path.basename(brief_path), continuation_brief(job_id, nxt['engine'], spec['profile'],
                                                              spec['brief_text'], a))
             failover = {'from': a['engine'], 'to': nxt['engine'], 'reason': 'limit_hit'}
             params, resume = nxt, None
@@ -1500,19 +1869,17 @@ def _run_claimed(job_id: str, spec: dict) -> dict:
     if usage and usage.get('cache_note'):
         notes.append(usage['cache_note'])
     receipt = build_receipt(spec, attempts, trip, t0, failover, notes, linked, usage=usage, meter_after=meter_after)
-    if stop_hit or _stopped(job_id):
+    # `twinlane stop` never writes the receipt while this runner lives: the request alone decides here.
+    if stop_hit or _stop_requested(job_id) and receipt['status'] != 'done':
         receipt['status'] = 'stopped'
-    common.write_json(_p(job_id, 'result.json'), receipt)
+    elif _stop_requested(job_id):
+        receipt['notes'].append('stop requested after the work finished; the receipt stays done')
+    _write_runner_receipt(job_id, receipt)
     err = _baton(spec.get('baton'), receipt)
     if err:
         receipt['notes'].append(f'baton end: {err}')
-        common.write_json(_p(job_id, 'result.json'), receipt)
+        _write_runner_receipt(job_id, receipt)
     return receipt
-
-
-def _stopped(job_id: str) -> bool:
-    r = common.read_json(_p(job_id, 'result.json'))
-    return isinstance(r, dict) and r.get('status') == 'stopped'
 
 
 def _stop_requested(job_id: str) -> bool:
@@ -1569,7 +1936,8 @@ def _overlapping_jobs(job_id: str, start, end, budget_s: float = OVERLAP_SCAN_S)
 
     def scan():
         try:
-            ids = sorted(os.listdir(common.JOBS), reverse=True)
+            ids = sorted((jid for jid in os.listdir(common.JOBS)
+                          if jid != 'archive'), reverse=True)
         except FileNotFoundError:
             ids = []
         except OSError:
@@ -1580,6 +1948,8 @@ def _overlapping_jobs(job_id: str, start, end, budget_s: float = OVERLAP_SCAN_S)
                 return
             if jid == job_id or not os.path.isdir(_p(jid, '')):
                 continue
+            if not observations.JOB_DIRECTORY_RE.fullmatch(jid):
+                state['truncated'] = True
             created = _job_created(jid)
             if created is not None and created > end:
                 continue  # created after the window closed: it cannot have run inside it
@@ -1608,7 +1978,8 @@ def _overlapping_jobs(job_id: str, start, end, budget_s: float = OVERLAP_SCAN_S)
         finally:
             state['done'] = True
 
-    t = threading.Thread(target=run, daemon=True, name='twinlane-overlap-scan')
+    context = copy_context()
+    t = threading.Thread(target=context.run, args=(run,), daemon=True, name='twinlane-overlap-scan')
     t.start()
     t.join(max(0.0, budget_s))
     stop.set()
@@ -1656,7 +2027,8 @@ def _bounded_after_meter(policy: dict, timeout_s: float, notes: list | None = No
         except BaseException as e:  # noqa: BLE001 - handed to the caller
             box['err'] = e
 
-    t = threading.Thread(target=work, daemon=True, name='twinlane-after-meter')
+    context = copy_context()
+    t = threading.Thread(target=context.run, args=(work,), daemon=True, name='twinlane-after-meter')
     t.start()
     t.join(max(0.0, timeout_s))
     if t.is_alive():
@@ -1741,6 +2113,103 @@ TRIPWIRE_SCOPE = 'tracked and untracked non-ignored paths inside the repo only'
 _UNSET = object()
 
 
+def _receipt_error(receipt: dict) -> str | None:
+    attempts = receipt.get('attempts') or []
+    return attempts[-1].get('error') if attempts else None
+
+
+def _finalize(receipt: dict) -> dict:
+    """Stamp every terminal receipt, including refusal and stop paths without attempts."""
+    if receipt.get('status') not in ('running', 'queued'):
+        receipt['finished_at'] = receipt.get('finished_at') or receipt.get('ended_at') or common.iso(common.now())
+        receipt['error'] = (receipt.get('error') or _receipt_error(receipt)) if receipt.get('status') != 'done' else None
+    return receipt
+
+
+def _validate_owner(slug):
+    if slug is None:
+        return
+    from . import baton
+    try:
+        if baton.load(baton.require_slug(slug)) is None:
+            raise baton.BatonError(f'no owner baton {slug}')
+    except baton.BatonError as e:
+        raise Refusal(common.EXIT_USAGE, str(e)) from e
+
+
+def _notify_owner(spec, receipt):
+    if not isinstance(spec, dict) or not spec.get('owner'):
+        return
+    try:
+        from . import baton
+        baton.owner_job(spec['owner'], receipt, terminal=receipt.get('status') in TERMINAL)
+    except Exception as e:
+        # A notification is advisory; the worker's result and exit code stay intact.
+        from . import baton
+        print(baton.redact(f'twinlane: owner notification failed: {type(e).__name__}: {common.clip(e, 200)}'), file=sys.stderr)
+
+
+OWNER_PENDING = 'owner-pending.json'
+OWNER_NOTIFIED = 'owner-notified.json'
+
+
+def repair_owner(jid):
+    """Retry a durable completion on authorized write paths only; never rerun an engine."""
+    if _preserve_job(jid):
+        return
+    pending = common.read_json(_p(jid, OWNER_PENDING))
+    receipt = common.read_json(_p(jid, 'result.json'))
+    if isinstance(pending, dict) and pending.get('job_id') == jid and isinstance(receipt, dict) \
+            and receipt.get('id') == jid and receipt.get('status') in TERMINAL:
+        owner = pending.get('owner')
+        if isinstance(owner, str):
+            _notify_owner({'owner': owner}, receipt)
+
+
+def repair_owners():
+    for jid in _job_ids():
+        if os.path.isfile(_p(jid, OWNER_PENDING)):
+            repair_owner(jid)
+
+
+def _write_receipt(jid, receipt):
+    receipt = _finalize(receipt)
+    spec = common.read_json(_p(jid, 'job.json'), {}) or {}
+    if spec.get('owner') and receipt.get('status') in TERMINAL and not os.path.exists(_p(jid, OWNER_NOTIFIED)):
+        # Write-ahead intent: receipt publication must never strand the owner's wake.
+        if not os.path.exists(_p(jid, OWNER_PENDING)):
+            _write_job_json(jid, OWNER_PENDING, {'owner': spec['owner'], 'job_id': jid,
+                              'engine': receipt.get('engine'), 'at': receipt.get('finished_at')})
+    _write_job_json(jid, 'result.json', receipt)
+    _notify_owner(spec, receipt)
+
+
+def _write_runner_receipt(jid, receipt):
+    """Publish, then finalize only the current runner's clean completion.
+
+    CHILD_STARTING stays durable until Popen's child is reaped (or never
+    started). Require this invocation's reaping evidence for a recorded child;
+    legacy receipts alone do not acquire that authority. Keep every recorded
+    identity, including the last attempt's child. Admission still probes them.
+    """
+    _write_receipt(jid, receipt)
+    if _preserve_job(jid) or receipt.get('status') not in TERMINAL or 'survivor' in receipt:
+        return
+    try:
+        with lifecycle_lock(jid, 'status.lock'):
+            if any(os.path.exists(_p(jid, marker)) for marker in (CHILD_STARTING, SURVIVOR)):
+                return
+            st = common.read_json(_p(jid, 'status.json'))
+            if not isinstance(st, dict):
+                return
+            if st.get('child_pid') and (_REAPED_CHILDREN.get() or {}).get(jid) != st['child_pid']:
+                return
+            st.update(status=receipt['status'], runner_finalized=True, updated_at=common.iso(common.now()))
+            _write_job_json(jid, 'status.json', st)
+    except OSError:
+        pass  # the published receipt and unfinished status retain the probed path
+
+
 def build_receipt(spec: dict, attempts: list, trip: dict, t0, failover, notes, linked: bool = True,
                   usage: dict | None = None, meter_after=_UNSET) -> dict:
     last = attempts[-1] if attempts else {}
@@ -1773,7 +2242,7 @@ def build_receipt(spec: dict, attempts: list, trip: dict, t0, failover, notes, l
     final_path = None
     if final_src:
         final_path = _p(spec['id'], 'final.md')
-        common.write_text(final_path, _read_text(final_src))
+        _write_job_text(spec['id'], 'final.md', _read_text(final_src))
     survivor = _survivor(spec['id'])
     if survivor:
         notes.append(f"{survivor.get('why') or 'engine process survived its kill'}; the job stays orphaned and holds "
@@ -1787,6 +2256,8 @@ def build_receipt(spec: dict, attempts: list, trip: dict, t0, failover, notes, l
                                                   if a.get('served_models_note'))) or None,
         'session_id': last.get('session_id'),
         'session_engine': last.get('engine'), 'num_turns': last.get('num_turns'),
+        'model_calls': last.get('model_calls'), 'subagent_model_calls': last.get('subagent_model_calls'),
+        'turns_note': TURNS_NOTE if last.get('engine') == 'claude' else None,
         'duration_s': round((common.now() - t0).total_seconds(), 1), 'subtype': last.get('subtype'),
         'is_error': last.get('is_error'),
         'permission_denials': sum(int(a.get('permission_denials') or 0) for a in attempts),
@@ -1803,7 +2274,18 @@ def build_receipt(spec: dict, attempts: list, trip: dict, t0, failover, notes, l
     }
     if survivor:  # only a receipt whose engine outlived the kill carries it; job_status and `twinlane stop` read it
         receipt['survivor'] = {k: survivor.get(k) for k in ('engine', 'pid', 'created', 'at')}
-    return receipt
+    if violation is True and receipt['status'] == 'done':
+        receipt['status'] = 'failed'
+        reason = ', '.join(touched[:10]) if touched else ('HEAD moved' if trip.get('head_moved') else
+                                                         'disallowed tools: ' + common.clip(str(disallowed), 500))
+        receipt['error'] = 'read-only job broke its rule: ' + reason
+    if disallowed and receipt['status'] == 'done':
+        receipt['status'] = 'failed'
+        receipt['error'] = 'job broke its guard: disallowed tools: ' + common.clip(str(disallowed), 500)
+    if receipt['status'] == 'done' and receipt['exit_code'] not in (None, 0):
+        receipt['status'] = 'failed'
+        receipt['error'] = f"{receipt['engine']} exited rc {receipt['exit_code']}"
+    return _finalize(receipt)
 
 
 # ---------------------------------------------------------------- planning a run
@@ -1821,6 +2303,8 @@ def _run_parser() -> argparse.ArgumentParser:
     ap.add_argument('--kind', help='default: code with --write, else intel')
     ap.add_argument('--engine', choices=('auto', 'claude', 'codex'), default='auto')
     ap.add_argument('--write', action='store_true')
+    ap.add_argument('--preserve-existing-metadata', action='store_true',
+                    help='retain pre-existing job handoffs and launch markers; uncertainty keeps holding')
     ap.add_argument('--bg', action='store_true')
     ap.add_argument('--model')
     ap.add_argument('--effort')
@@ -1833,20 +2317,44 @@ def _run_parser() -> argparse.ArgumentParser:
     ap.add_argument('--urgent', action='store_true')
     ap.add_argument('--name')
     ap.add_argument('--baton')
+    ap.add_argument('--owner', help='existing baton that collects this job')
     ap.add_argument('--task-id', help='opt-in stable CLI coordination task identity')
     ap.add_argument('--dispatch-id', help='idempotent request identity within --task-id')
     ap.add_argument('--actor', help='sender identity in the recorded delegation lineage')
     ap.add_argument('--recipient', help='implementation/worker identity receiving this dispatch')
     ap.add_argument('--parent-dispatch', help='recorded predecessor within the same task')
     ap.add_argument('--transition-receipt', help='host-recorded accepted review/handoff receipt identity')
+    ap.add_argument('--resume-owner', action='store_true',
+                    help="coordinator continues the current owner's own finished latest job (--continue-job)")
     ap.add_argument('--failover', action=argparse.BooleanOptionalAction, default=None)
     ap.add_argument('--dry-run', action='store_true')
     ap.add_argument('--json', action='store_true')
     return ap
 
 
+def _preserving_codex_binary(args) -> dict:
+    """The recorded identity of the one Codex binary a preserving start may run: TWINLANE_CODEX_BIN exactly as
+    the caller supplied it, qualified as a standalone file. No PATH or app discovery, private copy, lease,
+    prune or version cache, and no other engine to fall back to."""
+    if args.failover:
+        raise Refusal(common.EXIT_REFUSED, 'preserving Codex start never fails over to another engine; drop --failover')
+    if common.CODEX_RUN:
+        raise Refusal(common.EXIT_REFUSED, 'preserving Codex start refuses a TWINLANE_CODEX_RUN adapter: only the '
+                      'built-in runner verifies the qualified binary hand-off')
+    try:
+        return common.qualify_explicit_codex_bin(os.environ.get('TWINLANE_CODEX_BIN'))
+    except ValueError as e:
+        raise Refusal(common.EXIT_REFUSED, f'preserving Codex start refused: {e}. It needs TWINLANE_CODEX_BIN set to '
+                      'a standalone codex binary outside the app and twinlane bin folders') from e
+
+
 def plan_run(args, policy: dict) -> dict:
     """Everything `run` decides before creating anything (also the whole of --dry-run)."""
+    owner = getattr(args, 'owner', None)
+    _validate_owner(owner)
+    preserving = args.preserve_existing_metadata or _PRESERVING_METADATA.get()
+    if preserving and (args.continue_job or args.resume or args.baton or owner):
+        raise Refusal(common.EXIT_REFUSED, 'preserving start needs a fresh job without resume, continuation or baton updates')
     kind = args.kind or ('code' if args.write else 'intel')
     if kind not in policy.get('routing', {}):
         raise Refusal(common.EXIT_USAGE, f"unknown kind {kind!r}; kinds: {', '.join(policy.get('routing', {}))}")
@@ -1872,6 +2380,14 @@ def plan_run(args, policy: dict) -> dict:
     problem = brief_problem(brief)
     if problem:
         raise Refusal(common.EXIT_USAGE, f'brief {args.brief} is not readable text: {problem}')
+    if args.write and not args.dry_run:
+        from . import wip
+        try:
+            with wip.lock():
+                wip.check(cwd, 'run', args.name or common.clip(os.path.splitext(os.path.basename(args.brief))[0], 40), policy,
+                          argv=getattr(args, '_requeue_argv', []), preserve=preserving)
+        except (wip.WipError, TimeoutError) as e:
+            raise Refusal(common.EXIT_REFUSED, str(e)) from e
     forced = None if args.engine == 'auto' else args.engine
     # A dry run costs nothing: it never takes the automatic token refresh (a model call), it only says so.
     meter = _meter(policy, auto_refresh=forced != 'codex' and not args.dry_run)
@@ -1881,18 +2397,30 @@ def plan_run(args, policy: dict) -> dict:
         raise Refusal(common.EXIT_REFUSED, f"refused by policy: {d.get('reason')}" + (f'. {dry_note}' if dry_note else ''),
                       {'decision': d, 'wait_until': d.get('wait_until')})
     engine = d['engine']
+    codex_binary = _preserving_codex_binary(args) if preserving and engine == 'codex' else None
+    # A preserving start never looks up or probes app builds: its qualified binary has its own checks.
+    pf = common.codex_preflight(policy) if engine == 'codex' and not preserving else None
+    if pf and pf['refusal']:
+        raise Refusal(common.EXIT_REFUSED, 'codex CLI refused before dispatch: ' + pf['refusal'], {'codex': pf})
     profile = resolve_profile(kind, engine, d, policy, args.write)
     if profile == 'code':
         if not args.write:
             raise Refusal(common.EXIT_REFUSED, f'kind {kind} uses the code profile, which needs --write')
         if not common.is_linked_worktree(cwd):
             raise Refusal(common.EXIT_REFUSED, f'--write needs a LINKED worktree (git worktree add); {cwd} is not one')
+        why = writer_readiness(cwd, policy)
+        if why:
+            raise Refusal(common.EXIT_REFUSED, why)
     tier_name = codex_tier_model(args.model, policy) if engine == 'codex' else None
     if tier_name:
         raise Refusal(common.EXIT_USAGE, f'--model {args.model} is a Codex tier; use --tier {tier_name}')
     params = engine_params(engine, kind, d, policy, profile, args.model, args.effort, args.tier, args.timeout,
                            args.max_turns)
     notes, resume, resume_jobs = [], args.resume, []
+    if pf:
+        notes.append(f"codex CLI {pf['version'] or 'unknown'} ({pf['origin']})")
+        if pf['note']:
+            notes.append(pf['note'])
     caller_brief = brief  # before any continue-job context is appended: `twinlane resume` re-runs from this
     if resume and engine == 'claude':  # a codex run ignores --resume, so only a Claude resume needs the guard
         resume_jobs, truncated = _session_owners(resume)
@@ -1933,11 +2461,17 @@ def plan_run(args, policy: dict) -> dict:
         notes.append(f'{src} ignored: resume is Claude-only and the engine is {engine}')
         resume = None
     failover = args.failover if args.failover is not None else args.engine == 'auto'
-    return {'kind': kind, 'cwd': cwd, 'brief_src': os.path.abspath(args.brief), 'brief_text': brief,
+    if codex_binary is not None:
+        failover = False  # a preserving Codex start never falls back to another engine
+    return {'kind': kind, 'cwd': cwd, **({'writer_root': common.writer_key(cwd)} if profile == 'code' else {}),
+            'brief_src': os.path.abspath(args.brief), 'brief_text': brief,
             'caller_brief': caller_brief, 'decision': d, 'meter_before': meter, 'engine': engine, 'profile': profile, 'primary': params,
             'resume': resume, 'resume_jobs': resume_jobs, 'continue_job': prior['id'] if prior else None,
             'failover': failover,
-            'write': bool(args.write), 'urgent': bool(args.urgent), 'baton': args.baton,
+            'write': bool(args.write), 'urgent': bool(args.urgent), 'baton': args.baton, 'owner': owner,
+            **({'preserve_existing_metadata': True}
+               if args.preserve_existing_metadata or _PRESERVING_METADATA.get() else {}),
+            **({'codex_binary': codex_binary} if codex_binary is not None else {}),
             'timeout_override': args.timeout, 'notes': notes,
             'name': args.name or common.clip(os.path.splitext(os.path.basename(args.brief))[0], 40)}
 
@@ -2387,6 +2921,19 @@ def _coordination_parent():
 
 
 def create_job(plan: dict) -> str:
+    _validate_owner(plan.get('owner'))
+    if plan.get('write') or plan.get('profile') == 'code':
+        from . import wip
+        try:
+            with wip.admission(plan['cwd'], 'run', plan.get('name') or plan.get('baton') or 'writer',
+                               preserve=plan.get('preserve_existing_metadata') is True):
+                return _admitted_job(plan)
+        except (wip.WipError, TimeoutError) as e:
+            raise Refusal(common.EXIT_REFUSED, str(e)) from e
+    return _admitted_job(plan)
+
+
+def _admitted_job(plan: dict) -> str:
     parent_spec = _coordination_parent()
     if plan.get('coordination') is None:
         if parent_spec is not None and parent_spec.get('coordination') is not None:
@@ -2414,12 +2961,13 @@ def _create_job(plan: dict, reserved_id: str | None = None) -> str:
     else:
         raise RuntimeError('could not allocate a job id')
     spec = dict(plan, id=jid, created_at=common.iso(common.now()), writer_reservation_version=1)
-    common.write_text(_p(jid, 'brief.md'), compose_brief(jid, plan['engine'], plan['profile'], plan['brief_text']))
+    _write_job_text(jid, 'brief.md', compose_brief(jid, plan['engine'], plan['profile'], plan['brief_text']))
     if isinstance(plan.get('caller_brief'), str):
-        common.write_text(_p(jid, CALLER_BRIEF), plan['caller_brief'])
-    common.write_json(_p(jid, 'job.json'), spec)
-    common.write_json(_p(jid, 'status.json'), {'status': 'queued', 'pid': None, 'engine': plan['engine'],
+        _write_job_text(jid, CALLER_BRIEF, plan['caller_brief'])
+    _write_job_json(jid, 'job.json', spec)
+    _write_job_json(jid, 'status.json', {'status': 'queued', 'pid': None, 'engine': plan['engine'],
                                                'created_at': spec['created_at']})
+    _notify_owner(spec, dict(id=jid, engine=plan['engine'], status='queued'))
     return jid
 
 
@@ -2449,6 +2997,10 @@ def _coordination_intent(args, envelope):
     if not os.path.isfile(args.brief):
         raise Refusal(common.EXIT_USAGE, f'brief not found: {args.brief}')
     intent = {name: getattr(args, name) for name in CALLER_INTENT_FIELDS}
+    if getattr(args, 'owner', None) is not None:
+        intent['owner'] = args.owner
+    if args.preserve_existing_metadata or _PRESERVING_METADATA.get():
+        intent['preserve_existing_metadata'] = True
     intent.update(cwd=os.path.abspath(args.cd) if args.cd else None,
                   brief_text=_read_text(args.brief), coordination=envelope)
     return intent
@@ -2463,29 +3015,58 @@ def _coordination_replay_result(jid, as_json):
 
 
 def cmd_run(argv) -> int:
+    # Enter before planning/replay: neither a refusal nor dry-run may sweep old handoffs.
+    mode = _PRESERVING_METADATA.set(_PRESERVING_METADATA.get() or '--preserve-existing-metadata' in argv)
+    owner = _CURRENT_JOB.set(None)
+    try:
+        return _cmd_run(argv)
+    finally:
+        _CURRENT_JOB.reset(owner)
+        _PRESERVING_METADATA.reset(mode)
+
+
+def _cmd_run(argv) -> int:
     args = _parse(_run_parser(), argv)
     if isinstance(args, int):
         return args
+    args._requeue_argv = ['run'] + list(argv)
+    # argparse accepts unambiguous long-option abbreviations. Activate the parsed
+    # mode before parent/replay/sweep/planning effects, not just the raw spelling.
+    if args.preserve_existing_metadata:
+        _PRESERVING_METADATA.set(True)
     try:
+        _validate_owner(args.owner)
         parent = _coordination_parent()
+        if parent is not None and 'preserve_existing_metadata' in parent \
+                and type(parent['preserve_existing_metadata']) is not bool:
+            raise Refusal(common.EXIT_REFUSED, 'parent metadata preservation mode is malformed; no sweep or launch')
+        if parent is not None and parent.get('preserve_existing_metadata') is True:
+            _PRESERVING_METADATA.set(True)
         values = (args.task_id, args.dispatch_id, args.actor, args.recipient,
                   args.parent_dispatch, args.transition_receipt)
         envelope = intent = None
+        if args.resume_owner and args.task_id is None:
+            raise Refusal(common.EXIT_REFUSED, '--resume-owner needs a coordination task (--task-id ...)')
         if any(value is not None for value in values):
             if not all(values[:4]):
                 raise Refusal(common.EXIT_REFUSED, 'coordination requires task, dispatch, actor and recipient')
             envelope = dict(task=args.task_id, dispatch=args.dispatch_id, actor=args.actor,
                             recipient=args.recipient, parent=args.parent_dispatch, receipt=args.transition_receipt)
+            if args.resume_owner:  # added only when asked, so existing envelopes keep their fingerprints
+                envelope['resume_owner'] = True
             intent = _coordination_intent(args, envelope)
             args._coordination_brief_snapshot = intent['brief_text']
             if not args.dry_run:
                 from . import coordination
                 existing = coordination.replay({'coordination': envelope, 'caller_intent': intent})
                 if existing:
+                    if _PRESERVING_METADATA.get():
+                        raise Refusal(common.EXIT_REFUSED, 'existing dispatch is protected; preserving start will not replay it')
                     return _coordination_replay_result(existing, args.json)
         elif parent is not None and parent.get('coordination') is not None:
             raise Refusal(common.EXIT_REFUSED, 'coordinated workers cannot drop task identity')
-        envhandoff.sweep(common.JOBS, HANDOFF)
+        if not _PRESERVING_METADATA.get():
+            envhandoff.sweep(common.JOBS, HANDOFF)
         policy = common.load_policy()
         plan = plan_run(args, policy)
         if envelope is not None:
@@ -2537,7 +3118,10 @@ def cmd_run(argv) -> int:
 
 def _start_background(jid: str, plan: dict, as_json: bool) -> int:
     try:
-        d = common.spawn_detached_ex([sys.executable, common.TWINLANE_PY, '_job', jid], cwd=common.ROOT,
+        runner_argv = [sys.executable, common.TWINLANE_PY, '_job', jid]
+        if plan.get('preserve_existing_metadata') is True:
+            runner_argv.append('--preserve-existing-metadata')
+        d = common.spawn_detached_ex(runner_argv, cwd=common.ROOT,
                                      log_path=_p(jid, 'runner.log'), require_survival=True,
                                      handoff=_p(jid, HANDOFF))
         if not d.get('created'):
@@ -2549,9 +3133,9 @@ def _start_background(jid: str, plan: dict, as_json: bool) -> int:
                       f'`twinlane wait {jid}` before starting this work again.')
             spec = common.read_json(_p(jid, 'job.json'), {}) or {}
             spec['detach'] = {'mode': 'ambiguous', 'error': str(e)}
-            common.write_json(_p(jid, 'job.json'), spec)
+            _write_job_json(jid, 'job.json', spec)
             if e.pid and e.created:  # never an unstamped pid: `twinlane stop` could kill a reused one
-                common.write_text(_p(jid, 'runner.pid'), f'{e.pid} {e.created}')
+                _write_job_text(jid, 'runner.pid', f'{e.pid} {e.created}')
             common.emit({'id': jid, 'refused': True, 'status': 'unknown', 'reason': reason}, as_json)
             if not as_json:
                 print(f'twinlane run: {reason}', file=sys.stderr)
@@ -2559,10 +3143,10 @@ def _start_background(jid: str, plan: dict, as_json: bool) -> int:
         return _refuse_background(jid, plan, as_json, e)
     except common.DetachError as e:
         return _refuse_background(jid, plan, as_json, e)
-    common.write_text(_p(jid, 'runner.pid'), f"{d['pid']} {d['created']}")
+    _write_job_text(jid, 'runner.pid', f"{d['pid']} {d['created']}")
     spec = common.read_json(_p(jid, 'job.json'), {}) or {}
     spec['detach'] = {'mode': d['mode'], 'job': d['job']}
-    common.write_json(_p(jid, 'job.json'), spec)
+    _write_job_json(jid, 'job.json', spec)
     note = '' if d['mode'] in ('wmi', 'posix') else \
         '\nnote: started by the caller, maybe still inside one of its job objects; it can die with that job'
     note += ''.join(f'\nnote: {n}' for n in plan['notes'])
@@ -2577,19 +3161,40 @@ def _refuse_background(jid: str, plan: dict, as_json: bool, e: Exception) -> int
     advice = ('Launch identity retained; report this refusal to the task coordinator, do not replay inline.'
               if plan.get('coordination') else 'Run without --bg (inline), or start twinlane from a normal terminal.')
     reason = f'--bg refused: {e}. {advice}'
-    common.write_json(_p(jid, 'result.json'), {'id': jid, 'status': 'refused', 'engine': plan['engine'],
-                                               'error': reason, 'attempts': [], 'notes': [reason]})
-    common.emit({'id': jid, 'refused': True, 'reason': reason}, as_json)
+    receipt = {'id': jid, 'status': 'refused', 'engine': plan['engine'], 'error': reason, 'attempts': [],
+               'notes': [reason]}
+    # No runner started, but the receipt still has one writer: the runner role, which a concurrent
+    # `twinlane stop` takes too. A role that cannot be taken, or is held, means no receipt (fail closed).
+    try:
+        holder = _claim_runner(jid)
+    except (OSError, TimeoutError) as error:
+        holder, unwritten = False, f'the runner role could not be taken ({type(error).__name__})'
+    else:
+        unwritten = f'runner pid {holder[0]} holds the job' if holder else None
+    if holder is None:
+        try:
+            if common.read_json(_p(jid, 'result.json')) is None:
+                _write_receipt(jid, receipt)
+        finally:
+            _release_runner(jid)
+    payload = {'id': jid, 'refused': True, 'reason': reason}
+    if unwritten:
+        payload['receipt'] = f'not written: {unwritten}'
+    common.emit(payload, as_json)
     if not as_json:
-        print(f'twinlane run: {reason}', file=sys.stderr)
+        print(f'twinlane run: {reason}' + (f' No receipt written: {unwritten}.' if unwritten else ''),
+              file=sys.stderr)
     return common.EXIT_REFUSED
 
 
 def cmd_job(argv) -> int:
+    preserve = len(argv) == 2 and argv[-1] == '--preserve-existing-metadata'
+    if preserve:
+        argv = argv[:-1]
     if len(argv) != 1:
         print('usage: twinlane _job JOB', file=sys.stderr)
         return common.EXIT_USAGE
-    receipt = run_job(argv[0])
+    receipt = run_job(argv[0], preserve_existing_metadata=True) if preserve else run_job(argv[0])
     if receipt.get('duplicate_runner'):
         print(f"twinlane _job: {receipt['notes'][0]}", file=sys.stderr)
         return common.EXIT_REFUSED
@@ -2597,6 +3202,9 @@ def cmd_job(argv) -> int:
 
 
 def cmd_jobs(argv) -> int:
+    if argv[:1] == ['archive']:
+        from . import archive
+        return archive.cli(argv[1:])
     as_json, show_all = '--json' in argv, '--all' in argv
     envhandoff.sweep(common.JOBS, HANDOFF)
     rows = list_jobs(limit=None if show_all else 20)
@@ -2628,7 +3236,16 @@ def cmd_wait(argv) -> int:
         return common.EXIT_USAGE
     deadline = None if args.timeout is None else time.monotonic() + args.timeout
     while True:
+        repairs = {}
+        for j in ids:
+            repair_owner(j)
+            # Only a terminal receipt has a recheck to reject; a job without one (lost) keeps its own status.
+            receipt = common.read_json(_p(j, 'result.json'))
+            repairs[j] = (_repair_finished_status(j) if isinstance(receipt, dict)
+                          and receipt.get('status') in TERMINAL else None)
         statuses = {j: job_status(j) for j in ids}
+        statuses = {j: 'unknown' if repairs[j] == 'rejected' and s in TERMINAL else s
+                    for j, s in statuses.items()}
         finished = [j for j, s in statuses.items() if s in TERMINAL]
         if (args.any and finished) or len(finished) == len(ids):
             _print_statuses(statuses, args.json, timed_out=False, finished=finished, any_mode=args.any, timeout=args.timeout)
@@ -2647,7 +3264,7 @@ def mark_collected(job_id: str) -> None:
     """Record that the receipt was read, so `twinlane board` can tell "finished, not yet read". Best effort: a
     read-only disk must not make `twinlane result` fail after it has printed."""
     try:
-        common.write_text(_p(job_id, COLLECTED), common.iso(common.now()) + '\n')
+        _write_job_text(job_id, COLLECTED, common.iso(common.now()) + '\n')
     except OSError:
         pass
 
@@ -2670,10 +3287,32 @@ def cmd_result(argv) -> int:
         status = job_status(jid)
         common.emit({'id': jid, 'status': status}, args.json, f'{jid}: {status} (no receipt yet; twinlane wait {jid})')
         return common.EXIT_RUNNING if status not in TERMINAL else common.EXIT_FAILED
+    repair_owner(jid)
+    # Only a terminal receipt has a recheck to reject; a running receipt prints as before.
+    repair = _repair_finished_status(jid) if receipt.get('status') in TERMINAL else None
+    if repair == 'rejected':
+        status = job_status(jid)
+        receipt = dict(receipt, effective_status='unknown' if status in TERMINAL else status,
+                       status_repair='rejected')
+        _print_result(receipt, args.json, full=args.full)
+        if not args.json:
+            print(f'{jid}: finished-status recheck rejected; custody remains unresolved', file=sys.stderr)
+        return common.EXIT_RUNNING
     _print_result(receipt, args.json, full=args.full)
     if receipt.get('status') in TERMINAL:  # a running receipt will be replaced by the real result
         mark_collected(jid)
     return common.EXIT_OK
+
+
+def _request_stop(jid):
+    # First, so a runner that has not recorded its pid still launches nothing.
+    def write(path):
+        with open(path, 'x', encoding='utf-8') as handle:
+            handle.write(common.iso(common.now()) or '')
+    try:
+        _write_job_file(jid, STOP_REQUESTED, write)
+    except FileExistsError:
+        pass
 
 
 def cmd_stop(argv) -> int:
@@ -2688,19 +3327,21 @@ def cmd_stop(argv) -> int:
     except LookupError as e:
         print(f'twinlane stop: {e}', file=sys.stderr)
         return common.EXIT_USAGE
-    # First, so a runner that has not recorded its pid yet still launches nothing.
-    try:
-        fd = os.open(_p(jid, STOP_REQUESTED), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-        with os.fdopen(fd, 'w', encoding='ascii') as h:
-            h.write(common.iso(common.now()) or '')
-    except FileExistsError:
-        pass
+    _request_stop(jid)
     spec = common.read_json(_p(jid, 'job.json'), {}) or {}
     existing = common.read_json(_p(jid, 'result.json'))
-    if isinstance(existing, dict):
+    # Only a terminal receipt means finished; a running receipt is stopped like any live job.
+    if isinstance(existing, dict) and existing.get('status') in TERMINAL:
+        repair = _repair_finished_status(jid)
         survivor = _survivor(jid)
         if survivor and _survivor_state(survivor) != common.DEAD:
             return _stop_survivor(jid, existing, survivor, args.json)
+        if repair == 'rejected':
+            status = job_status(jid)
+            common.emit({'id': jid, 'status': 'unknown' if status in TERMINAL else status,
+                         'already_finished': False, 'status_repair': 'rejected'}, args.json,
+                        f'{jid}: finished-status recheck rejected; custody remains unresolved')
+            return common.EXIT_RUNNING
         _baton(spec.get('baton'), existing)  # its baton may still list it as running: sync from the receipt
         common.emit({'id': jid, 'status': existing.get('status'), 'already_finished': True}, args.json,
                     f"{jid}: already finished ({existing.get('status')})")
@@ -2732,36 +3373,70 @@ def cmd_stop(argv) -> int:
     for pid, created in targets:
         if not pid or int(pid) == os.getpid() or created in (None, '') or not common.pid_alive(pid, created):
             continue
-        (killed if common.kill_tree(pid, created) else failed).append(int(pid))
-    existing = common.read_json(_p(jid, 'result.json'))
-    if isinstance(existing, dict):  # the runner finished while we were stopping it: keep its receipt
-        _baton(spec.get('baton'), existing)
-        common.emit({'id': jid, 'status': existing.get('status'), 'already_finished': True, 'killed_pids': killed},
-                    args.json, f"{jid}: finished before the stop took effect ({existing.get('status')})")
-        return common.EXIT_OK
-    alive = [pid for pid, created in targets
-             if pid and int(pid) in failed and common.pid_maybe_alive(pid, created)]
-    if alive:  # a stopped receipt now would be a lie: the job (and its baton item) stays live
+        if common.kill_tree(pid, created):
+            killed.append(int(pid))
+            _pid_gone(pid, created)  # a kill is asynchronous: give the process its grace to be gone
+        else:
+            failed.append(int(pid))
+    alive = [int(pid) for pid, created in targets
+             if pid and int(pid) != os.getpid() and common.pid_maybe_alive(pid, created)]
+    if runner[0] and int(runner[0]) in alive:
+        return _stop_requested_only(jid, f'runner pid {runner[0]} is still alive after the kill', killed, failed,
+                                    alive, args.json)
+    if alive:  # the runner is gone but its engine is not: a stopped receipt now would be a lie
         msg = (f'{jid}: stop FAILED: pid {", ".join(map(str, alive))} is still alive after the kill; no receipt '
                f'written, job left running. {STOP_REQUESTED} is set, so a twinlane runner launches no further '
                f'attempt. Retry `twinlane stop {jid}` or end the process by hand.')
         common.emit({'id': jid, 'status': 'stop_failed', 'kill_failed_pids': failed, 'alive_pids': alive,
                      'killed_pids': killed}, args.json, msg)
         return common.EXIT_FAILED
-    receipt = {'id': jid, 'name': spec.get('name'), 'kind': spec.get('kind'), 'cwd': spec.get('cwd'),
-               'status': 'stopped', 'engine': st.get('engine') or (spec.get('primary') or {}).get('engine'),
-               'requested': {k: (spec.get('primary') or {}).get(k) for k in ('model', 'effort', 'tier', 'profile')},
-               'served_models': [], 'session_id': None, 'attempts': [], 'killed_pids': killed,
-               'kill_failed_pids': failed, 'stopped_at': common.iso(common.now()), 'final_path': None,
-               'events_path': None, 'baton': spec.get('baton'),
-               'notes': ['stopped by twinlane stop; partial output may be in the job folder']}
-    common.write_json(_p(jid, 'result.json'), receipt)
-    err = _baton(spec.get('baton'), receipt)  # the runner is gone, so nothing else clears its in-flight item
-    if err:
-        receipt['notes'].append(f'baton end: {err}')
-        common.write_json(_p(jid, 'result.json'), receipt)
+    # Single-writer receipt: only the holder of the runner role writes result.json. Take it the way a runner does
+    # (a lock naming a dead runner is stale), so no runner can publish while this writes, and a runner that starts
+    # later finds the receipt and exits.
+    try:
+        holder = _claim_runner(jid)
+    except (OSError, TimeoutError) as e:
+        return _stop_requested_only(jid, f'the runner role could not be taken ({type(e).__name__})', killed,
+                                    failed, [], args.json)
+    if holder:
+        return _stop_requested_only(jid, f'runner pid {holder[0]} holds the job', killed, failed, [holder[0]],
+                                    args.json)
+    try:
+        existing = common.read_json(_p(jid, 'result.json'))
+        if isinstance(existing, dict) and existing.get('status') in TERMINAL:  # finished while we were stopping it
+            _baton(spec.get('baton'), existing)
+            common.emit({'id': jid, 'status': existing.get('status'), 'already_finished': True,
+                         'killed_pids': killed}, args.json,
+                        f"{jid}: finished before the stop took effect ({existing.get('status')})")
+            return common.EXIT_OK
+        receipt = {'id': jid, 'name': spec.get('name'), 'kind': spec.get('kind'), 'cwd': spec.get('cwd'),
+                   'status': 'stopped', 'engine': st.get('engine') or (spec.get('primary') or {}).get('engine'),
+                   'requested': {k: (spec.get('primary') or {}).get(k)
+                                 for k in ('model', 'effort', 'tier', 'profile')},
+                   'served_models': [], 'session_id': None, 'attempts': [], 'killed_pids': killed,
+                   'kill_failed_pids': failed, 'stopped_at': common.iso(common.now()), 'final_path': None,
+                   'events_path': None, 'baton': spec.get('baton'),
+                   'notes': ['stopped by twinlane stop; partial output may be in the job folder']}
+        _write_receipt(jid, receipt)
+        err = _baton(spec.get('baton'), receipt)  # the runner is gone, so nothing else clears its in-flight item
+        if err:
+            receipt['notes'].append(f'baton end: {err}')
+            _write_receipt(jid, receipt)
+    finally:
+        _release_runner(jid)
     common.emit(receipt, args.json, f"{jid}: stopped (killed {killed or 'nothing alive'})")
     return common.EXIT_OK
+
+
+def _stop_requested_only(jid: str, why: str, killed: list, failed: list, alive: list, as_json: bool) -> int:
+    """`twinlane stop` while a runner may still be alive: it writes no receipt (only the runner role does). The
+    request stays set, so that runner launches nothing further and records the outcome itself."""
+    msg = (f'{jid}: stop REQUESTED, not confirmed: {why}; no receipt written. {STOP_REQUESTED} is set, so the '
+           f'runner launches no further attempt and records the outcome itself. Check `twinlane wait {jid}`, or '
+           f'retry `twinlane stop {jid}`.')
+    common.emit({'id': jid, 'status': 'stop_requested', 'killed_pids': killed, 'kill_failed_pids': failed,
+                 'alive_pids': alive}, as_json, msg)
+    return common.EXIT_RUNNING
 
 
 def _stop_survivor(jid: str, receipt: dict, survivor: dict, as_json: bool) -> int:
@@ -2800,17 +3475,18 @@ def _parse(ap: argparse.ArgumentParser, argv):
 # ---------------------------------------------------------------- listing / status
 
 def _job_ids() -> list[str]:
-    try:
-        return sorted((d for d in os.listdir(common.JOBS) if os.path.isdir(os.path.join(common.JOBS, d))),
-                      reverse=True)
-    except OSError:
-        return []
+    return observations.job_ids()
 
 
 def resolve_job(ref: str) -> str:
     ids = _job_ids()
     if ref in ids:
         return ref
+    from . import archive
+    archived = archive.archived_ids()
+    if ref in archived:
+        return ref
+    ids += sorted(archived, reverse=True)
     hits = [j for j in ids if ref in j]
     if len(hits) == 1:
         return hits[0]
@@ -2820,11 +3496,158 @@ def resolve_job(ref: str) -> str:
 def _runner_pid(job_id: str) -> tuple[int | None, int | None]:
     """(pid, creation stamp) from runner.pid ("<pid> <created>"; older files hold only the pid)."""
     parts = _read_text(_p(job_id, 'runner.pid')).split()
+    if _PRESERVING_METADATA.get():
+        if len(parts) != 2 or len(parts[0]) > 10 or len(parts[1]) > 20 \
+                or not all(p.isascii() and p.isdigit() for p in parts):
+            return None, None
+        pid, created = int(parts[0]), int(parts[1])
+        return (pid, created) if common._valid_pid(pid) and common._valid_stamp(created) else (None, None)
     pid = int(parts[0]) if parts and parts[0].isdigit() else None
     created = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
     return pid, created
 
 
+def _receipt_observed_child_exit(receipt, st) -> bool:
+    """Recognize an observed engine exit, never a synthetic launch/stop exit code.
+
+    Both done and failed receipts need the final attempt's post-wait evidence tied
+    to the recorded child's attempt. This proves only that child's exit;
+    descendants remain subject to the survivor marker.
+    """
+    if not isinstance(receipt, dict) or receipt.get('status') not in ('done', 'failed') \
+            or type(receipt.get('exit_code')) is not int or 'survivor' in receipt:
+        return False
+    if receipt['status'] == 'done' and receipt['exit_code'] != 0:
+        return False
+    attempts = receipt.get('attempts')
+    if not isinstance(attempts, list) or not attempts or not isinstance(attempts[-1], dict):
+        return False
+    last = attempts[-1]
+    return isinstance(st, dict) and type(st.get('attempt')) is int and st['attempt'] > 0 \
+        and type(last.get('n')) is int and last['n'] == st['attempt'] \
+        and (last.get('engine') is None or st.get('engine') is None or last['engine'] == st['engine']) \
+        and last.get('status') in ('done', 'failed') and type(last.get('exit_code')) is int \
+        and last['exit_code'] == receipt['exit_code'] and isinstance(last.get('events_path'), str) \
+        and bool(last['events_path']) and 'survivor' not in last
+
+
+def _finished_child_pid_reused(job_id: str, st: dict, receipt=None) -> bool:
+    """An exited child cannot own a later inaccessible process with its old pid.
+
+    This exception applies only to unreadable creation identity, with a qualified
+    completion and a DEAD runner. Unknown existence, launch uncertainty, survivors
+    and a readable matching identity retain the ordinary blocking rules.
+    """
+    receipt = common.read_json(_p(job_id, 'result.json')) if receipt is None else receipt
+    if not _receipt_observed_child_exit(receipt, st) or os.path.exists(_p(job_id, SURVIVOR)) \
+            or os.path.exists(_p(job_id, CHILD_STARTING)):
+        return False
+    pid, created = (st.get('pid'), st.get('pid_created')) if st.get('pid') else _runner_pid(job_id)
+    child, stamp = st.get('child_pid'), st.get('child_created')
+    if not all((common._valid_pid(pid), common._valid_stamp(created),
+                common._valid_pid(child), common._valid_stamp(stamp))) \
+            or _pid_state(pid, created) != common.DEAD:
+        return False
+    obs = common.observe_process(child, stamp)
+    return obs.get('state') == common.UNKNOWN and obs.get('exists') is True \
+        and obs.get('actual_created') is None and obs.get('pid') == child \
+        and obs.get('expected_created') == str(stamp)
+
+
+def _receipt_status(job_id: str, receipt: dict) -> str:
+    """A receipt cannot hide a child left in an unfinished status record.
+
+    Cleanly finalized jobs keep their cheap receipt path. An unfinished record needs
+    proof that the engine is gone; a runner may still be finishing receipt cleanup.
+    Call under observations.scope() so launch markers are observed, never reclaimed.
+    """
+    if os.path.exists(_p(job_id, SURVIVOR)):
+        survivor = _survivor(job_id)
+        if survivor is None:
+            return 'unknown'
+        state = _survivor_state(survivor)
+        if state != common.DEAD:
+            return 'orphaned' if state == common.ALIVE else 'unknown'
+    if _child_pending(job_id):
+        return 'unknown'
+    path = _p(job_id, 'status.json')
+    st = common.read_json(path)
+    if (st is None and os.path.exists(path)) or (st is not None and not isinstance(st, dict)):
+        return 'unknown'
+    if receipt.get('status') in TERMINAL and st is not None and st.get('status') not in TERMINAL:
+        pid, created = (st.get('pid'), st.get('pid_created')) if st.get('pid') else _runner_pid(job_id)
+        runner = _pid_state(pid, created)
+        if runner == common.UNKNOWN:
+            return 'unknown'
+        engine = _engine_state(job_id, st)
+        if engine != common.DEAD:
+            if engine == common.UNKNOWN and runner == common.DEAD \
+                    and _finished_child_pid_reused(job_id, st, receipt):
+                return receipt['status']
+            if engine == common.UNKNOWN:
+                return 'unknown'
+            return (st.get('status') or 'running') if runner == common.ALIVE else 'orphaned'
+    return receipt.get('status') or 'failed'
+
+
+def _repair_finished_status(job_id: str, *, require_dead_runner=False) -> str:
+    """Repair only on claim/wait/result/stop, after rechecking under status.lock.
+
+    Preserve the recorded identities: the caller is collecting a finished job, not
+    becoming its runner. Observation commands and protected metadata never write.
+    Return repaired, already-final (final receipt, no repair needed or runner
+    still finishing its own cleanup), unrepaired (acceptable evidence evaluated
+    read-only in preserving/observing mode), or rejected. Rejection
+    is never writer clearance, including when evidence changes under status.lock.
+    Writer admission requires a DEAD runner even when receipt collection can
+    already complete while that runner finishes its own cleanup.
+    """
+    read_only = _preserve_job(job_id) or observations.active()
+    def outcome(receipt, st):
+        if not isinstance(receipt, dict) or receipt.get('status') not in TERMINAL \
+                or (st is not None and not isinstance(st, dict)):
+            return 'rejected'
+        if st is None or st.get('status') in TERMINAL:
+            if not require_dead_runner and st and st.get('runner_finalized') is True \
+                    and st.get('status') == receipt['status'] and 'survivor' not in receipt \
+                    and not any(os.path.exists(_p(job_id, marker)) for marker in (CHILD_STARTING, SURVIVOR)):
+                return 'already-final'
+            with observations.scope():
+                if _writer_job_busy(job_id):
+                    return 'rejected'
+                if require_dead_runner:
+                    current = st or {}
+                    pid, created = ((current.get('pid'), current.get('pid_created'))
+                                    if current.get('pid') else _runner_pid(job_id))
+                    if _pid_state(pid, created) != common.DEAD:
+                        return 'rejected'
+            return 'already-final'
+        pid, created = (st.get('pid'), st.get('pid_created')) if st.get('pid') else _runner_pid(job_id)
+        with observations.scope():
+            runner = _pid_state(pid, created)
+            if (runner == common.DEAD or (runner == common.ALIVE and not require_dead_runner)) \
+                    and _receipt_status(job_id, receipt) == receipt['status']:
+                return 'repairable' if runner == common.DEAD else 'already-final'
+        return 'rejected'
+    receipt = common.read_json(_p(job_id, 'result.json'))
+    st = common.read_json(_p(job_id, 'status.json'))
+    decision = outcome(receipt, st)
+    if read_only:
+        return 'rejected' if decision == 'rejected' else 'unrepaired'
+    if decision != 'repairable':
+        return decision
+    with lifecycle_lock(job_id, 'status.lock'):
+        receipt = common.read_json(_p(job_id, 'result.json'))
+        st = common.read_json(_p(job_id, 'status.json'))
+        decision = outcome(receipt, st)
+        if decision != 'repairable':
+            return decision
+        st.update(status=receipt['status'], updated_at=common.iso(common.now()))
+        _write_job_json(job_id, 'status.json', st)
+        return 'repaired'
+
+
+@observations.command
 def job_status(job_id: str) -> str:
     """The job's state. alive -> its recorded status; dead -> the receipt, else `orphaned` (runner gone, engine
     child alive) or `lost`; exists but identity unreadable -> `unknown`, never `lost` (a sandbox cannot read
@@ -2832,14 +3655,7 @@ def job_status(job_id: str) -> str:
     kill reads `orphaned` until that process is gone."""
     r = common.read_json(_p(job_id, 'result.json'))
     if isinstance(r, dict):
-        s = _survivor(job_id)  # the only process probe a receipt ever costs, and only after a failed kill
-        if s:
-            state = _survivor_state(s)
-            if state != common.DEAD:
-                return 'orphaned' if state == common.ALIVE else 'unknown'
-        if _child_pending(job_id):
-            return 'unknown'
-        return r.get('status') or 'failed'
+        return _receipt_status(job_id, r)
     st = common.read_json(_p(job_id, 'status.json'), {}) or {}
     if not isinstance(st, dict) and _child_pending(job_id):
         return 'unknown'
@@ -2854,9 +3670,7 @@ def job_status(job_id: str) -> str:
         # The runner may have just written result.json and exited.
         r = common.read_json(_p(job_id, 'result.json')) or {}
         if r.get('status'):
-            if _child_pending(job_id):
-                return 'unknown'
-            return r['status']
+            return _receipt_status(job_id, r)
         # Runner gone but its engine child still running: not finished, and not safe to redo.
         engine = _engine_state(job_id, st)  # the child in status.json, or a survivor.json written before a crash
         return 'orphaned' if engine == common.ALIVE else 'unknown' if engine == common.UNKNOWN else 'lost'
@@ -2866,12 +3680,13 @@ def job_status(job_id: str) -> str:
     return 'lost' if age is not None and age > QUEUED_WITHOUT_PID_LOST_S else status
 
 
+@observations.command
 def list_jobs(limit: int | None = 20) -> list[dict]:
     rows = []
     for jid in _job_ids()[:limit] if limit else _job_ids():
-        spec = common.read_json(_p(jid, 'job.json'), {}) or {}
-        r = common.read_json(_p(jid, 'result.json'))
-        st = common.read_json(_p(jid, 'status.json'), {}) or {}
+        spec = observations.job_json(jid, default={}) or {}
+        r = observations.job_json(jid, 'result.json')
+        st = observations.job_json(jid, 'status.json', {}) or {}
         prim = spec.get('primary') or {}
         started = (r or {}).get('started_at') or st.get('started_at') or spec.get('created_at')
         served = (r or {}).get('served_models') or []
@@ -2971,13 +3786,28 @@ def usage_lines(receipt: dict) -> list[str]:
 
 
 def _print_result(receipt: dict, as_json: bool, full: bool, max_lines: int = FINAL_LINES) -> None:
-    final = _read_text(receipt['final_path']) if receipt.get('final_path') else ''
+    path = receipt.get('final_path')
+    if path:
+        old_root = os.path.join(common.JOBS, receipt['id'])
+        try:
+            relative = os.path.relpath(path, old_root)
+        except ValueError:  # an external final path on another Windows drive
+            relative = None
+        if relative is not None and relative != os.pardir \
+                and not relative.startswith(os.pardir + os.sep) and not os.path.isabs(relative):
+            path = os.path.join(job_dir(receipt['id']), relative)
+    final = _read_text(path) if path else ''
     if as_json:
         common.emit(dict(receipt, final_text=final), True)
         return
     print(f"{receipt['id']}  status={receipt['status']}  engine={receipt.get('engine')}")
+    if receipt.get('error'):
+        print(f"error: {receipt['error']}")
+    if receipt.get('finished_at'):
+        print(f"finished: {receipt['finished_at']}")
     print('models: ' + _attempt_models(receipt))
-    print(f"session={receipt.get('session_id') or '-'}  turns={receipt.get('num_turns')}  "
+    print(f"session={receipt.get('session_id') or '-'}  model_calls={receipt.get('model_calls')}  "
+          f"cli_turns={receipt.get('num_turns')}  "
           f"duration={receipt.get('duration_s')}s  denials={receipt.get('permission_denials')}  "
           f"touched={len(receipt['touched_files']) if receipt.get('touched_files') is not None else '?'}  "
           f"read_only_violation={receipt.get('read_only_violation')}")

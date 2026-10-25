@@ -51,8 +51,8 @@ def make_link(link, target):
 
 def remove_link(path):
     """Remove a link itself; never touches what it points at."""
-    if os.path.isdir(path):
-        os.rmdir(path)  # a directory link: removes the link only
+    if IS_WIN and os.path.isdir(path):
+        os.rmdir(path)  # a directory link or junction: removes the link only
     else:
         os.unlink(path)
 

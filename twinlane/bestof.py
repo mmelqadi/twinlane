@@ -321,9 +321,10 @@ def _assign_places(plan: dict, group_id: str) -> None:
 
 def _setup_worktree(plan: dict, group_id: str, c: dict) -> str | None:
     """Create the contestant's worktree (and run wt.setup_command). Returns an error text or None."""
+    from . import wip
     try:
         path = worktrees.add(plan['repo'], c['branch'], c['worktree'], plan['base'])
-    except worktrees.WorktreeError as e:
+    except (worktrees.WorktreeError, wip.WipError, TimeoutError) as e:
         return f'worktree: {e}'
     c['worktree'] = c['cwd'] = path
     command = ((plan['cfg'] or {}).get('wt') or {}).get('setup_command')
@@ -399,6 +400,18 @@ def cmd_run(argv) -> int:
             print(render_run(group, False), file=sys.stderr)
             print('twinlane run --best-of: every contestant was refused; nothing was started', file=sys.stderr)
         return common.EXIT_REFUSED
+    from . import wip
+    new_lanes = [c for c in live if not c['shared']]
+    if new_lanes:
+        try:
+            with wip.lock():
+                wip.check(new_lanes[0]['worktree'], 'best-of', group_id, policy,
+                          argv=['run'] + list(argv), slots=len(new_lanes), new_worktree=True)
+        except (wip.WipError, TimeoutError) as e:
+            common.emit({'queued': True, 'reason': str(e)}, args.json)
+            if not args.json:
+                print(str(e), file=sys.stderr)
+            return common.EXIT_REFUSED
     group['contestants'] = [_contestant_public(c) for c in group['contestants']]
     save_group(group)
     for c in group['contestants']:

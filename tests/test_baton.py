@@ -274,15 +274,16 @@ class RoundTripTests(BatonTestBase):
         self.assertEqual(rc, 0)
         self.assertEqual(baton.load('file')['progress']['next_action'], 'from file')
 
-    def test_save_rejects_oversized_fields_and_total_without_changing_history(self):
+    def test_save_truncates_oversized_fields_and_preserves_full_history(self):
         b = baton.new('bounded', 'goal')
         before = len(baton.history('bounded'))
         b['progress']['next_action'] = 'x' * 2000
-        raw = _raw(baton.baton_path('bounded'))
-        with self.assertRaisesRegex(baton.BatonError, 'next_action exceeds'):
+        with contextlib.redirect_stderr(io.StringIO()) as warning:
             baton.save(b, 'user', strict=True)
-        self.assertEqual(len(baton.history('bounded')), before)
-        self.assertEqual(_raw(baton.baton_path('bounded')), raw)
+        self.assertIn('next_action: 2000', warning.getvalue())
+        self.assertEqual(len(baton.load('bounded')['progress']['next_action']), 300)
+        self.assertGreater(len(baton.history('bounded')), before)
+        self.assertEqual(baton.history('bounded')[-1]['full_text']['baton.progress.next_action'], 'x' * 2000)
         b['progress']['next_action'] = 'next'
         b['progress']['done'] = [f'{i:02d}' + 'x' * 298 for i in range(30)]
         baton.save(b, 'job')  # system writes trim the oldest entries instead of refusing
@@ -691,7 +692,9 @@ class JobIdVisibilityTests(BatonTestBase):
     def test_job_id_regex_is_the_one_the_runner_makes(self):
         from twinlane import jobs
         for engine in baton.ENGINES:
-            made = jobs.create_job({'engine': engine, 'profile': 'intel', 'brief_text': 'x'})
+            # Id allocation is independent of the inherited real worker registry.
+            with mock.patch.object(jobs, '_coordination_parent', return_value=None):
+                made = jobs.create_job({'engine': engine, 'profile': 'intel', 'brief_text': 'x'})
             self.assertRegex(made, baton.JOB_ID_RE)
         for bad in ('j1', 'live-00', '20261009-143941-gemini-abcd', '20261009-143941-codex-abcde',
                     '20261009-143941-codex-ABCD', ''):

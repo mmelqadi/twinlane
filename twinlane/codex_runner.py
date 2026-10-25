@@ -8,15 +8,50 @@ set your models in config. Usage is checked by the caller when a job starts.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import signal
+import stat
 import subprocess
 import sys
 from pathlib import Path
 
 
 LIMIT_MARKERS = ('usage_limit', 'rate_limit', 'quota', 'limit reached', 'usage limit')
+# Set by a preserving start (twinlane common.CODEX_BIN_QUALIFIED): the identity of the one binary it may run.
+QUALIFIED = 'TWINLANE_CODEX_BIN_QUALIFIED'
+IDENTITY_KEYS = ('path', 'size', 'mtime_ns', 'file_id', 'dev', 'sha256')
+EXIT_REFUSED = 3
+
+
+def handoff_problem(binary: str | None, handoff: str) -> str | None:
+    """Why `binary` is not the qualified binary handed over (None when it is). twinlane checked it before
+    starting this runner; checking again here, right before the child starts, narrows the window between."""
+    try:
+        want = json.loads(handoff)
+    except ValueError:
+        return 'the qualified binary hand-off is malformed'
+    if not isinstance(want, dict) or set(want) != set(IDENTITY_KEYS):
+        return 'the qualified binary hand-off is malformed'
+    if not binary or binary != want['path']:
+        return 'TWINLANE_CODEX_BIN is not the qualified binary'
+    try:
+        st = os.lstat(binary)
+        key = (st.st_size, st.st_mtime_ns, st.st_ino, st.st_dev)
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or \
+                key != (want['size'], want['mtime_ns'], want['file_id'], want['dev']):
+            return 'the qualified binary changed or is no longer a standalone file'
+        digest = hashlib.sha256()
+        with open(binary, 'rb') as h:
+            for chunk in iter(lambda: h.read(1 << 20), b''):
+                digest.update(chunk)
+        after = os.lstat(binary)
+    except OSError as exc:
+        return f'the qualified binary cannot be verified ({type(exc).__name__})'
+    if (after.st_size, after.st_mtime_ns, after.st_ino, after.st_dev) != key or digest.hexdigest() != want['sha256']:
+        return 'the qualified binary bytes changed'
+    return None
 
 
 def command(binary: str, brief: str, cwd: str, model: str, effort: str, write: bool,
@@ -38,6 +73,7 @@ def run(argv=None) -> int:
     p.add_argument('--out', required=True)
     p.add_argument('--timeout', type=float, required=True)
     p.add_argument('--write', action='store_true')
+    p.add_argument('--preserve-existing-metadata', action='store_true')
     p.add_argument('--exec-config', action='append', default=[], metavar='KEY=VALUE',
                    help='passed to codex exec as -c KEY=VALUE (repeatable)')
     a = p.parse_args(argv)
@@ -47,7 +83,17 @@ def run(argv=None) -> int:
     final_path = out / 'last-message.md'
     result_path = out / 'result.txt'
     stderr_path = out / 'stderr.log'
-    binary = os.environ.get('TWINLANE_CODEX_BIN') or 'codex'
+    binary = os.environ.get('TWINLANE_CODEX_BIN')
+    handoff = os.environ.get(QUALIFIED)
+    if a.preserve_existing_metadata and handoff is None:
+        stderr_path.write_text('twinlane codex runner refused: preserving mode requires the qualified binary hand-off\n',encoding='utf-8')
+        return EXIT_REFUSED
+    if handoff is not None:  # a preserving start: this exact binary or nothing, never the codex on PATH
+        problem = handoff_problem(binary, handoff)
+        if problem:
+            stderr_path.write_text(f'twinlane codex runner refused: {problem}\n', encoding='utf-8')
+            return EXIT_REFUSED
+    binary = binary or 'codex'
     args = command(binary, a.brief, a.cd, a.model, a.effort, a.write, str(final_path), a.exec_config)
     try:
         prompt = Path(a.brief).read_text(encoding='utf-8')

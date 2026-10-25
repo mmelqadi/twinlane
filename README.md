@@ -13,6 +13,9 @@ Works with Anthropic's Claude Code CLI and the OpenAI Codex CLI on Windows, macO
 
 ## What you can do
 
+- **Wake the coordinating session.** Use `twinlane watch --name lead` to wait for completed jobs,
+  batons waiting on lead, cached usage crossings and estimated context crossings.
+
 - **See both usage limits.** Check Claude Code and Codex windows together, including the window currently limiting each engine.
 - **Route new work.** Choose an engine by task type, fresh usage readings, and your configured thresholds.
 - **Prepare a handoff.** Save the task's goal, progress, decisions, and recent evidence in a brief for the next engine.
@@ -20,6 +23,41 @@ Works with Anthropic's Claude Code CLI and the OpenAI Codex CLI on Windows, macO
 - **Land and ship deliberately.** A single-integrator land queue with a gate, a release manifest for exactly what landed, worktree health checks, best-of runs across engines, and restart recovery for lost jobs (see the sections below).
 
 If a dispatched worker ends with a recognized usage-limit result, twinlane can make one policy-checked attempt on the other engine, carrying the original brief, available partial output, and worktree changes. This is a new attempt; it does not migrate a running conversation.
+
+### Coordination commands
+
+```sh
+twinlane baton new example --goal "Review the change" --waiting-on lead
+twinlane baton set example --waiting-on user --ask "Review this one change?"
+twinlane run --owner example --brief brief.md --cd . --kind review --bg
+twinlane watch --name lead --timeout 3300 --interval 5 --json
+twinlane result JOB
+twinlane status JOB
+twinlane --version
+```
+
+`waiting_on` accepts `lead`, `user`, `job:JOB`, `lane:SLUG`, or `none`. A user wait needs
+`--ask`, just like the existing question inbox; an answer never grants a live-write approval.
+The board ranks **Waiting on lead** and **Waiting on user** by oldest wait first, shows idle
+lanes, and includes `writers N/MAX · queued Q · route: ENGINE-first (reason)`. This routing
+advice compares weekly pace (usage divided by the fraction of the week elapsed); dispatch
+still checks the configured policy and fresh meters.
+
+`--owner SLUG` requires an existing baton. Job completion records a history event and wakes
+its bound lane, or lead when no session is bound, unless the baton is waiting on a user or
+another dependency. The inbox's `collect JOB for SLUG` item clears when anyone runs
+`twinlane result JOB`, answers that inbox item, or changes the baton's wait.
+
+A coordinating session should run `twinlane watch` in the background and re-arm it after
+each wake. It exits after printing pending events, or a timeout line. Each `--name` has an
+independent cursor; delivery is at least once, with acknowledgement only after output.
+Watch polls files only and never refreshes meters or calls a model. Engine jobs cannot run it.
+
+`baton set --evidence "plain text"` stores a text evidence item; `kind|path|result` still works.
+Capped baton text is truncated with an ellipsis and a stderr warning; history retains the
+full text for that write. `meter` discovers the newest complete app CLI build, then PATH,
+without exporting its choice into worker environments. `status JOB` shows completion
+state, exit code, time and receipt path; `--version` includes a best-effort short source commit.
 
 ### Preview the board
 
@@ -60,7 +98,7 @@ twinlane meter --fresh
 twinlane route intel
 ```
 
-If an engine reads `unknown`, follow the displayed reason before starting work. On macOS/Linux, set `TWINLANE_CODEX_BIN` to your Codex binary or use available rollout evidence; automatic Codex desktop discovery is Windows-specific. See [Limits](LIMITS.md) for platform and authentication details.
+If an engine reads `unknown`, follow the displayed reason before starting work. On macOS/Linux, set `TWINLANE_CODEX_BIN` to your Codex binary or use available rollout evidence (turn that off with `--no-rollout`, see [Fresh readings](#fresh-readings)); automatic Codex desktop discovery is Windows-specific. See [Limits](LIMITS.md) for platform and authentication details.
 
 If the Claude CLI login has expired, renew that login and run `twinlane meter --fresh` again. `--fresh` rereads usage; it does not renew credentials or make a model call. You can also supply a usage reading with `twinlane meter --record-claude <get_usage json>`.
 
@@ -99,6 +137,32 @@ twinlane install --yes        # apply it to your Claude settings file, with back
 
 Credits and extra usage are checked only when a job starts. A long Codex job can still reach paid credits if your account allows it. See [Money guard](#money-guard) and [Limits](LIMITS.md) before running live jobs.
 
+## Common tasks
+
+| I want to | Run |
+| --- | --- |
+| See both engines' usage, jobs and batons on one screen | `twinlane board` (`--md` for chat, `--watch 30` in a terminal) |
+| Get fresh usage readings | `twinlane meter --fresh` (see [Fresh readings](#fresh-readings)) |
+| Know which engine should take a task | `twinlane route KIND` (exit 3 = refused, with the reason) |
+| Run a read-only task in the background | `twinlane run --kind intel --cd DIR --brief F --bg` |
+| Let a worker edit code | `twinlane run --kind code --write --cd LINKED_WORKTREE --brief F --bg` |
+| Wait for workers without polling | `twinlane wait JOB1 JOB2 --any --timeout 60` |
+| Read what a worker did | `twinlane result JOB` (`--json` for the receipt) |
+| Hand a task to the other engine | `twinlane baton set SLUG --next "..."`, then `twinlane handoff SLUG --to codex` |
+| Land finished work, one branch at a time | `twinlane land enqueue SLUG`, then `twinlane land run SLUG` |
+| List exactly what landed, for a release | `twinlane ship plan` |
+| Check or clean up worktrees | `twinlane wt doctor`, then `twinlane wt prune` (dry run unless asked) |
+| See writer capacity and queued requests | `twinlane wip`; `twinlane wip next` pops one request without launching it |
+| See questions that need a person | `twinlane inbox` (ranked questions and hidden count; `--all` shows every question) |
+| Record a question's answer | `twinlane inbox answer task:H1 --grant "verbatim words"` or `--deny "reason"` |
+| Clean up worktrees with no unique patches | `twinlane wt gc` (preview), then `twinlane wt gc --apply` |
+| Preview a compaction checkpoint hook | `twinlane install --precompact` (settings diff; no install without `--yes`) |
+| Continue jobs lost to a reboot | `twinlane resume`, then `twinlane resume --all-lost --yes` |
+
+Every command takes `--help`. Exit codes: 0 ok, 2 usage, 3 refused by policy, 4 still running or lock held, 5 failed, 6 engine limit hit.
+
+To teach a coding agent these commands, copy [`skills/twinlane/SKILL.md`](skills/twinlane/SKILL.md) into its skills folder (for example `~/.claude/skills/twinlane/` or `~/.codex/skills/twinlane/`).
+
 ## Usage and routing
 
 | Kind | First | Fallback |
@@ -109,6 +173,21 @@ Credits and extra usage are checked only when a job starts. A long Codex job can
 The default thresholds are caution at 75%, prepare a handoff at 80%, stop new nonurgent work at 85%, and hard stop at 100%. An unknown or stale reading is **unknown**, never 0%; it cannot authorize that engine.
 
 Every usage window of both engines counts: Claude's 5-hour, weekly and per-model windows, and each Codex limit. The meter and the board list each window and mark the one that sets the engine's maximum `[binding]`; a window twinlane does not know keeps its own name with `(unrecognised window)`. Every refusal names the window that caused it, for example `claude stop (90% in 7d-sonnet)`, and `--json` carries the same facts as `blockers`. When the first-choice engine is at 75-85% and the other is below 75% and usable, `twinlane route` picks the other one and says so.
+
+### Fresh readings
+
+Dispatch trusts a reading only while the cache is younger than `meter.cache_ttl_s` (120 s); the board may show older readings, so a route the board shows is not yet a dispatch admission. `twinlane meter --fresh` takes a new reading of both engines and writes the cache: one OAuth GET for Claude (no model call, no token renewal; add `--refresh` only if you accept one tiny model call to renew an expired token) and one read-only app-server exchange for Codex.
+
+Two settings keep that refresh narrow:
+
+- `TWINLANE_CODEX_BIN=PATH` runs that Codex binary as given. On Windows, twinlane otherwise copies the desktop app's build into `<home>/bin`, leases the copy and prunes older copies; an explicit binary outside the app's own folders skips all three.
+- `--no-rollout` (or `meter.codex_rollout_fallback: false` in your config) never reads local Codex rollout session files. A failed app-server exchange then leaves Codex **unknown** instead of falling back to the newest rollout reading.
+
+```sh
+TWINLANE_CODEX_BIN=/path/to/codex twinlane meter --fresh --no-rollout --json
+```
+
+Check `codex.source` (`app-server`), each engine's `status` and `reading_at`, then dispatch within the cache TTL.
 
 ### Money guard
 
@@ -126,13 +205,52 @@ Codex uses the installed CLI through `codex exec --json`. `TWINLANE_CODEX_RUN` c
 
 A code worker, Claude or Codex, starts without any environment variable whose name looks like a secret (TOKEN, SECRET, PASSWORD, API_KEY, `*_KEY`, AWS_*, AZURE_*, GH_*, OPENAI_*, ...). The receipt's `env_stripped` lists the stripped names, never their values. A secret a script reads from a file is not removed.
 
-Job liveness has three values: alive, dead and unknown. A process that exists but whose creation time cannot be read (a restricted-token sandbox cannot open the host's runners) makes its job `unknown`, never `lost`. An `unknown` job keeps its engine's slot, stays on the board and in the baton, blocks `--continue-job`, and `twinlane stop` will not kill it; check it from the host. After a kill at a timeout or an interrupt, the runner checks the process it started (the Claude CLI, or the Codex runner) instead of trusting the kill command. A process that is still running is recorded in `jobs/<id>/survivor.json` and the job stays `orphaned` (or `unknown`) until `twinlane stop` ends it. `twinlane run --resume SESSION` is refused while the tracked job that owns that session is live or unknown.
+Job liveness has three values: alive, dead and unknown. A process that exists but whose creation time cannot be read (a restricted-token sandbox cannot open the host's runners) makes its job `unknown`, never `lost`. On Windows a process that cannot be opened is still identified by its creation time in a system process snapshot, so a pid that a system service took over after the job ended reads dead and frees the job's slot. An `unknown` job keeps its engine's slot, stays on the board and in the baton, blocks `--continue-job`, and `twinlane stop` will not kill it; check it from the host. After a kill at a timeout or an interrupt, the runner checks the process it started (the Claude CLI, or the Codex runner) instead of trusting the kill command. A process that is still running is recorded in `jobs/<id>/survivor.json` and the job stays `orphaned` (or `unknown`) until `twinlane stop` ends it. `twinlane run --resume SESSION` is refused while the tracked job that owns that session is live or unknown.
+
+`twinlane jobs archive [--older-than DAYS] [--include-unread] [--apply] [--json]` previews old finished jobs, with candidate details and skip reasons. The default age is 14 days (`jobs.archive_after_days` in policy). Only receipts with status `done`, `failed`, `timeout`, `stopped` or `refused` qualify. Receipts must have been read with `result` unless `--include-unread` is given. Live or unknown processes, runner locks, unreadable evidence and pending baton work prevent archival. `--apply` refuses with exit 3 unless every job in the live folder is terminal and dead; dry runs still list candidates and explain any apply block. New lifecycle writers take an outer archive lock before the original in-folder locks, preserving exclusion with older runners. Archival probes and closes the in-folder locks before renaming while retaining the outer lock. `--apply` rechecks each job and moves it to `<home>/jobs/archive/YYYY-MM/<id>`, then appends an audit entry to `index.jsonl`; it never deletes evidence. An index write or sync failure reports `index entry uncertain` and keeps the job moved; lookups scan the archive layout and retries do not duplicate entries. `result`, `status` and `wait` still resolve archived ids, including when the index is unavailable. Normal `jobs` and `board` listings show active folders only. Workers may preview but cannot apply archival. Archival cannot exclude a twinlane release older than 0.3.3: run `--apply` only once every process using the home runs this release, because an older `stop` or refusal aimed at an already archived id could recreate a live folder next to the archived evidence.
 
 On Windows, every `--bg` runner is created through WMI (`detach=wmi`), outside every job object of the launching app and outside its process tree. If WMI cannot start it, `--bg` is refused (exit 3) rather than falling back to a start that could die with the app. macOS and Linux keep their own path: a new process session and process-group stop.
 
 ## Batons, board, and sessions
 
 `twinlane baton new SLUG --goal "..."` starts a local task record. `baton set`, `baton snap`, and `baton show` maintain it. `twinlane handoff SLUG --to codex` writes a brief using the task record and recent evidence. Approvals never transfer with a brief.
+
+Writer admission counts each worktree toplevel once across both engines. Live writer jobs, active/review
+batons and interactive sessions active within `wip.session_active_s` (default 1800 seconds) occupy a lane.
+The main checkout counts by default (`wip.count_main_checkout`). `wip.max_writers` defaults to 5.
+At capacity a new lane exits 3 with a deduplicated FIFO request. `twinlane wip` shows the lanes and queue;
+`twinlane wip next` prints the next retry command and pops it only when capacity exists (`--force` overrides
+the pop check). It never starts a worker. Read-only jobs do not count.
+
+Stored baton states are `active`, `review`, `landed`, `closed`, `waiting-on-you`, `waiting-external`, and `parked`.
+`stale` is derived after `lanes.stale_after_s` without progress, local git activity, jobs or bound session activity.
+Checkpoint snaps do not reset the progress clock. Batons are never auto-closed, even when every acceptance item
+passes: landing marks `landed` and records its count and verified state. Close explicitly with
+`twinlane baton set SLUG --state closed`. Resume with `--state active`.
+Use `--ask "Archive these 2 branches?" --record branches --count 2` or `--external https://example.com/issue/1`.
+`--state blocked` is refused: ask one question or name an external dependency.
+`--state parked --park-for 8h` releases the baton slot; the default park timeout is 3 days. A park past its
+timeout becomes derived stale with "parked past timeout: close or resume?" on the board.
+
+`twinlane inbox` ranks blocking questions, waiting questions and legacy holds across projects, oldest first
+within each rank. It always shows the open, shown and hidden counts; `--all` reveals every item.
+`twinlane inbox answer SLUG:H1 --grant "yes, go ahead"` (or `--deny "reason"`) writes `holds.answers`.
+An inbox yes is an answer, never a live-write approval. Live writes still need the user's confirmation naming
+the action and its records, given to the session that performs them. Explicit baton approval resolution remains separate.
+Board ATTENTION contains inbox items and stale lanes; SIGNALS retains usage, process and receipt warnings.
+
+Sessions and board show a `~` context estimate from the newest usage record, with advisory checkpoint/rotate
+flags at configurable thresholds (70%/85% by default). Set `context.window_tokens.models`, then per-engine
+`context.window_tokens.claude`/`codex` when verified; Codex can fall back to its rollout window. Unknown sizes stay unknown.
+Claude supervisor `agents --json` supplies working/idle/needs-you states when available, with transcript and
+local hook-state fallback. `startedBy` and `UNMANAGED` describe provenance, not authorization.
+
+Bind sessions explicitly using `baton new ... --session SESSION_ID` or
+`baton set SLUG --bind-session SESSION_ID` (repeatable, at most 8; `--unbind-session` removes one).
+`twinlane install --precompact` previews a settings diff; the callback checkpoints up to three batons bound
+to that session id, never guesses by cwd and preserves `progress_at`. Worker callbacks do nothing.
+`twinlane install --lane-state` previews Notification/Stop hooks and prints a Codex notify line for manual
+configuration. Installation is opt-in with `--yes`; no Codex configuration file is edited.
 
 A baton is capped at 8 KB by trimming the oldest finished history. An unfinished job is never trimmed, so many live jobs can leave a baton over 8 KB, and a handoff lists every unfinished job id or ends with an exact count of the ones it left out. Worker receipts update a baton's job and in-flight fields but never its `owner` (the lead); only `twinlane baton set --owner` changes that.
 
@@ -144,9 +262,12 @@ twinlane board  2026-10-11T10:15:33Z  (read-only; cached meters, 10s old)
 claude: caution 5h 77% (resets in 1h59m) [binding] | 7d 31% (resets in 2d7h) | extra usage off [fixture, 10s old]
 codex: ok 5h 42% (resets in 2h59m) [binding] | 7d 18% (resets in 3d0h) [fixture, 10s old]
 route now: ->codex code* intel* plan* review* parallel sweep integrate verify  (* = fallback)
-== ATTENTION (2)
-! claude CAUTION (77% in 5h, stop at 85%)
-! 2 finished, not yet read; newest: twinlane result 20261011-101533-codex-b2
+lanes: 1/5 writer lanes busy (twinlane wip)
+== ATTENTION (0)
+  nothing needs you
+== SIGNALS (2)
+  claude CAUTION (77% in 5h, stop at 85%)
+  2 finished, not yet read; newest: twinlane result 20261011-101533-codex-b2
 == JOBS  running/queued 1
   20261011-101533-codex-c3  codex  code      running    1m 2%t  6.1-sol/?  demo-c3  wt=example-repo
   last finished (2):
@@ -200,6 +321,14 @@ twinlane wt prune --yes [--include-empty]      # remove what passed every check
 
 `wt prune` is a dry run unless `--yes`. It removes a worktree only when its branch is merged and had commits of its own, it is clean, nothing uses it, and its last activity is older than `wt.prune_min_age_s`. Links (junctions and symlinks) inside it are unlinked first, without being followed. The branch is deleted with `git branch -d` only; an unmerged branch is never deleted. Every action is recorded in `prune.jsonl`. Workers cannot run `prune`.
 
+`wt gc [--apply]` uses the same prune checks with zero unique patches determined by `git cherry`.
+`wt prune --merged-only` enables that comparison too. Patch-equivalent cherry-picks can therefore be
+eligible even without ancestry; Git may keep their branch when `branch -d` refuses it. Dirty, busy, locked,
+too-recent or uncertain worktrees stay in place. In merged-only mode, landed/closed batons are historical references and no
+longer pin their worktrees; active interactive sessions still protect theirs. Unmerged work more than
+`wt.behind_max` commits behind (default 50) is labelled `rebase or park` and never removed. Archive defaults to a suggestion; user configuration can opt into pruning only the just-landed worktree. Configured dependency folders are checked
+before writer dispatch and again before each attempt; missing, empty or dangling folders refuse the writer.
+
 ## Best-of runs
 
 ```sh
@@ -233,7 +362,7 @@ Land, ship, worktree and best-of behaviour is set per repository in the `project
 }
 ```
 
-Commands are argv lists, never strings; nothing runs through a shell. Placeholders are `{repo}`, `{worktree}`, `{branch}`, `{slug}`, `{target}`, `{manifest}`, `{source_commit}` and `{base}`; an unknown placeholder is an error, and a value with a line break is refused. A `.bat` or `.cmd` command only receives plain values. Other keys: `land.command`, `land.command_rebases`, `land.heartbeat_s`, `land.heartbeat_stale_s`, `land.gate_timeout_s`, `ship.dry_run_max_age_s`, `wt.root`, `wt.setup_command`, `wt.remove_command`, `wt.link_roots`, `wt.prune_min_age_s`. Unknown keys are refused. Without a `land.gate`, `land run` lands ungated and says so.
+Commands are argv lists, never strings; nothing runs through a shell. Placeholders are `{repo}`, `{worktree}`, `{branch}`, `{slug}`, `{target}`, `{manifest}`, `{source_commit}` and `{base}`; an unknown placeholder is an error, and a value with a line break is refused. A `.bat` or `.cmd` command only receives plain values. Other keys: `land.command`, `land.command_rebases`, `land.heartbeat_s`, `land.heartbeat_stale_s`, `land.gate_timeout_s`, `ship.dry_run_max_age_s`, `wt.root`, `wt.setup_command`, `wt.remove_command`, `wt.link_roots`, `wt.prune_min_age_s`. Unknown keys are refused. With `land.require_gate: true`, a missing gate refuses landing. Otherwise an ungated landing is labelled explicitly.
 
 ## Configuration
 
@@ -250,6 +379,10 @@ Add local deny rules in your own config, for example:
 ```
 
 Arrays replace the packaged array; include the generic rules you still need. Do not put credentials in the config file.
+
+`jobs.archive_after_days` sets the default minimum completion age for `jobs archive` (14 days). `--older-than` overrides it for one invocation; ages must be finite, nonnegative numbers, and a job must be strictly older than the threshold.
+
+`--include-unread` preserves unread `--owner` completion notices: those jobs remain active until their receipt is collected with `result`.
 
 Guard settings go in the `guard` section: `deny_commands` (program names, optionally with leading arguments), `deny_text` (regular expressions matched against the command text), `self_aliases` (extra names for the twinlane command) and `allow_subagents` (default false). A `guard` section that is not an object, or cannot be read, denies every call of the job.
 
@@ -275,4 +408,12 @@ twinlane is not an API-key router or a multi-model chat UI. It coordinates two i
 
 ## Tests and license
 
-Run `python -m unittest discover -s tests -v`. Tests use fixtures and temporary homes; they do not call vendor networks. MIT licensed; see [LICENSE](LICENSE).
+Run `python -m unittest discover -s tests -v`, or use the faster parallel option
+`python -B tests/run_suite.py -j 4` with serial failure triage (see
+[Running the tests](CONTRIBUTING.md#running-the-tests)). Tests use fixtures and temporary homes; they do not call vendor networks. MIT licensed; see [LICENSE](LICENSE).
+
+`land card BRANCH` (or `land card --baton SLUG`) is a read-only, one-screen review of the worktree,
+ahead/behind, unique commits, diffstat, gate evidence, acceptance and inbox. Enqueue prints its verdict.
+After landing, `land.archive_worktree` is `suggest` by default (`off`/`apply` are opt-in alternatives);
+the suggestion uses `wt prune --merged-only --apply --only PATH`. Automatic archive keeps every prune
+safety and skips only the one-hour minimum age for that just-landed worktree. Archive failure preserves the landing result.

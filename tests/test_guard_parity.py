@@ -4,6 +4,7 @@ calls, no network."""
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -25,6 +26,11 @@ BS = chr(92)
 CONFIG = {'self_aliases': ['tl'],
           'deny_commands': ['release-prod.sh', 'kubectl delete', 'terraform apply'],
           'deny_text': [r'release-prod\.sh', r'ops/rotate_\w+\.py']}
+
+
+def windows_drive_path(cmd):
+    """A drive-rooted path (`C:` then a slash) only roots a path on Windows; elsewhere it is a relative name."""
+    return os.name != 'nt' and re.search(r'(?<![\w])[A-Za-z]:[\\/]', cmd) is not None
 
 
 def judge(cmd, tool='Bash', config=None, profile='code'):
@@ -217,9 +223,12 @@ class GuardParity(unittest.TestCase):
                  ('Bash', 'crontab x'), ('Bash', 'at x'), ('Bash', 'sc create x'),
                  ('PowerShell', 'New-Service x'), ('Bash', 'reg add x')]
         for tool, cmd in cases:
+            if windows_drive_path(cmd):
+                continue
             with self.subTest(cmd=cmd):
                 self.assertIsNotNone(judge(cmd, tool), cmd)
-        self.assertIsNone(judge("[IO.File]::Copy('\x43:\x5csource.txt','inside.txt')", 'PowerShell'))
+        if os.name == 'nt':
+            self.assertIsNone(judge("[IO.File]::Copy('\x43:\x5csource.txt','inside.txt')", 'PowerShell'))
 
     def test_review_self_stop_and_handoff(self):
         for cmd in ('twinlane stop j1', 'twinlane handoff j1',
@@ -277,6 +286,8 @@ class GuardParity(unittest.TestCase):
                     tool, expected, cmd = line.split('\t', 2)
                     if cmd.startswith('E:'):
                         cmd = cmd[2:].encode('latin-1', 'backslashreplace').decode('unicode_escape')
+                    if windows_drive_path(cmd):
+                        continue
                     with self.subTest(batch=batch, cmd=cmd):
                         self.assertEqual(judge(cmd, tool) is not None, expected == 'D', cmd)
 

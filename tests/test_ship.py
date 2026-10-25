@@ -320,6 +320,55 @@ class Ship(unittest.TestCase):
 
     # --- run -----------------------------------------------------------------
 
+    def record_unverified(self, event):
+        unverified = dict(event, event='landed-unverified', reason='command did not complete')
+        paths = land.Paths(self.repo)
+        with paths.locked():
+            land._append_ledger(paths, unverified)
+
+    def test_unverified_range_refuses_plan_regardless_of_foreign_override(self):
+        bad = self.land_slug('unchecked')
+        self.record_unverified(bad)
+        later = self.land_slug('later')
+        for flag in ([], ['--allow-foreign']):
+            for target in (f"{bad['from']}..{later['to']}", 'unchecked'):
+                res = self.plan(target, *flag, rc=common.EXIT_REFUSED)
+                self.assertIn('unchecked', res['reason'])
+                self.assertIn(f"{bad['from']}..{bad['to']}", res['reason'])
+                self.assertIn('a verified landing or a fix-forward on the target is needed', res['reason'])
+            # A baseline cannot silently include the unchecked range either.
+            self.plan('later', '--baseline', bad['from'], *flag, rc=common.EXIT_REFUSED)
+        # An isolated later range does not overlap the unchecked commits.
+        self.plan('later')
+        # Giving the same commits another target branch cannot hide the unverified range.
+        git_fixtures.git(self.repo, 'branch', 'release', later['to'])
+        self.configure(land={'target': 'release'})
+        self.plan(f"{bad['from']}..{later['to']}", '--allow-foreign', rc=common.EXIT_REFUSED)
+
+    def test_unverified_range_rechecked_by_dry_run_and_execute(self):
+        bad = self.land_slug('unchecked')
+        manifests = [self.plan('unchecked', *flag) for flag in ([], ['--allow-foreign'])]
+        self.configure_commands()
+        for res in manifests:
+            self.dry_run(res['manifest'])
+        self.record_unverified(bad)  # a manifest/receipt predating the finding cannot bypass it
+        for res in manifests:
+            for args in ([], ['--execute', '--confirm', res['sha256'][:8]]):
+                rc, out, err = self.ship('run', '--manifest', res['manifest'], *args)
+                self.assertEqual(rc, common.EXIT_REFUSED, out + err)
+                self.assertIn('unchecked', out + err)
+                self.assertIn(f"{bad['from']}..{bad['to']}", out + err)
+                self.assertIn('a verified landing or a fix-forward on the target is needed', out + err)
+        self.assertFalse(os.path.exists(self.ship_marker))
+
+    def test_verified_fix_forward_only_clears_ranges_including_its_result(self):
+        bad = self.land_slug('unchecked')
+        self.record_unverified(bad)
+        self.configure(land={'gate': [PY, '-c', 'pass']})
+        fixed = self.land_slug('fixed')
+        self.plan(f"{bad['from']}..{fixed['to']}")
+        self.plan(f"{bad['from']}..{bad['to']}", rc=common.EXIT_REFUSED)
+
     def test_run_without_execute_never_calls_ship_command(self):
         landed = self.land_slug('a')
         res = self.plan('a')

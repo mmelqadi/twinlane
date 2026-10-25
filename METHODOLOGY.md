@@ -15,3 +15,9 @@ One session is the integrator for a repository. It enqueues finished branches wi
 Release is a separate, targeted step. After landing, `twinlane ship plan SLUG` writes a manifest of exactly that landing's files; read its foreign and superseded flags before passing `--allow-foreign` or `--allow-superseded`. Run `twinlane ship run --manifest PATH` as a dry run, review it, and only then `--execute --confirm CODE`. Ship the landing you reviewed, not everything on the branch. Nothing in this lane needs a worker to hold deploy credentials.
 
 Keep the tree tidy at task boundaries: `twinlane wt doctor`, then `twinlane wt prune` as a dry run before `--yes`. After a reboot or an app quit, `twinlane resume` lists lost jobs; continue one only if its work is still wanted. Use `run --best-of` and `compare` for a decision that deserves two independent attempts, and accept that it costs the usage of both.
+
+The lead loop is `twinlane board` ? `twinlane inbox` ? `twinlane wip` ?
+`twinlane wt prune --merged-only` (preview). Ask one yes/no question instead of marking work blocked.
+Bind the active session to its baton with `--bind-session SESSION_ID`; an inbox yes is never a live-write
+approval. Park waiting work explicitly and close stale or landed batons yourself after checking the evidence.
+Use `twinlane land card --baton SLUG` before enqueueing. Review source, tests, integration and release separately.

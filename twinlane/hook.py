@@ -1,4 +1,4 @@
-"""Claude Code UserPromptSubmit hook: warn when either engine nears its limit (DESIGN.md "hook.py").
+"""Claude Code UserPromptSubmit warning and session-bound PreCompact checkpoint hook (DESIGN.md "hook.py").
 
 Fail-open by construction: it reads only the cached meter (state/meter.json), never blocks for more
 than about a second, prints nothing unless an engine is at handoff/stop/out, and always returns 0.
@@ -181,9 +181,15 @@ def run(stdin=None, out=None, meter: dict | None = None, policy: dict | None = N
         state_dir: str | None = None, spawn=None, env=None) -> int:
     """Testable core. `meter` injects a cached reading; otherwise state/meter.json is read."""
     env = env if env is not None else os.environ
+    payload = read_stdin_json(stdin)
     if env.get('TWINLANE_ENGINE_JOB'):
         return 0  # a twinlane-dispatched worker: never nag it, never spawn refreshes from it
-    payload = read_stdin_json(stdin)
+    if payload.get('hook_event_name') == 'PreCompact':
+        precompact(payload)
+        return 0
+    if payload.get('hook_event_name') in ('Notification', 'Stop'):
+        lane_state(payload)
+        return 0
     event = payload.get('hook_event_name')
     if event and event != 'UserPromptSubmit':
         return 0
@@ -203,10 +209,61 @@ def run(stdin=None, out=None, meter: dict | None = None, policy: dict | None = N
     return 0
 
 
-def main(**kwargs) -> int:
+PRECOMPACT_LOCK_S = 5
+
+
+def precompact(payload):
+    """Checkpoint up to three batons explicitly bound to this session; never infer by cwd."""
+    from . import baton
+    import glob
+    from . import lanes
+    sid = payload.get('session_id')
+    if not isinstance(sid, str) or not baton.SESSION_RE.fullmatch(sid):
+        return
+    matches = []
+    for path in glob.glob(os.path.join(common.BATONS, '*.json')):
+        slug = os.path.basename(path)[:-5]
+        if not baton.valid_slug(slug):
+            continue
+        b = common.read_json(path)
+        if isinstance(b, dict) and sid in lanes.bound_ids(b) and b.get('state') not in ('landed', 'closed'):
+            matches.append((b.get('updated_at') or '', slug))
+    for _, slug in sorted(matches, reverse=True)[:3]:
+        try:
+            baton.snap(slug, None, 'checkpoint', lock_timeout_s=PRECOMPACT_LOCK_S,
+                       extra={'last_precompact': {'at': common.iso(common.now()), 'session_id': sid,
+                              'trigger': payload.get('trigger') if payload.get('trigger') in ('auto', 'manual') else None}},
+                       create=False)
+        except Exception:
+            continue
+
+
+checkpoint = precompact
+
+
+def lane_state(payload, engine='claude'):
+    from . import baton
+    sid = payload.get('session_id') if engine == 'claude' else payload.get('thread-id')
+    if not isinstance(sid, str) or not baton.SESSION_RE.fullmatch(sid):
+        return
+    if engine == 'codex' and payload.get('type') != 'agent-turn-complete':
+        return
+    row = {'engine': engine, 'session_id': sid, 'cwd': payload.get('cwd'),
+           'state': 'needs-you' if payload.get('hook_event_name') == 'Notification' else 'idle',
+           'since': common.iso(common.now())}
+    if engine == 'claude' and row['state'] == 'needs-you':
+        row['reason'] = baton.redact(str(payload.get('message') or ''))[:160]
+    common.write_json(os.path.join(common.STATE, 'lanes', f'{engine}-{sid}.json'), row)
+
+
+def main(argv=None, **kwargs) -> int:
     """Contract entry (`twinlane hook`). Any failure exits 0 silently: a hook must never break a prompt."""
     try:
-        run(**kwargs)
+        args = sys.argv[2:] if argv is None else argv
+        if len(args) == 2 and args[0] == '--codex-notify':
+            lane_state(json.loads(args[1]), 'codex')
+        else:
+            run(**kwargs)
     except BaseException:
         pass
     return 0

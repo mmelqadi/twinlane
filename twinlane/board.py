@@ -17,7 +17,7 @@ import re
 import sys
 import time
 
-from . import common
+from . import common, observations
 from . import meter as meter_mod
 from .worktrees import (  # noqa: F401 - shared with `twinlane wt`; board keeps the old names
     BASE_BRANCHES, GIT_TIMEOUT_S, _activity, _base_branch, _gitdir, _parse_worktrees, _probe)
@@ -31,7 +31,7 @@ NEW_DIR_GRACE_S = 60               # a job dir this young may still be half-crea
 LONG_RUN_FRACTION = 0.8
 OLD_JOB_S = ATTENTION_WINDOW_S + 4 * 3600  # a job created this long ago cannot have finished inside the window
 FINISHED_DEFAULT = 5
-CAPS = {'attention': 6, 'live': 6, 'batons': 5, 'worktrees': 6}
+CAPS = {'attention': 5, 'live': 4, 'batons': 4, 'worktrees': 4}
 GIT_WORKERS = 8
 PROBE_LIMIT = 12                   # worktrees git is asked about by default (--all: every one)
 VERDICT_RE = re.compile(r'^[\s*#>_`-]*(MERGE AFTER FIXES|DO NOT MERGE|MERGE)\b[^\n]*')
@@ -259,7 +259,8 @@ def _file(path: str):
     """(exists, parsed). Parsed is None for a missing or invalid file; `exists` tells the two apart."""
     if not os.path.isfile(path):
         return False, None
-    return True, common.read_json(path)
+    jid, name = os.path.basename(os.path.dirname(path)), os.path.basename(path)
+    return True, observations.job_json(jid, name)
 
 
 def _last_activity(jid: str) -> float | None:
@@ -329,10 +330,13 @@ def _job_row(jid: str, now) -> dict | None:
                 'requested': _s(req.get('model')) or _s(req.get('tier')) or _s(prim.get('model'))
                 or _s(prim.get('tier')),
                 'served': served[0] if served else None, 'cwd': cwd,
+                'profile': spec.get('profile'), 'write': spec.get('write'),
+                'writer_root': _s(spec.get('writer_root')) or (common.writer_key(cwd) if cwd else None),
                 'worktree': os.path.basename(cwd.rstrip('\\/')) if cwd else None,
                 'age_s': elapsed, 'age': common.fmt_age(elapsed), 'timeout_s': _num(prim.get('timeout_s')),
                 'ended_age_s': common.age_s(receipt.get('ended_at')) if receipt.get('ended_at') else None,
                 'read_only_violation': receipt.get('read_only_violation') is True,
+                'error': _txt(receipt.get('error'), 160) or None,
                 'baton': _s(spec.get('baton')),
                 'collected': os.path.isfile(jobs._p(jid, jobs.COLLECTED))})
     if problems:
@@ -358,6 +362,7 @@ def _job_row(jid: str, now) -> dict | None:
     return row
 
 
+@observations.command
 def collect_jobs(now, show_all: bool, finished_n: int) -> dict:
     """Every job dir is classified, so ATTENTION covers all recent jobs; only the DISPLAYED finished rows are
     capped (finished_n, newest first). The one shortcut: a job whose id says it was created more than
@@ -401,7 +406,7 @@ def _mtime_ns(path: str) -> int:
         return 0
 
 
-def _baton_row(slug: str, raw) -> dict:
+def _baton_row(slug: str, raw, policy=None, session_rows=None) -> dict:
     from . import baton
     row = {'slug': slug, 'owner': None, 'age': '?', 'age_s': None, 'updated_at': None, 'next_action': None,
            'in_flight': [], 'approvals_pending': [], 'root': None, 'worktree': None, 'problems': []}
@@ -418,6 +423,9 @@ def _baton_row(slug: str, raw) -> dict:
         return {}
 
     owner, prog = sub(raw, 'owner', 'owner'), sub(raw, 'progress', 'progress')
+    row['waiting_on'] = raw.get('waiting_on', 'none')
+    row['waiting_since'] = raw.get('waiting_since')
+    row['waiting_age'] = common.fmt_age(common.age_s(row['waiting_since']))
     holds, repo = sub(raw, 'holds', 'holds'), sub(raw, 'repo', 'repo')
     eng = owner.get('engine')
     if eng in ENGINES:
@@ -467,10 +475,19 @@ def _baton_row(slug: str, raw) -> dict:
         elif v is not None:
             bad.append(f'repo.{key}')
     row['problems'] = list(dict.fromkeys(bad))
+    if not bad:
+        row['stored_state'] = raw.get('state', 'active')
+        from . import lanes
+        row['state'] = lanes.effective_state(raw, policy=policy, session_rows=session_rows)
+        from . import inbox
+        row['inbox'] = inbox.items([dict(raw, slug=slug)], policy=policy, session_rows=session_rows)
+    else:
+        row['state'], row['inbox'] = 'unknown', []
     return row
 
 
-def collect_batons() -> list[dict]:
+@observations.command
+def collect_batons(policy=None, session_rows=None) -> list[dict]:
     """Read every baton file directly (not through baton.list_batons) so one damaged file becomes a row with
     `problems` instead of an exception."""
     from . import baton
@@ -480,7 +497,7 @@ def collect_batons() -> list[dict]:
         if not baton.valid_slug(slug):
             continue
         try:
-            row = _baton_row(slug, common.read_json(path))
+            row = _baton_row(slug, common.read_json(path), policy, session_rows)
         except Exception:  # noqa: BLE001
             row = dict(_baton_row(slug, None), problems=['unreadable'])
         row['_mtime'] = _mtime_ns(path)
@@ -494,7 +511,7 @@ def collect_batons() -> list[dict]:
 # ---------------------------------------------------------------- worktrees
 
 def _norm(path) -> str:
-    return common.canon_path(path)
+    return observations.once(('canon', path), lambda: common.canon_path(path))
 
 
 def rank_worktree(w: dict):
@@ -568,7 +585,7 @@ def _lost_groups(rows: list[dict]) -> list[list[dict]]:
     return [g for g in groups if len(g) > 1]
 
 
-def build_attention(meters: dict, jobs_data: dict, batons: list[dict], show_all: bool) -> list[dict]:
+def build_signals(meters: dict, jobs_data: dict, batons: list[dict], show_all: bool) -> list[dict]:
     """Ordered by what the lead must not miss: pending approvals and engines at their stop line (P0), then
     live jobs at risk, unreadable records and engines near the line (P1), then failures (P2), then finished
     work not yet read (P3). Within a priority the order is the order found."""
@@ -578,9 +595,6 @@ def build_attention(meters: dict, jobs_data: dict, batons: list[dict], show_all:
     def recent(r):
         return r.get('ended_age_s') if r.get('ended_age_s') is not None else r.get('age_s')
 
-    for b in batons:
-        for a in b['approvals_pending']:
-            items.append(_item(P_MUST, 'approval', b['slug'], f"approval pending [{b['slug']}]: {a}"))
     for name in ENGINES:
         v = meters.get(name)
         if not isinstance(v, dict):
@@ -636,7 +650,8 @@ def build_attention(meters: dict, jobs_data: dict, batons: list[dict], show_all:
         if r['status'] in PROBLEM or r['limit_hit']:
             what = 'limit_hit' if r['limit_hit'] else r['status']
             items.append(_item(P_FAIL, 'problem', r['id'], f"{what}: {r['id']} {r['engine'] or ''} "
-                               f"{r['name'] or ''}".rstrip() + f" ({common.fmt_age(age)} ago)"))
+                               f"{r['name'] or ''}".rstrip() + f" ({common.fmt_age(age)} ago)"
+                               + (' - ' + _txt(r['error'], 100) if r.get('error') else '')))
         elif r['read_only_violation']:
             items.append(_item(P_FAIL, 'problem', r['id'], f"read-only violation: {r['id']} "
                                f"(twinlane result {r['id']})"))
@@ -655,20 +670,58 @@ def build_attention(meters: dict, jobs_data: dict, batons: list[dict], show_all:
     return sorted(items, key=lambda i: i['priority'])
 
 
+def build_attention(meters: dict, jobs_data: dict, batons: list[dict], show_all: bool) -> list[dict]:
+    """The human list: oldest questions first across projects, then stale lanes."""
+    from . import inbox
+    questions = inbox.rank([r for b in batons for r in b.get('inbox', [])])
+    out = [_item(P_MUST, 'inbox', r['id'], f"[{('blocking', 'waiting', 'legacy')[r.get('rank', 2)]}] [{r.get('project', '-')}] {r['id']}: {r['question']} [records: {r['records']}]") for r in questions]
+    out += [_item(P_INFO, 'stale', b['slug'], f"{b['slug']} stale: " + ('parked past timeout: ' if b.get('stored_state') == 'parked' else '') + f"close or resume? twinlane baton set {b['slug']} --state closed|active")
+            for b in batons if b.get('state') == 'stale']
+    return out
+
+
 # ---------------------------------------------------------------- collect
 
+@observations.command
 def collect(show_all: bool = False, finished_n: int = FINISHED_DEFAULT, now=None, policy: dict | None = None) -> dict:
     now = now or common.now()
     policy = policy or common.load_policy()
     meters = collect_meters(policy, now)
     jobs_data = collect_jobs(now, show_all, finished_n)
-    batons = collect_batons()
+    from . import sessions
+    session_error = None
+    try:
+        lane_sessions = sessions.collect_sessions(since_s=12*3600, limit=0, raw_paths=True, policy=policy)['rows']
+    except Exception as e:
+        lane_sessions, session_error = [], str(e)
+    batons = collect_batons(policy, lane_sessions)
     attention = build_attention(meters, jobs_data, batons, show_all)
+    signals = build_signals(meters, jobs_data, batons, show_all)
+    if session_error:
+        signals.append(_item(P_INFO, 'sessions', 'sessions', 'sessions unreadable: ' + session_error))
     worktrees = collect_worktrees(batons, show_all)
+    from . import wip, context, capacity
+    try:
+        busy = wip.lanes_from(jobs_data['live'], batons, lane_sessions, policy)
+    except wip.WipError as e:  # the board still renders; only writer admission fails closed
+        busy = None
+        signals.append(_item(P_INFO, 'wip', 'wip', 'writer count unknown: ' + str(e)))
+    idle = sum(r.get('state') == 'idle' for r in lane_sessions)
+    waiting = {kind: sorted([b for b in batons if b.get('waiting_on') == kind],
+                            key=lambda b: (b.get('waiting_since') or '', b['slug'])) for kind in ('lead', 'user')}
+    capacity_line = capacity.line('?' if busy is None else len(busy), (policy.get('wip') or {}).get('max_writers', 5),
+                                  len(wip.queue()), meters, now)
+    for row in lane_sessions:
+        if (row.get('context') or {}).get('flag'):
+            signals.append(_item(P_INFO, 'context', row['id'], context.label(row['context']) + ' (estimate)'))
+        row.pop('_writer_cwd', None)
+    lane_sessions = lane_sessions if show_all else lane_sessions[:5]
     jobs_data.pop('_all_finished')
     for b in batons:
         b.pop('root', None)
     return _scrub({'generated_at': common.iso(now), 'all': show_all, 'meters': meters, 'attention': attention,
+                   'signals': signals, 'sessions': lane_sessions, 'waiting': waiting, 'capacity': capacity_line,
+                   'lanes': {'busy': '?' if busy is None else len(busy), 'max': (policy.get('wip') or {}).get('max_writers', 5), 'idle': idle},
                    'jobs': jobs_data, 'batons': batons, 'worktrees': worktrees})
 
 
@@ -682,8 +735,14 @@ def _cap(items: list, key: str, show_all: bool, floor: int = 0) -> tuple[list, i
 
 
 def _cap_attention(items: list, show_all: bool) -> tuple[list, int]:
-    """P0 items (approvals, engines at their stop line) are never hidden by the cap."""
-    return _cap(items, 'attention', show_all, floor=sum(1 for i in items if i['priority'] == P_MUST))
+    """One short human list; --all exposes every pending question and stale lane."""
+    if show_all:
+        return items, 0
+    questions = [r for r in items if r.get('kind') == 'inbox']
+    stale = [r for r in items if r.get('kind') == 'stale']
+    limit = (common.load_policy().get('inbox') or {}).get('show', 5)
+    shown = questions[:limit] + stale[:5]
+    return shown, len(items) - len(shown)
 
 
 def _window_name(w: dict) -> str:
@@ -769,7 +828,7 @@ def _done_text(r: dict) -> str:
 
 
 def _baton_text(b: dict) -> str:
-    bits = [f"{b['slug']}  owner={b['owner'] or '-'}  {b['age']}"]
+    bits = [f"{b['slug']}  owner={b['owner'] or '-'}  {b['age']}  {b.get('state', 'active')}"]
     if b['in_flight']:
         bits.append(f"in-flight {len(b['in_flight'])}")
     if b['approvals_pending']:
@@ -822,16 +881,34 @@ def render_text(data: dict) -> str:
         if isinstance(v, dict) and v['note'] and v['status'] not in ('ok', 'caution'):
             L.append(f"  note {e}: {v['note']}")
     L.append(_route_text(m))
+    L.append(data.get('capacity', ''))
+    L.append(f"idle lanes: {data.get('lanes', {}).get('idle', 0)}")
+    for kind in ('lead', 'user'):
+        L.append(f'== Waiting on {kind}')
+        L += [f"  {b['slug']} {b.get('waiting_age', '?')} {b.get('next_action') or '-'}"
+              for b in data.get('waiting', {}).get(kind, [])] or ['  none']
+    L.append(f"lanes: {data.get('lanes', {}).get('busy', '?')}/{data.get('lanes', {}).get('max', 5)} writer lanes busy (twinlane wip)")
     att, more = _cap_attention(data['attention'], show_all)
     L.append(f"== ATTENTION ({len(data['attention'])})")
     L += [f"! {a['text']}" for a in att] or ['  nothing needs you']
     if more:
-        L.append(_more(more))
+        L.append(f'+{more} hidden (twinlane inbox --all)')
+    diagnostic_rows = data.get('signals', [])
+    L.append(f'== SIGNALS ({len(diagnostic_rows)})')
+    L += ['  ' + a['text'] for a in (diagnostic_rows if show_all else diagnostic_rows[:max(6, sum(r['priority'] == P_MUST for r in diagnostic_rows))])]
+    signal_cap = max(6, sum(r['priority'] == P_MUST for r in diagnostic_rows))
+    if not show_all and len(diagnostic_rows) > signal_cap:
+        L.append(_more(len(diagnostic_rows) - signal_cap))
     live, more = _cap(data['jobs']['live'], 'live', show_all)
     L.append(f"== JOBS  {_jobs_title(data['jobs'])}")
     L += ['  ' + _live_text(r) for r in live] or ['  none running']
     if more:
         L.append(_more(more))
+    from . import context
+    L.append('== SESSIONS (context is estimated)')
+    L += [f"  {r['engine']} {r['id']} {r['state']} {context.label(r.get('context'))}"
+          f" startedBy={r.get('started_by') or '?'} {'UNMANAGED' if r.get('unmanaged') else ''}"
+          for r in data.get('sessions', [])]
     L.append(f"  last finished ({len(data['jobs']['finished'])}):")
     L += ['  ' + _done_text(r) for r in data['jobs']['finished']] or ['  none']
     bs, more = _cap(data['batons'], 'batons', show_all)
@@ -877,11 +954,24 @@ def render_md(data: dict) -> str:
     L.append('- ' + _engine_line('claude', m.get('claude')))
     L.append('- ' + _engine_line('codex', m.get('codex')))
     L.append('- ' + _route_text(m))
+    L.append('- ' + data.get('capacity', ''))
+    L.append(f"- idle lanes: {data.get('lanes', {}).get('idle', 0)}")
+    for kind in ('lead', 'user'):
+        L += ['', f'**Waiting on {kind}**']
+        L += _table(['slug', 'age', 'next action'], [[b['slug'], b.get('waiting_age'), b.get('next_action')]
+                    for b in data.get('waiting', {}).get(kind, [])]) or ['- none']
+    L.append(f"- lanes: {data.get('lanes', {}).get('busy', '?')}/{data.get('lanes', {}).get('max', 5)} writer lanes busy (twinlane wip)")
     att, more = _cap_attention(data['attention'], show_all)
     L += ['', f"**Attention ({len(data['attention'])})**"]
     L += [f"- ! {a['text']}" for a in att] or ['- nothing needs you']
     if more:
-        L.append(f'- ... +{more} more (`--all`)')
+        L.append(f'- ... +{more} hidden (`twinlane inbox --all`)')
+    L += ['', '**Signals**']
+    ds = data.get('signals', [])
+    L += ['- ' + a['text'] for a in (ds if show_all else ds[:max(6, sum(r['priority'] == P_MUST for r in ds))])] or ['- none']
+    signal_cap = max(6, sum(r['priority'] == P_MUST for r in ds))
+    if not show_all and len(ds) > signal_cap:
+        L.append(f'- ... +{len(ds) - signal_cap} more (`--all`)')
     live, more = _cap(data['jobs']['live'], 'live', show_all)
     L += ['', f"**Jobs** - {_jobs_title(data['jobs'])}"]
     L += _table(['job', 'engine', 'kind', 'status', 'age', 'model req/served', 'name', 'worktree'],
@@ -890,6 +980,12 @@ def render_md(data: dict) -> str:
                   _model_text(r), r['name'], r['worktree']] for r in live]) or ['- none running']
     if more:
         L.append(f'- ... +{more} more (`--all`)')
+    from . import context
+    L += ['', '**Sessions** (estimated context)']
+    L += _table(['engine', 'session', 'state', 'context', 'startedBy', 'custody'],
+                [[r['engine'], r['id'], r['state'], context.label(r.get('context')),
+                  r.get('started_by'), 'UNMANAGED' if r.get('unmanaged') else 'tracked']
+                 for r in data.get('sessions', [])]) or ['- none']
     L += ['', f"Last finished ({len(data['jobs']['finished'])})"]
     L += _table(['job', 'engine', 'status', 'ended', 'model req/served', 'name', 'verdict'],
                 [[_code(r['id']), r['engine'], r['status'] + (' (unread)' if _unread(r) else ''),
@@ -897,8 +993,8 @@ def render_md(data: dict) -> str:
                  for r in data['jobs']['finished']]) or ['- none']
     bs, more = _cap(data['batons'], 'batons', show_all)
     L += ['', f"**Batons ({len(data['batons'])})**"]
-    L += _table(['baton', 'owner', 'age', 'in-flight', 'approvals', 'next action'],
-                [[_code(b['slug']), b['owner'], b['age'], len(b['in_flight']), len(b['approvals_pending']),
+    L += _table(['baton', 'owner', 'age', 'state', 'in-flight', 'approvals', 'next action'],
+                [[_code(b['slug']), b['owner'], b['age'], b.get('state'), len(b['in_flight']), len(b['approvals_pending']),
                   (f"[malformed: {', '.join(b['problems'])}] " if b['problems'] else '') + (b['next_action'] or '-')]
                  for b in bs]) or ['- none']
     if more:

@@ -5,6 +5,7 @@ import io
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
@@ -13,6 +14,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 import test_support  # noqa: E402; isolated temp home before importing twinlane
+import git_fixtures  # noqa: E402
 import twinlane  # noqa: E402
 from twinlane import cli, common  # noqa: E402
 
@@ -34,6 +36,18 @@ def run_main(*argv):
 
 
 class Dispatch(unittest.TestCase):
+    def test_subprocess_dispatch_uses_fixture_cwd_and_source_path(self):
+        with tempfile.TemporaryDirectory(prefix='dispatch-destination-', dir=test_support._HOME) as repo:
+            done = subprocess.CompletedProcess([], 0, stdout='', stderr='')
+            with mock.patch.object(git_fixtures.Workspace, 'repo', return_value=repo), \
+                    mock.patch.object(subprocess, 'run', return_value=done) as run:
+                self.test_a_new_command_runs_from_the_script_and_from_python_dash_m()
+            self.assertEqual(run.call_count, 2)
+            for call in run.call_args_list:
+                self.assertEqual(call.kwargs['cwd'], repo)
+                self.assertEqual(call.kwargs['env']['PYTHONPATH'], ROOT)
+                self.assertEqual(call.kwargs['env']['PYTHONDONTWRITEBYTECODE'], '1')
+
     def test_each_new_command_reaches_its_module_with_the_remaining_arguments(self):
         for command, module in STUBS.items():
             mod = importlib.import_module('twinlane.' + module)
@@ -102,11 +116,14 @@ class Dispatch(unittest.TestCase):
         self.assertIn('unknown command', err)
 
     def test_a_new_command_runs_from_the_script_and_from_python_dash_m(self):
-        env = dict(os.environ)
+        workspace = git_fixtures.Workspace(prefix='dispatch-git-')
+        self.addCleanup(workspace.cleanup)
+        repo = workspace.repo('dispatch')
+        env = dict(os.environ, PYTHONPATH=ROOT)
         for argv in ([sys.executable, os.path.join(ROOT, 'twinlane', 'cli.py'), 'land', 'status'],
                      [sys.executable, '-m', 'twinlane', 'wt', 'doctor']):
             with self.subTest(argv=argv[1:3]):
-                proc = subprocess.run(argv, cwd=ROOT, env=env, capture_output=True, text=True,
+                proc = subprocess.run(argv, cwd=repo, env=env, capture_output=True, text=True,
                                       encoding='utf-8', errors='replace', timeout=60)
                 self.assertNotIn('Traceback', proc.stderr)
                 if still_stub(STUBS[argv[-2]]):

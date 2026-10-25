@@ -61,6 +61,13 @@ class LandError(Exception):
         self.details = details or {}
 
 
+class LandUnverified(LandError):
+    """The work reached the target but its result has not passed the gate."""
+
+    def __init__(self, details: dict):
+        super().__init__(details['why'], common.EXIT_FAILED, details)
+
+
 # ---------------------------------------------------------------- identity
 
 def host_name() -> str:
@@ -545,7 +552,12 @@ class Lander:
             elif xy[0] not in (' ', '?', '!'):
                 problems.append(f'staged change {xy} {path}')
             elif any(_overlaps(path, p) for p in landing_paths):
-                problems.append(f'peer edit {xy.strip()} {path} is on a landing path')
+                if self.land_cfg.get('command_handles_wip') and self.land_cfg.get('command'):
+                    paths = self.facts.setdefault('wip_paths', [])
+                    if path not in paths:
+                        paths.append(path)
+                else:
+                    problems.append(f'peer edit {xy.strip()} {path} is on a landing path')
         return problems
 
     def check(self, entry: dict) -> dict:
@@ -599,6 +611,9 @@ class Lander:
             raise LandError(f'the main checkout {self.main_root} has changes that landing would touch: '
                             + '; '.join(problems[:10]), details={'problems': problems})
         f['gate_argv'] = self._command('gate', head, base)
+        if self.land_cfg.get('require_gate') and not f['gate_argv']:
+            raise LandError('this project requires a land gate (land.require_gate) but land.gate is not set; '
+                            'nothing was landed; gate: none configured (REQUIRED: the run will be refused)')
         f['command_argv'] = self._command('command', head, base)
         f['commits'] = _commits(self.main_root, base if f['ff'] else merge_base, head)
         return f
@@ -613,6 +628,15 @@ class Lander:
         if holder is not None and not (verdict['state'] in BREAKABLE and self.break_reason):
             raise LandError(describe_holder(holder, verdict), common.EXIT_RUNNING,
                             {'holder': holder, 'holder_state': verdict})
+        self._entry_facts(entry)
+        recovery = self._recover_preview(entry)
+        if recovery:
+            if recovery['event'] == 'interrupted-unknown':
+                raise LandError(recovery['reason'], common.EXIT_FAILED)
+            return dict(recovery, dry_run=True, recovery_preview=True)
+        already = self._already_landed(entry)
+        if already:
+            return dict(already, dry_run=True)
         f = self.check(entry)
         plan = {'dry_run': True, 'slug': f['slug'], 'branch': f['branch'], 'target': f['target'],
                 'from': f['base'], 'head': f['head'], 'commits': f['commits'], 'merges': f['range_merges'],
@@ -703,9 +727,12 @@ class Lander:
 
     def _env(self) -> dict:
         f = self.facts
-        return dict(os.environ, TWINLANE_LAND_SLUG=f['slug'], TWINLANE_LAND_BASE=f['base'],
+        env = dict(os.environ, TWINLANE_LAND_SLUG=f['slug'], TWINLANE_LAND_BASE=f['base'],
                     TWINLANE_LAND_HEAD=f['head'], TWINLANE_LAND_TARGET=f['target'],
                     TWINLANE_LAND_REPO=self.main_root)
+        if f.get('wip_file'):
+            env['TWINLANE_LAND_WIP_FILE'] = f['wip_file']
+        return env
 
     def _do_rebase(self) -> None:
         f = self.facts
@@ -770,16 +797,36 @@ class Lander:
             raise LandError('the main checkout changed during the run: ' + '; '.join(problems[:10]),
                             details={'problems': problems})
         if f['command_argv']:
+            if f.get('wip_paths'):
+                f['wip_file'] = os.path.join(self.paths.logs, f"{common.stamp()}-{f['slug']}-wip.json")
+                common.write_json(f['wip_file'], f['wip_paths'])
             result = self._run_logged(f['command_argv'], 'land', self._env())
             to = _rev(main, 'refs/heads/' + f['target'])
+            self._record(self._event('command-finished', command=result, **{
+                'from': f['base'], 'head': f['head'], 'to': to}))
             info = {'command': result}
             if to == f['base']:
                 raise LandError(f"land.command {'failed (rc ' + str(result['rc']) + ')' if result['rc'] else 'ran'}"
                                 f" and {f['target']} did not move; nothing landed", common.EXIT_FAILED, info)
             info.update(self._range(f['base'], to))
             if result['rc'] != 0:
-                raise LandError(f"land.command failed (rc {result['rc']}) AFTER moving {f['target']} to {to[:12]}; "
-                                'the range is in the ledger: inspect it', common.EXIT_FAILED, info)
+                raise LandUnverified(dict(info, why=f"land.command exited rc {result['rc']} after moving the target"))
+            if not info['tree_matches'] and f['gate_argv']:
+                why = (f"the landed tree differs from the gated tree in {len(info['differs_from_gated'])} path(s) "
+                       'and could not be re-gated')
+                wt = f['worktree']
+                if not _status(wt) and _branch_of(wt) == f['branch'] and _rev(wt, 'HEAD') == to:
+                    before = _status(wt)
+                    env = dict(self._env(), TWINLANE_LAND_HEAD=to)
+                    regate = self._run_logged(self._command('gate', to, f['base']), 'regate', env)
+                    info['regate'] = regate
+                    stable = (_rev(wt, 'HEAD') == to and _branch_of(wt) == f['branch']
+                              and _status(wt) == before and _rev(main, 'refs/heads/' + f['target']) == to)
+                    if regate['rc'] == 0 and stable:
+                        return info
+                    why = (f"the landed tree differs from the gated tree in {len(info['differs_from_gated'])} path(s); "
+                           f"the re-gate failed (rc {regate['rc']})" + ('' if stable else ' or changed what it judged'))
+                raise LandUnverified(dict(info, why=why))
             return info
         rc, out = common.git(main, 'merge', '--ff-only', '--no-edit', f['head'], timeout=REBASE_TIMEOUT_S)
         to = _rev(main, 'refs/heads/' + f['target'])
@@ -803,6 +850,133 @@ class Lander:
                               'path(s): ' + ', '.join(info['differs_from_gated'][:10]))
         return info
 
+    def _entry_facts(self, entry: dict) -> None:
+        target, _ = _target(self.main_root, self.cfg)
+        self.facts.update(slug=entry['slug'], branch=entry['branch'], worktree=entry['worktree'], target=target)
+
+    def _already_landed(self, entry: dict) -> dict | None:
+        self._entry_facts(entry)
+        f = self.facts
+        rc, head = common.git(self.main_root, 'rev-parse', '--verify', '-q', 'refs/heads/' + entry['branch'])
+        tip = _rev(self.main_root, 'refs/heads/' + f['target'])
+        if rc == 0 and _is_ancestor(self.main_root, head.strip(), tip):
+            return self._event('already-landed', head=head.strip(), target_tip=tip,
+                               reason=f"the branch is already in {f['target']}; nothing to land")
+        return None
+
+    def _recover_preview(self, entry: dict) -> dict | None:
+        events = self._recovery_events(entry)
+        # Ledger append and dequeue are separate writes. Finish a dequeue lost after a terminal append too.
+        intent = events[-1] if events else {}
+        if intent.get('event') in ('landed', 'landed-unverified', 'already-landed'):
+            self._entry_facts(entry)
+            rc, head = common.git(self.main_root, 'rev-parse', '--verify', '-q', 'refs/heads/' + entry['branch'])
+            expected = intent.get('gated_commit') or intent.get('head')
+            if (rc == 0 and head.strip() in (expected, intent.get('to')) and intent.get('branch') == entry['branch']
+                    and intent.get('target') == self.facts['target']):
+                self.facts.update(head=expected, base=intent.get('from'))
+                return intent
+            return None
+        completion = intent if intent.get('event') == 'command-finished' else None
+        if completion:
+            intent = next((e for e in reversed(events[:-1]) if e.get('event') == 'landing'), {})
+        if intent.get('event') != 'landing':
+            return None
+        self._entry_facts(entry)
+        f = self.facts
+        # An intent for another branch/worktree/target cannot qualify this queue entry.
+        if any(intent.get(k) != f[k] for k in ('branch', 'worktree', 'target')):
+            raise LandError('the interrupted landing intent does not match the queue entry; inspect the ledger')
+        f.update(head=intent['head'], base=intent['from'])
+        to = _rev(self.main_root, 'refs/heads/' + f['target'])
+        if to == f['base']:
+            return None
+        event = self._recovered_landing(intent, completion, to, 'next-run')
+        if event['event'] == 'interrupted-unknown':
+            rc, head = common.git(self.main_root, 'rev-parse', '--verify', '-q', 'refs/heads/' + f['branch'])
+            if rc == 0 and head.strip() != f['head'] and _is_ancestor(self.main_root, to, head.strip()):
+                # The human followed the recovery instruction and rebased the queued lane for a retry.
+                return None
+        return event
+
+    def _recovered_landing(self, intent: dict, completion: dict | None, to: str, recovered: str) -> dict:
+        """Attribute a moved target before consuming the lane's queue entry."""
+        f = self.facts
+        info = self._range(f['base'], to)
+        if not (info['contains_gated_commit'] or info['tree_matches']):
+            reason = (f"cannot attribute the interrupted move to {f['slug']}; inspect git log {f['base']}..{to}; "
+                      f"then twinlane land dequeue {f['slug']} if it landed, or rebase and twinlane land run "
+                      f"{f['slug']} again if it did not")
+            return self._event('interrupted-unknown', reason=reason, head=f['head'], recovered=recovered, **info)
+        custom = intent['mode'] not in ('ff', 'rebase+ff')
+        command = None
+        reason = None
+        if custom:
+            matches = completion and all(completion.get(k) == intent.get(k)
+                                         for k in ('slug', 'branch', 'worktree', 'target', 'from', 'head'))
+            command = completion.get('command') if matches and completion.get('to') == to else None
+            if not isinstance(command, dict) or command.get('rc') != 0:
+                reason = 'the custom land command has no successful completion evidence for the target'
+        elif info['contains_gated_commit']:
+            # The built-in fast-forward can only have landed this exact head, even if a peer moved on.
+            info = self._range(f['base'], f['head'])
+        if reason is None and intent.get('gate') and not info['tree_matches']:
+            reason = 'the recovered tree differs from the gated tree'
+        return self._event('landed-unverified' if reason else 'landed', recovered=recovered,
+                           gate=intent.get('gate'), mode=intent['mode'], notes=self.notes,
+                           command=command, reason=reason, **info)
+
+    def _recovery_events(self, entry: dict) -> list:
+        # Breaking the dead holder is administrative; it must not hide the intent being recovered.
+        return [e for e in read_ledger(self.paths) if e.get('slug') == entry['slug']
+                and e.get('event') not in ('broken-lock', 'interrupted-unknown')]
+
+    def _recover(self, entry: dict) -> dict | None:
+        event = self._recover_preview(entry)
+        if event:
+            if event['event'] == 'interrupted-unknown':
+                raise LandError(event['reason'], common.EXIT_FAILED, {'interrupted_unknown': event})
+            events = self._recovery_events(entry)
+            recorded = bool(events and events[-1].get('event') in ('landed', 'landed-unverified', 'already-landed'))
+            if recorded:
+                with self.paths.locked():
+                    queue = read_queue(self.paths)
+                    queue['entries'] = [e for e in queue['entries'] if e['slug'] != entry['slug']]
+                    common.write_json(self.paths.queue, queue)
+                from . import baton
+            elif event['event'] != 'landed-unverified':
+                self._record(event, dequeue_slug=True)
+            if event['event'] == 'landed-unverified':
+                details = {k: v for k, v in event.items() if k != 'event'}
+                details['why'] = event.get('reason') or 'the interrupted land is unverified'
+                if recorded:
+                    details['event'] = event
+                raise LandUnverified(details)
+            return event
+        events = self._recovery_events(entry)
+        if events and events[-1].get('event') in ('landing', 'command-finished'):
+            self._record(self._event('interrupted', reason='a previous run stopped; starting a new landing attempt'))
+        return None
+
+    def _salvage(self, gate) -> dict:
+        f = self.facts
+        to = _rev(self.main_root, 'refs/heads/' + f['target'])
+        if to != f['base']:
+            events = self._recovery_events({'slug': f['slug']})
+            completion = events[-1] if events and events[-1].get('event') == 'command-finished' else None
+            intent = self._event('landing', gate=gate, mode=self._mode(), **{'from': f['base'], 'head': f['head']})
+            event = self._recovered_landing(intent, completion, to, 'interrupted')
+            if event['event'] == 'interrupted-unknown':
+                return event  # the error handler records it without consuming the queue entry
+            self._record(event, dequeue_slug=True)
+            print(f"twinlane land: interrupted AFTER landing {f['slug']} {f['base']}..{to}; recorded in the ledger",
+                  file=sys.stderr)
+            return event
+        else:
+            event = self._event('interrupted', reason='stopped before the target moved; nothing landed')
+            self._record(event)
+            return event
+
     def run(self) -> dict:
         if self.dry_run:
             return self.dry()
@@ -810,17 +984,62 @@ class Lander:
         gate = None
         try:
             try:
+                recovered = self._recover(entry)
+                if recovered:
+                    return recovered
+                already = self._already_landed(entry)
+                if already:
+                    self._record(already, dequeue_slug=True)
+                    return already
                 self.check(entry)
                 if self.facts['will_rebase']:
                     self._do_rebase()
                 gate = self._gate()
-                landed = self._land()
+                self._record(self._event('landing', **{'from': self.facts['base'], 'head': self.facts['head'],
+                             'gated_tree': _git(self.main_root, 'rev-parse', self.facts['head'] + '^{tree}').strip(),
+                             'gate': gate, 'mode': self._mode()}))
+                try:
+                    landed = self._land()
+                except LandError:
+                    raise
+                except BaseException:
+                    salvaged = None
+                    try:
+                        salvaged = self._salvage(gate)
+                    except Exception as err:
+                        print(f'twinlane land: interrupted landing recovery failed ({err}); see the intent journal',
+                              file=sys.stderr)
+                    if salvaged and salvaged['event'] == 'interrupted-unknown':
+                        raise LandError(salvaged['reason'], common.EXIT_FAILED, {'interrupted_unknown': salvaged})
+                    if salvaged and salvaged['event'] == 'landed-unverified':
+                        raise LandUnverified({'event': salvaged, 'why': salvaged['reason']})
+                    raise
+            except LandUnverified as e:
+                info = {k: v for k, v in e.details.items() if k not in ('event', 'at', 'holder', 'slug', 'branch',
+                        'target', 'worktree', 'reason', 'gate', 'mode', 'notes')}
+                recorded_event = e.details.get('event')
+                recorded = isinstance(recorded_event, dict)
+                event = recorded_event if recorded else self._event('landed-unverified', reason=e.details['why'],
+                                    gate=e.details.get('gate', gate),
+                                    mode=e.details.get('mode') or self._mode(), notes=self.notes, **info)
+                if not recorded:
+                    try:
+                        self._record(event, dequeue_slug=True)
+                    except Exception as err:
+                        e.details['ledger_error'] = str(err)
+                        print(f'twinlane land: LANDED but the ledger or queue write failed ({err}); '
+                              'inspect the intent journal', file=sys.stderr)
+                e.details['event'] = event
+                e.args = (f"LANDED {event['slug']} {event['from']}..{event['to']} but UNVERIFIED: {e.details['why']}; "
+                          f"run the gate on {event['target']} and fix forward; this range is not shippable by itself",)
+                raise
             except LandError as e:
+                unknown = e.details.get('interrupted_unknown')
                 event = 'failed' if e.code == common.EXIT_FAILED else 'refused'
                 extra = {'reason': str(e), 'from': self.facts.get('base'), 'head': self.facts.get('head'),
                          'gate': e.details.get('gate', gate)}
                 extra.update({k: v for k, v in e.details.items() if k != 'gate'})
-                e.details['event'] = self._event(event, **extra)
+                e.details['event'] = unknown if isinstance(unknown, dict) else self._event(event, **extra)
                 try:
                     self._record(e.details['event'])
                 except Exception as err:  # noqa: BLE001 - keep the refusal; note the lost ledger line
@@ -848,6 +1067,89 @@ class Lander:
 
 # ---------------------------------------------------------------- cli
 
+def review_card(branch=None, slug=None, target=None, repo=None):
+    """A read-only review card; no gate command is executed."""
+    from . import baton, inbox, lanes, worktrees
+    main_root, cfg = _project(repo)
+    b = baton.load(slug) if slug else None
+    if slug and b is None:
+        raise LandError('no baton ' + slug, common.EXIT_USAGE)
+    branch = branch or ((b or {}).get('repo') or {}).get('branch')
+    if b is None and branch:
+        import glob
+        for filename in glob.glob(os.path.join(common.BATONS, '*.json')):
+            candidate = common.read_json(filename)
+            if isinstance(candidate, dict) and (candidate.get('repo') or {}).get('branch') == branch:
+                b = candidate
+                slug = b.get('slug')
+                break
+    if not branch:
+        raise LandError('card needs BRANCH or --baton SLUG', common.EXIT_USAGE)
+    target = target or _target(main_root, cfg)[0]
+    path = next((w['path'] for w in worktrees.worktree_list(main_root) if w.get('branch') == branch), None)
+    ahead = _git(main_root, 'rev-list', '--count', target + '..' + branch).strip()
+    behind = _git(main_root, 'rev-list', '--count', branch + '..' + target).strip()
+    cherry = _git(main_root, 'cherry', target, branch)
+    stat = _git(main_root, 'diff', '--stat', target + '...' + branch).splitlines()
+    entries = read_queue(Paths(main_root))['entries']
+    matching = [e for e in entries + read_ledger(main_root) if e.get('branch') == branch]
+    last = matching[-1] if matching else {}
+    questions = inbox.items([b]) if b else []
+    acceptance = ((b or {}).get('task') or {}).get('acceptance') or []
+    reasons = []
+    gate = (cfg.get('land') or {}).get('gate')
+    if not gate and (cfg.get('land') or {}).get('require_gate'):
+        reasons.append('no gate configured and land.require_gate is on')
+    if path is None:
+        reasons.append('no linked worktree')
+    elif _status(path):
+        reasons.append('dirty')
+    pending = sum(a.get('status') != 'pass' for a in acceptance)
+    if pending:
+        reasons.append(f'acceptance {pending}/{len(acceptance)} not pass')
+    if questions:
+        reasons.append('open inbox item')
+    return {'branch': branch, 'worktree': path, 'target': target, 'ahead': int(ahead), 'behind': int(behind),
+            'unique': sum(x.startswith('+') for x in cherry.splitlines()),
+            'diffstat': stat[:15] + (stat[-1:] if len(stat) > 15 else []),
+            'gate_configured': bool(gate), 'last_gate': last.get('gate'), 'tree_matches': last.get('tree_matches'),
+            'baton': slug, 'state': lanes.effective_state(b) if b else None, 'acceptance': acceptance,
+            'inbox': questions, 'bound_sessions': (b or {}).get('bound_sessions', []),
+            'verdict': 'not ready: ' + '; '.join(reasons) if reasons else 'ready to land'}
+
+
+def _human_card(card):
+    lines = [f"branch {card['branch']}  target {card['target']}", f"worktree {card['worktree'] or '-'}",
+             f"ahead {card['ahead']} / behind {card['behind']} / unique {card['unique']}",
+             f"gate configured: {card['gate_configured']}; last gate: {common.clip(str(card['last_gate']), 100)}; tree_matches: {card['tree_matches']}",
+             f"baton {card['baton'] or '-'} ({card['state'] or '-'}); open inbox {len(card['inbox'])}",
+             'acceptance: ' + ', '.join(f"{a.get('id')}={a.get('status')}" for a in card['acceptance']),
+             'bound sessions: ' + ', '.join(e['id'] for e in card['bound_sessions'])]
+    return '\n'.join(lines + card['diffstat'] + [card['verdict']])
+
+
+def _after_land(event, lander):
+    from . import lanes, worktrees
+    if event.get('dry_run'):
+        event['batons'] = lanes.preview_landed(event, lander.main_root)
+        return
+    if event.get('event') not in ('landed', 'landed-unverified'):
+        return
+    event['batons'] = lanes.mark_landed(event, lander.main_root)
+    if event.get('event') != 'landed':
+        return
+    mode = (lander.cfg.get('land') or {}).get('archive_worktree', 'suggest')
+    path = event.get('worktree')
+    if mode == 'off' or not path:
+        return
+    event['archive_command'] = 'twinlane wt prune --merged-only --apply --only ' + json.dumps(path)
+    if mode == 'apply':
+        try:
+            event['archive'] = worktrees.prune(lander.main_root, yes=True, merged_only=True, only=[path], archive=True)
+        except Exception as e:
+            event['archive_error'] = str(e)
+
+
 def _parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog='twinlane land', description='queue and land worktree branches one at a time')
     sub = ap.add_subparsers(dest='cmd')
@@ -864,6 +1166,10 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument('--session')
     add('status', 'queue and lock holder')
     add('next', 'the queue head')
+    p = add('card', 'read-only one-screen landing review')
+    p.add_argument('branch', nargs='?')
+    p.add_argument('--baton')
+    p.add_argument('--target')
     p = add('run', 'land the queue head')
     p.add_argument('slug', nargs='?')
     p.add_argument('--rebase', action='store_true', help='rebase a linear branch onto a moved target first')
@@ -894,6 +1200,13 @@ def _human_status(st: dict) -> str:
 
 
 def _human_run(res: dict) -> str:
+    if res.get('recovery_preview'):
+        return f"would record the interrupted landing of {res['slug']}"
+    if res.get('event') == 'already-landed':
+        return (f"would dequeue {res['slug']}: already in {res['target']}" if res.get('dry_run') else
+                f"{res['slug']} is already in {res['target']}: dequeued (ledger event already-landed)")
+    if res.get('recovered'):
+        return f"recovered an interrupted landing of {res['slug']}: {res['from']}..{res['to']} (recorded now)"
     if res.get('dry_run'):
         lines = [f"dry run: would land {res['slug']} ({res['branch']}) on {res['target']} by {res['mode']}: "
                  f"{len(res['commits'])} commit(s) after {res['from'][:12]}"]
@@ -906,6 +1219,13 @@ def _human_run(res: dict) -> str:
     lines = [f"landed {res['slug']} on {res['target']}: {res['from'][:12]}..{res['to'][:12]} "
              f"({len(res['commits'])} commit(s), {res['mode']})"]
     lines += ['  note: ' + n for n in res.get('notes') or []]
+    for b in res.get('batons', []):
+        lines.append(f"  baton {b.get('slug', '?')}: " + (f"not updated ({b['error']})" if b.get('error') else
+                     f"landed (count {b['count']})" + (', UNVERIFIED' if not b['verified'] else '')))
+    if res.get('archive_command'):
+        lines.append('  archive: ' + res['archive_command'])
+    if res.get('archive_error'):
+        lines.append('  archive failed: ' + res['archive_error'])
     return '\n'.join(lines)
 
 
@@ -923,10 +1243,15 @@ def cli(argv) -> int:
         if refused is not None:
             return refused
     try:
-        if args.cmd == 'enqueue':
+        if args.cmd == 'card':
+            res = review_card(args.branch, args.baton, args.target, args.repo)
+            human = _human_card(res)
+        elif args.cmd == 'enqueue':
             res = enqueue(args.slug, args.worktree, args.repo, args.session)
             human = (f"{'queued' if res['queued'] else 'already queued'} {args.slug} "
                      f"({res['entry']['branch']}) at position {res['position']}")
+            res['verdict'] = review_card(res['entry']['branch'], repo=args.repo)['verdict']
+            human += '\n' + res['verdict']
         elif args.cmd == 'status':
             res = status(args.repo)
             human = _human_status(res)
@@ -939,7 +1264,9 @@ def cli(argv) -> int:
             if args.do_break and not (args.reason or '').strip():
                 raise LandError('--break needs --reason TEXT (recorded in the ledger)', common.EXIT_USAGE)
             reason = args.reason if args.do_break else None
-            res = Lander(args.slug, args.repo, args.rebase, args.dry_run, reason, args.session).run()
+            lander = Lander(args.slug, args.repo, args.rebase, args.dry_run, reason, args.session)
+            res = lander.run()
+            _after_land(res, lander)
             human = _human_run(res)
         elif args.cmd == 'release':
             res = release(args.repo, args.do_break, args.reason, args.session)
@@ -956,6 +1283,8 @@ def cli(argv) -> int:
                               f"{(e.get('from') or '')[:12]}..{(e.get('to') or '')[:12]}  "
                               f"{common.clip(e.get('reason') or '', 100)}" for e in events) or 'no events'
     except LandError as e:
+        if args.cmd == 'run' and e.details.get('event', {}).get('event') == 'landed-unverified':
+            _after_land(e.details['event'], lander)
         if args.json:
             common.emit({'ok': False, 'code': e.code, 'reason': str(e), 'details': e.details}, True)
         print(f'twinlane land {args.cmd}: ' + ('refused' if e.code in (common.EXIT_REFUSED, common.EXIT_USAGE)
