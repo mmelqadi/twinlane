@@ -1824,12 +1824,12 @@ def _run_codex(job_id, argv, cwd, timeout_s, files, params, policy=None, qualifi
 
 # A worker whose shell calls hung often ends with a short "I could not read the repo" and exit 0. That is not a result.
 UNREAD_RE = re.compile(
-    r"(?:(?:could not|couldn't|cannot|can't|can not|unable to|was unable to|failed to|did not manage to) "
-    r"(?:read|access|open|inspect|see)"
-    r"(?: (?:any|all|the|your|this))?(?: (?:source|repo|repository|workspace|checkout|code|project))?"
-    r" (?:repository|repo|workspace|checkout|codebase|code|project|files)\b(?!'s\b)"
-    r"|(?:shell|shell calls?|shell commands?|commands?) (?:is|are|was|were) (?:unavailable|not available)"
-    r"|no shell (?:access|available))")
+    r"^(?:[a-z][a-z ]{0,20}:\s+)?(?:(?:sorry|unfortunately)\s*[,.:-]*\s+)?"
+    r"(?:(?:(?:i|we) )?(?:could not|couldn't|cannot|can't|can not|am unable to|was unable to|unable to|failed to|did not manage to) "
+    r"(?:read|access|open|inspect|see)(?: (?:any|all|the|your|this))?(?: (?:source|repo|repository|workspace|checkout|code|project))?"
+    r" (?:repository|repo|workspace|checkout|codebase|code|project|files)(?=[ ]*(?:[.,;:!-]|$|(?:because|so|and|as|due|since|from|in|on|here|at|with|via)\b))"
+    r"|(?:the )?(?:shell|shell calls?|shell commands?|commands?) (?:is|are|was|were) (?:unavailable|not available)"
+    r"|no shell (?:access|available))", re.I)
 UNREAD_VERDICT_RE = re.compile(r"^[\s*_#>`-]*(?:verdict\s*[:-]?\s*)?[*_`]*(?:pass|block|approve|reject|lgtm)\b", re.I)
 UNREAD_QUOTED_RE = re.compile(
     '"[^"]*"' + '|(`+)[^`]*?' + chr(92) + '1'
@@ -1855,7 +1855,7 @@ def _final_says_unread(text) -> bool:
         return False
     first = UNREAD_SENTENCE_RE.split(UNREAD_QUOTED_RE.sub(' ', raw).strip(), 1)[0]
     head = ' '.join(first[:UNREAD_HEAD_CHARS].lower().split())
-    return UNREAD_RE.search(head) is not None and not UNREAD_RECOVERED_RE.search(head)
+    return UNREAD_RE.match(head) is not None and not UNREAD_RECOVERED_RE.search(head)
 
 
 # ---------------------------------------------------------------- failover
