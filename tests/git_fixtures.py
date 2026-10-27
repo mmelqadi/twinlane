@@ -15,7 +15,7 @@ import time
 IS_WIN = os.name == 'nt'
 REPARSE_POINT = getattr(stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 0x400)
 IDENTITY = ['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.org', '-c', 'commit.gpgsign=false',
-            '-c', 'core.autocrlf=false', '-c', 'init.defaultBranch=main']
+            '-c', 'core.autocrlf=false', '-c', 'init.defaultBranch=main', '-c', 'gc.auto=0', '-c', 'maintenance.auto=false']
 
 
 def git_available():
@@ -80,8 +80,11 @@ def unlink_links_under(root):
 
 
 def _force_remove(function, path, _info):
-    os.chmod(path, stat.S_IWRITE)  # git marks object files read-only; Windows refuses to delete them
-    function(path)
+    try:
+        os.chmod(path, stat.S_IWRITE)  # git marks object files read-only; Windows refuses to delete them
+        function(path)
+    except FileNotFoundError:
+        pass  # git's background maintenance can remove its own lock between the listing and the delete
 
 
 def rmtree(path):
