@@ -1228,6 +1228,60 @@ class InlineRuns(JobsBase):
         self.assertIn('sandbox could not set up', notes)
         self.assertIn('unverified', notes)
 
+    def test_a_short_final_message_that_could_not_read_the_repo_is_a_failure(self):
+        said = jobs._final_says_unread
+        self.assertTrue(said('I could not read the repo, so there is nothing to report.'))
+        self.assertTrue(said('Sorry - the shell is unavailable.\nNothing was inspected.'))
+        self.assertTrue(said('I can\u2019t read the repo from this sandbox.'))
+        self.assertFalse(said('PASS - no findings.'))
+        self.assertTrue(said("I couldn't read the repository; shell calls hung."))
+        self.assertTrue(said('I could not read any source files.'))
+        self.assertTrue(said('Unable to access the workspace: no shell access.'))
+        self.assertFalse(said('PASS - the fixture handles "I could not read the repo" correctly.'))
+        self.assertFalse(said('**BLOCK** - note: no shell access was needed for this inline review.'))
+        self.assertFalse(said('The test string `could not read the repo` is covered; nothing else to report.'))
+        self.assertFalse(said('Review verdict: PASS. The fixture contains "I could not read the repo". All checks passed.'))
+        self.assertFalse(said('Summary of the run: the log line "worker said: I cannot access the workspace" is expected.'))
+        self.assertFalse(said('Verdict: PASS with notes. Fixture text: '+chr(0x2018)+'I could not read the repo'+chr(0x2019)+' is quoted.'))
+        self.assertFalse(said("Review complete.\nPASS\nI could not read the repository's optional README, but reviewed all supplied source."))
+        self.assertFalse(said('Summary: ' + 'x' * 560 + ' "quoted example that could not read the repo' + ' y' * 30 + '" then done.'))
+        self.assertTrue(said("Summary: I could not read the repository. Nothing was reviewed."))
+        self.assertFalse(said('Verdict: PASS\nI could not read the file optional.env because it is absent. No findings.'))
+        self.assertFalse(said('Reviewed the fallback message ``I could not read the repo``; its handling is correct. No findings.'))
+        self.assertTrue(said('I could not read the source files, so nothing was checked.'))
+        self.assertFalse(said('`PASS` - the inline delta is correct. I could not read the repository files under docs/, which are outside this review.'))
+        self.assertTrue(said('I could not read the repository because shell commands hung, so I cannot give a verdict.'))
+        self.assertFalse(said('Reviewed every supplied file. I could not read the repository files under docs/ (out of scope).'))
+        self.assertFalse(said('Added a watchdog for shell commands hanging indefinitely.'))
+        self.assertTrue(said('The shell was unavailable, so I did nothing.'))
+        self.assertFalse(said('Implemented detection for workers with no shell access.'))
+        self.assertFalse(said('I could not read the repository README; completed the requested review using the supplied diff.'))
+        self.assertFalse(said('Fixed the bug where shell commands hung; all checks now pass.'))
+        self.assertFalse(said('I could not read the repo initially, but recovered and completed the review.'))
+        self.assertTrue(said("Summary: I couldn't read the repository, and the 'fixture' wording is irrelevant."))
+        self.assertFalse(said('No shell access was needed for this inline review; the supplied delta is sound.'))
+        self.assertTrue(said('No shell access, so nothing was inspected.'))
+        self.assertFalse(said('I could not read the repo because ' + 'the sandbox was slow and ' * 12 + 'but recovered and completed the review.'))
+        self.assertFalse(said('I could not read the files in the optional attachments; completed the requested inline-source review successfully. No findings.'))
+        self.assertFalse(said('I could not read the files in the optional attachments; the requested review is complete.'))
+        self.assertFalse(said('The shell was unavailable, so I used the supplied inline diff and found no issues.'))
+        self.assertFalse(said(''))
+        self.assertFalse(said(None))
+        self.assertFalse(said('Review done. ' + 'Detail line.\n' * 150 + 'Note: earlier I could not read the repo.'))
+        self.assertFalse(said('x ' * 400 + 'could not read the repo'))  # phrase after the opening 600 characters
+        os.environ['FAKE_CODEX_FINAL'] = 'I could not read the repo, so I made no changes.'
+        rc, out, _ = self.run_codex()
+        self.assertEqual(rc, common.EXIT_FAILED, out)
+        r = self.receipt(self.only_job())
+        self.assertEqual(r['status'], 'failed')
+        self.assertIn('could not read the repository', r['error'])
+
+    def test_a_normal_final_message_stays_done(self):
+        os.environ['FAKE_CODEX_FINAL'] = 'PASS - reviewed the diff; no findings.'
+        rc, out, _ = self.run_codex()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.receipt(self.only_job())['status'], 'done')
+
     def test_explicit_codex_binary_is_recorded(self):
         os.environ['TWINLANE_CODEX_BIN'] = self.fake_codex_bin
         rc, out, _ = self.cli('run', '--brief', self.brief, '--cd', self.work,

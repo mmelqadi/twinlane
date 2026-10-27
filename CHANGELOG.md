@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Added
+- Host-load admission counts Windows console hosts (`hostload.conhost_soft` / `conhost_hard`, default 80 / 120). Past about 150 of them a started worker's shell calls hang, so the usable slots shrink first and queued work waits with "host busy: N console hosts". The count shows on the board host line; a missing count never throttles.
+
+### Fixed
+- A Codex run whose short final message opens by saying it could not read the repository or files (for example after hung shell calls) is now `failed`, not `done`. Longer reports that merely quote the phrase stay `done`.
+
 ## 0.4.1 - 2026-10-27
 
 ### Fixed

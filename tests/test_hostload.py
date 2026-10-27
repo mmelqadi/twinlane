@@ -26,5 +26,38 @@ class CachedHostloadTests(tb.BoardBase):
                 self.assertIsNone(hostload.cached(now=1000))
 
 
+class ConsoleHostGauge(unittest.TestCase):
+    CALM = {'cpu_pct': 10.0, 'ram_free_mb': 9000, 'engine_procs': 2}
+
+    def test_settings_validate_the_pair_like_the_process_pair(self):
+        cfg = hostload.settings({'hostload': {'conhost_soft': 100, 'conhost_hard': 50}})
+        self.assertEqual((cfg['conhost_soft'], cfg['conhost_hard']), (100, 101))
+        cfg = hostload.settings(None)
+        self.assertEqual((cfg['conhost_soft'], cfg['conhost_hard']), (80, 120))
+
+    def test_console_hosts_shrink_the_slots_and_name_themselves(self):
+        low = dict(self.CALM, console_hosts=40)
+        self.assertEqual(hostload.effective_parallel(14, low), (14, None))
+        mid = dict(self.CALM, console_hosts=100)  # halfway between soft and hard
+        usable, why = hostload.effective_parallel(14, mid)
+        self.assertEqual((usable, why), (7, 'host busy: 100 console hosts'))
+        high = dict(self.CALM, console_hosts=158)  # the field incident: past the hard limit, never below min_parallel
+        usable, why = hostload.effective_parallel(14, high)
+        self.assertEqual(usable, hostload.settings(None)['min_parallel'])
+        self.assertIn('158 console hosts', why)
+        self.assertIn('158 console hosts', hostload.line(high, 14))
+
+    def test_a_missing_count_never_throttles(self):
+        for reading in (self.CALM, dict(self.CALM, console_hosts=None)):
+            self.assertEqual(hostload.effective_parallel(14, reading), (14, None))
+
+    def test_nan_and_infinite_counts_are_ignored_not_raised(self):
+        for bad in (float('nan'), float('inf'), float('-inf'), 10 ** 400, -10 ** 400):
+            reading = dict(self.CALM, console_hosts=bad, engine_procs=bad)
+            self.assertEqual(hostload.pressure(reading, hostload.settings(None)), (0.0, None))
+            self.assertEqual(hostload.effective_parallel(14, reading), (14, None))
+            hostload.line(reading, 14)
+
+
 if __name__ == '__main__':
     unittest.main()

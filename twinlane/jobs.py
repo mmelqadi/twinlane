@@ -1808,6 +1808,9 @@ def _run_codex(job_id, argv, cwd, timeout_s, files, params, policy=None, qualifi
     else:
         out['status'] = 'failed'
     out['codex_error'] = c.get('error_text')
+    if out['status'] == 'done' and _final_says_unread(c['final_text']):
+        out['status'] = 'failed'
+        out['error'] = 'worker could not read the repository (its final message says so)'
     if sandbox_failed and out['status'] == 'done':
         out['status'] = 'failed'
         out['error'] = ("the Codex sandbox could not set up ('setup refresh had errors'); "
@@ -1817,6 +1820,42 @@ def _run_codex(job_id, argv, cwd, timeout_s, files, params, policy=None, qualifi
         if out['status'] == 'timeout':
             out['error'] = f'timed out after {timeout_s} s' + (f": {c['error_text']}" if c.get('error_text') else '')
     return _mark_stalled(out, stall)
+
+
+# A worker whose shell calls hung often ends with a short "I could not read the repo" and exit 0. That is not a result.
+UNREAD_RE = re.compile(
+    r"^(?:[a-z][a-z ]{0,20}:\s+)?(?:(?:sorry|unfortunately)\s*[,.:-]*\s+)?"
+    r"(?:(?:(?:i|we) )?(?:could not|couldn't|cannot|can't|can not|am unable to|was unable to|unable to|failed to|did not manage to) "
+    r"(?:read|access|open|inspect|see)(?: (?:any|all|the|your|this))?(?: (?:source|repo|repository|workspace|checkout|code|project))?"
+    r" (?:repository|repo|workspace|checkout|codebase|code|project|files)(?=[ ]*(?:[.,;:!-]|$|(?:because|so|and|as|due|since|from this (?:sandbox|environment|session))\b))"
+    r"|(?:the )?(?:shell|shell calls?|shell commands?|commands?) (?:is|are|was|were) (?:unavailable|not available)"
+    r"|no shell (?:access|available)(?=[ ]*(?:[.,;:!-]|$|(?:so|and|because|as|here|in|on)\b)))", re.I)
+UNREAD_VERDICT_RE = re.compile(r"^[\s*_#>`-]*(?:verdict\s*[:-]?\s*)?[*_`]*(?:pass|block|approve|reject|lgtm)\b", re.I)
+UNREAD_QUOTED_RE = re.compile(
+    '"[^"]*"' + '|(`+)[^`]*?' + chr(92) + '1'
+    + '|' + chr(0x201c) + '[^' + chr(0x201d) + ']*' + chr(0x201d)
+    + "|(?<!\\w)'[^']*'(?!\\w)")
+UNREAD_RECOVERED_RE = re.compile(r"\b(?:but|however|although|though|recovered|resolved|fixed|fix|now|eventually|after|once|retried|succeeded|completed|finished|reviewed|done|used|using|found|instead|supplied|inline|findings|issues)\b")
+UNREAD_SENTENCE_RE = re.compile(r"(?<=[.!?])\s|\n")
+UNREAD_HEAD_CHARS, UNREAD_MAX_CHARS = 300, 800
+
+
+def _final_says_unread(text) -> bool:
+    """True for a SHORT final message whose first sentence says the repository or files could not be read.
+
+    Real reports are long and a review opens with its verdict, so the check is deliberately narrow: a message of
+    UNREAD_MAX_CHARS or more is never judged, one that starts with a verdict word (PASS, BLOCK, ...) is a result, a
+    phrase inside quotation marks or backticks is being quoted, a sentence that goes on to say the worker recovered (but, fixed,
+    now, after, ...) is a result, and a caveat about one part ("the repository's
+    README") or a later sentence is not the whole task. A message the rule misses stays `done` and the lead reads it."""
+    if not isinstance(text, str):
+        return False
+    raw = text.strip().replace(chr(0x2019), "'").replace(chr(0x2018), "'")
+    if not raw or len(raw) >= UNREAD_MAX_CHARS or UNREAD_VERDICT_RE.match(raw):
+        return False
+    first = UNREAD_SENTENCE_RE.split(UNREAD_QUOTED_RE.sub(' ', raw).strip(), 1)[0]
+    whole = ' '.join(first.lower().split())
+    return UNREAD_RE.match(whole[:UNREAD_HEAD_CHARS]) is not None and not UNREAD_RECOVERED_RE.search(whole)
 
 
 # ---------------------------------------------------------------- failover

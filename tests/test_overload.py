@@ -206,9 +206,9 @@ class CpuAverage(unittest.TestCase):
         def fake_times():
             return 65, 100
 
-        with mock.patch.object(hostload.common, 'IS_WIN', True),                 mock.patch.object(hostload, '_win_times', fake_times),                 mock.patch.object(hostload, '_win_free_mb', lambda: 4000),                 mock.patch.object(hostload, '_win_engine_procs', lambda: 2):
+        with mock.patch.object(hostload.common, 'IS_WIN', True),                 mock.patch.object(hostload, '_win_times', fake_times),                 mock.patch.object(hostload, '_win_free_mb', lambda: 4000),                 mock.patch.object(hostload, '_win_engine_procs', lambda: 2),                 mock.patch.object(hostload, '_win_console_hosts', lambda: 5):
             reading = hostload.measure(20, 50.0)
-        self.assertEqual(set(reading), {'cpu_pct', 'ram_free_mb', 'engine_procs', 'heap'})
+        self.assertEqual(set(reading), {'cpu_pct', 'ram_free_mb', 'engine_procs', 'console_hosts', 'heap'})
         self.assertNotIn('hist', hostload.line(reading, 14))
         self.assertTrue(os.path.exists(self.path))  # kept in its own file, away from hostload.json
 
@@ -243,7 +243,7 @@ class CpuAverage(unittest.TestCase):
             n = next(ticks)
             return n * 40, n * 100
 
-        with mock.patch.object(hostload.common, 'IS_WIN', True), mock.patch.object(hostload, '_win_times', fake_times),                 mock.patch.object(hostload, '_win_free_mb', lambda: 4000),                 mock.patch.object(hostload, '_win_engine_procs', lambda: 2):
+        with mock.patch.object(hostload.common, 'IS_WIN', True), mock.patch.object(hostload, '_win_times', fake_times),                 mock.patch.object(hostload, '_win_free_mb', lambda: 4000),                 mock.patch.object(hostload, '_win_engine_procs', lambda: 2),                 mock.patch.object(hostload, '_win_console_hosts', lambda: 5):
             reading = hostload.measure(20, 100.0)
         self.assertIn('cpu_pct', reading)
         self.assertIsNotNone(reading['cpu_pct'])

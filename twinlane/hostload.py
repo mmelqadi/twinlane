@@ -15,6 +15,7 @@ Thresholds live in the user config under "hostload" (all optional):
   ram_free_soft_mb   2048      free physical RAM: slots shrink below this ...
   ram_free_hard_mb   512       ... down to min_parallel at this
   procs_soft/hard    16 / 32   live codex / sandbox processes
+  conhost_soft/hard  80 / 120  Windows console hosts: past ~150 a started job's shell calls hang, so slots shrink first
   min_parallel       2         slots that stay open per engine at full load
   sample_ttl_s       3         one sample is shared by every runner for this long
 """
@@ -29,9 +30,11 @@ import time
 from . import common
 
 DEFAULTS = {'enabled': True, 'cpu_soft': 80, 'cpu_hard': 98, 'ram_free_soft_mb': 2048, 'ram_free_hard_mb': 512,
-            'procs_soft': 16, 'procs_hard': 32, 'min_parallel': 2, 'sample_ttl_s': 3, 'cpu_window_s': 20}
+            'procs_soft': 16, 'procs_hard': 32, 'conhost_soft': 80, 'conhost_hard': 120, 'min_parallel': 2, 'sample_ttl_s': 3, 'cpu_window_s': 20}
 # Image names that count as engine load: the Codex CLI and the sandbox helpers it spawns.
 ENGINE_PROCESS_NAMES = ('codex.exe', 'codex', 'codex-command-runner.exe', 'codex-windows-sandbox-setup.exe')
+# Windows console hosts: every shell a worker opens holds one, and their count is what exhausts the desktop heap.
+CONSOLE_HOST_NAMES = ('conhost.exe', 'openconsole.exe')
 
 # CPU is averaged over `cpu_window_s` from a short history of cumulative counters. With less than CPU_MIN_SPAN_S of
 # history (first call, or a stale file) the figure is the lowest of CPU_COLD_SAMPLES short windows instead: a spike
@@ -70,6 +73,8 @@ def settings(policy: dict | None) -> dict:
         out['ram_free_hard_mb'] = max(0, out['ram_free_soft_mb'] - 1)
     if out['procs_hard'] <= out['procs_soft']:
         out['procs_hard'] = out['procs_soft'] + 1
+    if out['conhost_hard'] <= out['conhost_soft']:
+        out['conhost_hard'] = out['conhost_soft'] + 1
     out['min_parallel'] = max(1, int(out['min_parallel']))
     out['cpu_window_s'] = min(120, max(5, out['cpu_window_s']))
     return out
@@ -108,6 +113,14 @@ def _win_free_mb():
 
 def _win_engine_procs():
     """Count live engine processes from a Toolhelp snapshot (no WMI, no subprocess)."""
+    return _win_count_procs(ENGINE_PROCESS_NAMES)
+
+
+def _win_console_hosts():
+    return _win_count_procs(CONSOLE_HOST_NAMES)
+
+
+def _win_count_procs(image_names):
     import ctypes
     from ctypes import wintypes
 
@@ -122,7 +135,7 @@ def _win_engine_procs():
     snap = k32.CreateToolhelp32Snapshot(0x2, 0)
     if snap in (None, ctypes.c_void_p(-1).value):
         return None
-    names = {n.lower() for n in ENGINE_PROCESS_NAMES}
+    names = {n.lower() for n in image_names}
     count = 0
     try:
         entry = PE()
@@ -278,7 +291,7 @@ def _cpu_pct(times, window_s: float, now: float) -> float | None:
 
 def measure(window_s: float = DEFAULTS['cpu_window_s'], now: float | None = None) -> dict:
     """One real reading. Every field is None when it could not be read."""
-    out = {'cpu_pct': None, 'ram_free_mb': None, 'engine_procs': None, 'heap': None}
+    out = {'cpu_pct': None, 'ram_free_mb': None, 'engine_procs': None, 'console_hosts': None, 'heap': None}
     try:
         times = _win_times if common.IS_WIN else _posix_times
         out['cpu_pct'] = _cpu_pct(times, window_s, time.time() if now is None else now)
@@ -301,6 +314,11 @@ def measure(window_s: float = DEFAULTS['cpu_window_s'], now: float | None = None
         pass
     if out['engine_procs'] is None and not common.IS_WIN:
         out['engine_procs'] = _ps_engine_procs()
+    if common.IS_WIN:  # POSIX has no console hosts: the figure stays None and never throttles
+        try:
+            out['console_hosts'] = _win_console_hosts()
+        except (OSError, ValueError, AttributeError, ImportError):
+            pass
     # Desktop-heap exhaustion has no cheap counter; its symptom (0xc0000142 on a new console process)
     # shows up as a job whose shell never answers, which the stall watchdog handles.
     return out
@@ -347,6 +365,16 @@ def sample(policy: dict | None = None, now: float | None = None) -> dict | None:
 
 # ---------------------------------------------------------------- judging
 
+def _finite(value) -> bool:
+    """A usable count: a real number that is not NaN or infinite (a garbled cache file must not raise)."""
+    if type(value) not in (int, float):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:  # a JSON integer too large for a float
+        return False
+
+
 def pressure(reading: dict | None, cfg: dict) -> tuple[float, str | None]:
     """(0..1, why). 0 means no pressure; 1 means every metric at its hard limit. `why` names the worst one."""
     if not isinstance(reading, dict):
@@ -366,9 +394,13 @@ def pressure(reading: dict | None, cfg: dict) -> tuple[float, str | None]:
         consider((cfg['ram_free_soft_mb'] - free) / (cfg['ram_free_soft_mb'] - cfg['ram_free_hard_mb']),
                  f'free RAM {free:.0f} MB')
     procs = reading.get('engine_procs')
-    if type(procs) in (int, float):
+    if _finite(procs):
         consider((procs - cfg['procs_soft']) / (cfg['procs_hard'] - cfg['procs_soft']),
                  f'{int(procs)} codex/sandbox processes')
+    hosts = reading.get('console_hosts')
+    if _finite(hosts):
+        consider((hosts - cfg['conhost_soft']) / (cfg['conhost_hard'] - cfg['conhost_soft']),
+                 f'{int(hosts)} console hosts')
     return min(1.0, worst), why
 
 
@@ -399,8 +431,10 @@ def line(reading: dict | None, configured: int, policy: dict | None = None) -> s
         bits.append(f"cpu {reading['cpu_pct']:.0f}%")
     if type(reading.get('ram_free_mb')) in (int, float):
         bits.append(f"free RAM {reading['ram_free_mb'] / 1024:.1f} GB")
-    if type(reading.get('engine_procs')) in (int, float):
+    if _finite(reading.get('engine_procs')):
         bits.append(f"{int(reading['engine_procs'])} codex/sandbox procs")
+    if _finite(reading.get('console_hosts')):
+        bits.append(f"{int(reading['console_hosts'])} console hosts")
     usable, why = effective_parallel(configured, reading, policy)
     tail = f'slots {usable}/{configured}' + (f' ({why})' if why else '')
     return 'host load: ' + (' · '.join(bits) or 'no counters readable') + ' · ' + tail
