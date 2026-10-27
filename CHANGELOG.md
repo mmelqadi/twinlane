@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- More parallel engine channels: contention on `slots.lock` is a wait (`waiting for slot lock`), never a failed job; each
+  attempt that waited for a slot records `slot_wait_s` and up to five distinct `slot_wait_reasons` in the receipt;
+  `run` refuses a second live job with the same engine, model, tier, folder and brief (`duplicate of live job ...`,
+  override `--allow-duplicate`; coordinated dispatches keep their own replay identity); `board` shows a per-engine
+  `slots:` line (running/cap, the lower count host load allows, waiting) and counts queued writer requests the pump
+  cannot start by itself apart (`queued 13 (13 stuck: ...)`). A pumped request records its child's identity and the
+  job carries the claim (`wip_claim`): once the claim is stale, that exact child is DEAD and no job carries the
+  claim, the next pump retries it; a request gets at most five pump starts (counted when the claim is taken), then
+  waits for a person; anything less proven stays claimed for a person, as before.
+  `jobs archive` no longer treats a stale `queued`/`running` status.json beside a terminal receipt as live when
+  runner, launch marker, survivor and engine are all proven DEAD (older runners left 1,266 such folders, which
+  blocked every archive and kept every slot scan reading the whole history).
+
 ## 0.4.1 - 2026-10-27
 
 ### Fixed

@@ -7,9 +7,11 @@ the real credentials or a real engine.
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import datetime as dt
 import glob
+import hashlib
 import json
 import math
 import os
@@ -255,7 +257,7 @@ def next_reset(windows: list[dict], thresholds: dict) -> str | None:
     return common.iso(pick(common.parse_time(w['resets_at']) for w in pool))
 
 
-def _finish_common(raw: dict, engine_policy: dict, thresholds: dict, now) -> dict:
+def _finish_common(raw: dict, engine_policy: dict, thresholds: dict, now, rollover=True) -> dict:
     """Fields both engines share: source, age, windows, max_pct, status before engine rules."""
     raw = raw or {}
     out = {'status': 'unknown', 'source': raw.get('source') or 'none', 'reading_at': raw.get('reading_at'),
@@ -276,7 +278,7 @@ def _finish_common(raw: dict, engine_policy: dict, thresholds: dict, now) -> dic
         w = w if isinstance(w, dict) else {'name': None}
         checked = _window(w.get('name'), w.get('pct'), w.get('resets_at'))
         windows.append({**w, **checked})
-    out['windows'] = effective_windows(windows, now)
+    out['windows'] = effective_windows(windows, now) if rollover else windows
     bi = binding_index(out['windows'])
     for i, w in enumerate(out['windows']):
         w['recognised'] = is_recognised(w)
@@ -333,7 +335,22 @@ def finish_claude(raw: dict, policy: dict, now=None) -> dict:
 def finish_codex(raw: dict, policy: dict, now=None) -> dict:
     th, xp = policy.get('thresholds', {}), policy.get('codex', {})
     raw = raw or {}
-    out = _finish_common(raw, xp, th, now or common.now())
+    now = now or common.now()
+    last_good = raw.get('source') == 'last-good'
+    if last_good:
+        xp = dict(xp, stale_reading_max_age_s=codex_last_good_max_age(policy))
+    out = _finish_common(raw, xp, th, now, rollover=not last_good)
+    if raw.get('identity'):
+        out['identity'] = raw['identity']
+    if last_good:
+        out['stale'] = True
+        # Keep the note's age current on cache hits without moving reading_at.
+        note = re.sub(r'^last-good app-server reading, [0-9]+s old(?:; )?', '', out['note'])
+        out['note'] = _join(f'last-good app-server reading, {out["age_s"]}s old', note)
+        why = _last_good_problem(raw, policy, now)
+        if why:
+            out['status'] = 'unknown'
+            out['note'] = _join(out['note'], f'last-good unavailable: {why}')
     credits = raw.get('credits') or {}
     out['credits'] = credits
     out['limit_reached_type'] = raw.get('limit_reached_type')
@@ -792,6 +809,61 @@ def _reset_credits(obj) -> dict | None:
     return {'available': count, 'expires': [common.iso(t) for t in expires]}
 
 
+def _codex_identity(obj: dict) -> dict:
+    """Only fingerprints leave this helper; account ids and credential contents never enter a cache."""
+    out = {}
+    for key, aliases in (('account', ('accountId', 'account_id', 'chatgpt_account_id')),
+                         ('plan_id', ('planId', 'plan_id')),
+                         ('plan', ('planType', 'plan', 'chatgpt_plan_type'))):
+        value = next((obj[k] for k in aliases if isinstance(obj.get(k), str) and obj[k]), None)
+        if value:
+            out[key] = hashlib.sha256(value.encode('utf-8')).hexdigest()
+    return out
+
+
+def _codex_auth_identity() -> dict | None:
+    """Identity only: no refresh or token retention. A missing login reads {} (binds nothing); an unreadable
+    login or an API-key login reads None. Neither authorizes reuse of a subscription allowance."""
+    try:
+        with open(os.path.join(common.CODEX_DIR, 'auth.json'), encoding='utf-8') as handle:
+            auth = json.load(handle)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError):
+        return None
+    if not isinstance(auth, dict) or auth.get('OPENAI_API_KEY') or auth.get('auth_mode') not in (None, 'chatgpt'):
+        return None
+    tokens = auth.get('tokens')
+    if tokens is None:
+        return {}
+    if not isinstance(tokens, dict):
+        return None
+    identity = _codex_identity(tokens)
+    token = tokens.get('id_token')
+    if isinstance(token, str):
+        try:
+            part = token.split('.')[1]
+            claims = json.loads(base64.urlsafe_b64decode(part + '=' * (-len(part) % 4)))
+            details = claims.get('https://api.openai.com/auth')
+            if isinstance(details, dict):
+                identity = {**_codex_identity(details), **identity}
+        except (ValueError, IndexError, TypeError, AttributeError):
+            pass  # no token or decode error is ever printed
+    return identity
+
+
+def _identity_matches(recorded: dict, current: dict | None) -> bool:
+    """No conflict: every fingerprint current holds equals the recorded one (an empty current never conflicts)."""
+    return current is not None and all(recorded.get(k) == v for k, v in current.items())
+
+
+def _identity_bound(recorded: dict, current: dict | None) -> bool:
+    """Reuse needs a proven account: signed out, or a login without an account and plan, binds nothing."""
+    return isinstance(current, dict) and bool(current.get('account')) \
+        and bool(current.get('plan') or current.get('plan_id')) \
+        and recorded.get('account') == current['account'] and _identity_matches(recorded, current)
+
+
 def parse_app_server(result: dict) -> dict:
     """account/rateLimits/read result -> raw codex reading: every window of every limit id, the plan,
     credits (balance as a number), spend control, the individual limit and the free full resets.
@@ -826,7 +898,7 @@ def parse_app_server(result: dict) -> dict:
             'limit_reached_type': rl.get('rateLimitReachedType'), 'ordinary_usage_allowed': ordinary,
             'spend_control_reached': spend if isinstance(spend, bool) else None,
             'individual_limit': _plain(individual), 'free_resets': resets,
-            'plan': rl.get('planType'), 'note': ''}
+            'plan': rl.get('planType'), 'identity': _codex_identity({**rl, **result}), 'note': ''}
 
 
 class AppServerError(RuntimeError):
@@ -1054,15 +1126,115 @@ def rollout_fallback_enabled(policy: dict | None) -> bool:
     return v is True
 
 
+def codex_last_good_path() -> str:
+    return os.path.join(common.STATE, 'codex-last-good.json')
+
+
+def codex_last_good_max_age(policy: dict) -> float:
+    value = (policy.get('meter') or {}).get('codex_last_good_max_age_s', 0)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+        return 0
+    return value
+
+
+def _allowance_snapshot(raw: dict):
+    """Comparable raw/finished evidence, excluding display fields and inferred reset capacity."""
+    wins = raw.get('windows')
+    if not isinstance(wins, list) or any(not isinstance(w, dict) for w in wins):
+        return None
+    return (raw.get('reading_at'),
+            [(w.get('name'), w.get('pct'), common.iso(common.parse_time(w.get('resets_at'))), w.get('limit'))
+             for w in wins],
+            raw.get('credits') or {}, raw.get('plan'), raw.get('limit_reached_type'),
+            raw.get('ordinary_usage_allowed'), raw.get('spend_control_reached'))
+
+
+def _last_good_problem(raw: dict, policy: dict, now) -> str | None:
+    """Recheck on every use, including cache hits and urgent routes. Never infer a window reset."""
+    max_age = codex_last_good_max_age(policy)
+    if not max_age:
+        return 'disabled by meter.codex_last_good_max_age_s'
+    stamp = common.parse_time(raw.get('reading_at'))
+    age = (now - stamp).total_seconds() if stamp else None
+    if age is None or age < 0 or age >= max_age:
+        return 'reading expired or has an invalid timestamp'
+    wins = raw.get('windows')
+    if not isinstance(wins, list) or not wins:
+        return 'no complete usage windows'
+    stop = policy.get('thresholds', {}).get('stop_pct', 85)
+    if isinstance(stop, bool) or not isinstance(stop, (int, float)) or not math.isfinite(stop):
+        return 'invalid stop threshold'
+    for w in wins:
+        if not isinstance(w, dict) or w.get('invalid_pct'):
+            return 'invalid usage window'
+        checked = _window(w.get('name'), w.get('pct'), w.get('resets_at'))
+        if checked.get('invalid_pct') or checked['pct'] >= stop:
+            return 'a usage window is invalid or at the stop threshold'
+    if raw.get('limit_reached_type') or raw.get('ordinary_usage_allowed') is False \
+            or raw.get('spend_control_reached') is True or raw.get('on_credits'):
+        return 'the reading holds a Codex limit or billing refusal'
+    recorded = raw.get('identity') or {}
+    if not isinstance(recorded, dict) or not _identity_bound(recorded, _codex_auth_identity()):
+        return 'account or plan changed'
+    # Another probe may have replaced or invalidated last-good while meter.json still holds this copy.
+    latest = common.read_json(codex_last_good_path())
+    if not isinstance(latest, dict) or latest.get('source') != 'app-server' \
+            or _allowance_snapshot(latest) != _allowance_snapshot(raw) or (latest.get('identity') or {}) != recorded:
+        return 'last-good evidence was replaced or is unreadable'
+    # A failed/busy last-good write must not hide a newer published live refusal.
+    cached = common.read_json(meter_path(), {})
+    known = cached.get('codex') if isinstance(cached, dict) else None
+    if isinstance(known, dict) and known.get('source') == 'app-server':
+        known_at = common.parse_time(known.get('reading_at'))
+        if known_at is not None and known_at >= stamp and (
+                _allowance_snapshot(known) != _allowance_snapshot(raw)
+                or not _identity_matches(recorded, known.get('identity') or {})):
+            return 'newer live evidence is not the saved app-server reading'
+    return None
+
+
+def _save_codex_last_good(raw: dict, policy: dict, identity: dict) -> None:
+    """Keep the newest app-server response, including exhausted responses which block an older safe one.
+    All writes share the meter's atomic, locked, monotonic and deferred-write rules."""
+    if raw.get('source') != 'app-server':
+        return
+    recorded = raw.get('identity') or {}
+    conflict = not isinstance(recorded, dict) or any(
+        k in recorded and recorded[k] != v for k, v in identity.items())
+    reading = dict(raw, identity=identity if conflict else {**identity, **recorded})
+    # An incomplete or conflicting response invalidates older evidence instead of hiding a new refusal.
+    if conflict or finish_codex(reading, policy)['status'] == 'unknown':
+        reading = {'source': 'none', 'reading_at': raw.get('reading_at'), 'identity': reading['identity']}
+    try:
+        _cache_update(codex_last_good_path(), lambda cur: None if isinstance(cur, dict)
+                      and _older(reading.get('reading_at'), cur.get('reading_at')) else reading)
+    except OSError:
+        pass  # optional persistence must not turn a successful live probe into a failure
+
+
 def read_codex_raw(_argv=None, sessions_root=None, timeout: float = APP_SERVER_TIMEOUT_S,
-                   rollout_fallback: bool = True) -> dict:
-    """The app-server reading; when that fails, the newest local rollout reading unless rollout_fallback is off,
-    in which case a failed exchange is source 'none' (status unknown) and no session file is opened."""
+                   rollout_fallback: bool = True, policy: dict | None = None) -> dict:
+    """Live app-server first, then opt-in last-good, then the independently controlled rollout fallback."""
+    policy = policy if policy is not None else common.load_policy()
+    enabled = bool(codex_last_good_max_age(policy))  # off: no auth read, no last-good write, as before
+    identity = _codex_auth_identity() if enabled else None
     reading, why = read_app_server(_argv, timeout)
     if not reading and isinstance(why, _RetryableAppServerFailure):
         reading, why = read_app_server(_argv, APP_SERVER_RETRY_TIMEOUT_S)
     if reading:
+        if enabled and identity is not None and identity == _codex_auth_identity():
+            _save_codex_last_good(reading, policy, identity)
         return reading
+    if enabled:
+        saved = common.read_json(codex_last_good_path())
+        if isinstance(saved, dict) and saved.get('source') == 'app-server':
+            candidate = dict(saved, source='last-good', stale=True)
+            problem = _last_good_problem(candidate, policy, common.now())
+            if not problem:
+                age = int(common.age_s(saved['reading_at']))
+                candidate['note'] = _join(f'last-good app-server reading, {age}s old', why)
+                return candidate
+            why = _join(why, f'last-good unavailable: {problem}')
     if not rollout_fallback:
         return {'source': 'none', 'note': _join(why, 'rollout fallback off (meter.codex_rollout_fallback / --no-rollout)')}
     fallback = rollout_reading(sessions_root)
@@ -1189,6 +1361,8 @@ def _cached_meter(policy: dict) -> dict | None:
             return None
         a = common.age_s(m[eng].get('reading_at'))
         m[eng]['age_s'] = None if a is None else int(a)
+    if m['codex'].get('source') == 'last-good':
+        m['codex'] = finish_codex(m['codex'], policy)
     return m
 
 
@@ -1235,7 +1409,7 @@ def read(fresh: bool = False, refresh_claude: bool = False, policy: dict | None 
         claude_reader = lambda: read_claude_raw(refresh=refresh_claude, _http=_http, _run=_run)  # noqa: E731
     use_rollouts = rollout_fallback_enabled(policy) if rollout_fallback is None else rollout_fallback is True
     readers = {'claude': claude_reader,
-               'codex': _codex_reader or (lambda: read_codex_raw(rollout_fallback=use_rollouts))}
+               'codex': _codex_reader or (lambda: read_codex_raw(rollout_fallback=use_rollouts, policy=policy))}
     raw: dict = {}
 
     queue_ = getattr(_deferral, 'queue', None)  # the reader threads inherit this thread's deferral
@@ -1424,6 +1598,8 @@ def _fmt_engine(name: str, sec: dict, now, say_resets: bool = True) -> str:
     body = ' · '.join(parts)
     src = sec.get('source') or 'none'
     tag = f'[{src}, {_fmt_age(sec.get("age_s"))} old]' if src != 'none' else '[none]'
+    if sec.get('stale'):
+        tag = tag[:-1] + ', stale]'
     return f'{name}: {sec.get("status", "unknown")} ' + (f'{body} ' if body else '') + tag
 
 

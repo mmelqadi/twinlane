@@ -207,7 +207,8 @@ Dispatch trusts a reading only while the cache is younger than `meter.cache_ttl_
 Two settings keep that refresh narrow:
 
 - `TWINLANE_CODEX_BIN=PATH` runs that Codex binary as given. On Windows, twinlane otherwise copies the desktop app's build into `<home>/bin`, leases the copy and prunes older copies; an explicit binary outside the app's own folders skips all three.
-- `--no-rollout` (or `meter.codex_rollout_fallback: false` in your config) never reads local Codex rollout session files. A failed app-server exchange then leaves Codex **unknown** instead of falling back to the newest rollout reading.
+- `--no-rollout` (or `meter.codex_rollout_fallback: false` in your config) never reads local Codex rollout session files. A failed app-server exchange leaves Codex **unknown** unless the separate last-good fallback below is enabled.
+- `meter.codex_last_good_max_age_s` defaults to **0 (off)**. Set a positive maximum age in seconds to allow the newest successful app-server reading when a live probe fails. Twinlane writes it atomically to `state/codex-last-good.json`; rollout readings never enter this file. Reuse requires every recorded window to be below `thresholds.stop_pct`, no limit or billing refusal, and no recorded account or plan mismatch. The original timestamp and percentages remain unchanged, even after a reset time passes. Status and board label it `last-good`, `stale`, and show its age. Expired readings remain unknown; urgency cannot lift these restrictions. This setting does not enable rollout access or change Claude readings.
 
 ```sh
 TWINLANE_CODEX_BIN=/path/to/codex twinlane meter --fresh --no-rollout --json
@@ -225,7 +226,7 @@ Credits and extra usage are checked only when a job starts. A long Codex job can
 
 ## Workers and receipts
 
-`twinlane run` accepts `--engine`, `--kind`, `--cd`, `--brief`, `--bg`, `--write`, `--name`, `--baton`, `--effort`, and `--timeout`. A code worker can edit its selected worktree; an intel worker gets a read-only profile. Background jobs have an ID, an evidence directory, event stream, final message, usage information where reported, and a receipt. Use `twinlane wait JOB --any`, `twinlane result JOB`, or `twinlane stop JOB`.
+`twinlane run` accepts `--engine`, `--kind`, `--cd`, `--brief`, `--bg`, `--write`, `--name`, `--baton`, `--effort`, and `--timeout`. A code worker can edit its selected worktree; an intel worker gets a read-only profile. Background jobs have an ID, an evidence directory, event stream, final message, usage information where reported, and a receipt. Use `twinlane wait JOB --any`, `twinlane result JOB`, or `twinlane stop JOB`. `--timeout` is one budget for the whole job, measured from the start of its first attempt: slot waiting, preflight, snapshots, process creation, engine time and any automatic retry all spend it. Earlier releases counted it from engine launch only. A retry is not launched with less than one second left. An engine never gets a fresh window after its own launch bookkeeping, and an expired budget goes straight to the normal timeout kill and survivor checks.
 
 Codex uses the installed CLI through `codex exec --json`. `TWINLANE_CODEX_RUN` can name an optional compatible adapter. No adapter is required. Evidence includes `events.jsonl`, `last-message.md`, and `result.txt`.
 
@@ -236,6 +237,25 @@ Job liveness has three values: alive, dead and unknown. A process that exists bu
 `twinlane jobs archive [--older-than DAYS] [--include-unread] [--apply] [--json]` previews old finished jobs, with candidate details and skip reasons. The default age is 14 days (`jobs.archive_after_days` in policy). Only receipts with status `done`, `failed`, `timeout`, `stopped` or `refused` qualify. Receipts must have been read with `result` unless `--include-unread` is given. Live or unknown processes, runner locks, unreadable evidence and pending baton work prevent archival. `--apply` refuses with exit 3 unless every job in the live folder is terminal and dead; dry runs still list candidates and explain any apply block. New lifecycle writers take an outer archive lock before the original in-folder locks, preserving exclusion with older runners. Archival probes and closes the in-folder locks before renaming while retaining the outer lock. `--apply` rechecks each job and moves it to `<home>/jobs/archive/YYYY-MM/<id>`, then appends an audit entry to `index.jsonl`; it never deletes evidence. An index write or sync failure reports `index entry uncertain` and keeps the job moved; lookups scan the archive layout and retries do not duplicate entries. `result`, `status` and `wait` still resolve archived ids, including when the index is unavailable. Normal `jobs` and `board` listings show active folders only. Workers may preview but cannot apply archival. Archival cannot exclude a twinlane release older than 0.3.3: run `--apply` only once every process using the home runs this release, because an older `stop` or refusal aimed at an already archived id could recreate a live folder next to the archived evidence.
 
 On Windows, every `--bg` runner is created through WMI (`detach=wmi`), outside every job object of the launching app and outside its process tree. If WMI cannot start it, `--bg` is refused (exit 3) rather than falling back to a start that could die with the app. macOS and Linux keep their own path: a new process session and process-group stop.
+
+The optional job-state index is disabled by default. Set `"jobs_index": {"enabled": true}` in
+policy to enable `state/jobs.db` (SQLite WAL). Only literal `true` enables it. Status/receipt
+publication updates the cache after writing the folder; an index failure never fails a job.
+A dirty marker (`state/jobs.db.dirty/`, containing failure tokens) disables cache reads until
+rebuild. Missing rows, unfinished rows, a busy/unreadable/corrupt database and schema mismatches
+use the existing folder path. Folder names are always the universe; indexed PIDs never decide
+liveness. A terminal row can skip folder reads only while its result/status file stats still
+match and it has no survivor or unresolved launch/tree markers. Removed/archived folders are
+ignored even if their rows remain. Board history details still come from folders; the cache
+supplies old-history exclusion and status live-job collection.
+
+`twinlane jobs reindex [--dry-run] [--json]` rebuilds from folders into a separate database,
+closes/checkpoints it, then atomically replaces the cache. It clears pre-scan dirty tokens;
+a concurrent failed write keeps the index dirty. Dry run creates no database. Enable the policy
+first; workers cannot run reindex, including dry runs. Close external SQLite viewers before
+rebuilding: open WAL sidecars prevent replacement. OFF opens no SQLite database and creates
+no index files. Commands that already load policy add no policy reads; `jobs`, `wait`, `result`
+and `stop` load policy once to discover the opt-in on their repair/collection paths.
 
 ## Batons, board, and sessions
 
@@ -466,3 +486,48 @@ ahead/behind, unique commits, diffstat, gate evidence, acceptance and inbox. Enq
 After landing, `land.archive_worktree` is `suggest` by default (`off`/`apply` are opt-in alternatives);
 the suggestion uses `wt prune --merged-only --apply --only PATH`. Automatic archive keeps every prune
 safety and skips only the one-hour minimum age for that just-landed worktree. Archive failure preserves the landing result.
+
+### Receipt read stamps and sink trust
+
+Completion sinks are off by default. To opt in, set `"notify": {"completions_log": true,
+"toast": false}` in your config; only literal `true` enables a sink. The publishing runner
+appends one metadata-only JSON line to `state/completions.jsonl` after its final receipt
+write and after releasing custody, slot and writer locks. Owner-baton notifications continue
+unchanged. Read it with `twinlane completions [--since ISO|--unacked] [--json]`; `--unacked`
+uses the same valid read-stamp rule as `ack`. The reader writes nothing, even with no home.
+No rotation is implemented; retain the append-only history for now.
+
+`notify.toast: true` also enables an advisory Windows toast containing only job ID, name
+(up to 200 characters, controls normalized) and status. A fixed PowerShell script receives
+JSON data on stdin; no user command or trusted-sink file is executed. A windowless helper
+owns a five-second PowerShell timeout; the runner does not wait for it. Platforms without
+toast support, denied process breakaway, and sink failures are skipped with a `runner.log`
+note. Neither sink changes receipts, retries jobs, or dismisses owner notices. There is no
+backfill: jobs completed with sinks off, or during a failed append, retain their existing
+receipts but do not appear in the log. Stalled attempts keep the existing final `failed`
+receipt status. Workers have no setting-mutation or completion-append CLI; the existing
+worktree guard protects config and state paths.
+
+After reading `final.md` directly, `twinlane ack JOB...` stamps the same receipt marker as
+`result`. Preview bulk stamping with `twinlane ack --older-than 14 --name 'review*' --dry-run`,
+then omit `--dry-run` to stamp; `--owner SLUG` is an alternative filter. Age is measured from
+receipt completion, strictly older than the threshold. Missing, malformed or nonterminal
+receipts are skipped. Pending/unverified owner completions and notices still visible in the
+owner inbox are retained: use `twinlane result JOB` to collect those notices. Ack changes no
+baton, process state or admission claim. The board includes an uncapped uncollected receipt
+count grouped by owner, even when old finished rows are hidden.
+
+`twinlane trust add NAME PATH` records a sink file's absolute path, SHA-256, timestamp and
+local user in `state/trusted-sinks.json`. `trust list` reports current hash validity;
+`trust remove NAME` revokes the record. Changed or unreadable files are untrusted until an
+explicit `trust add` records them again. Nothing loads or executes these files yet. The helper
+`trusted_sink(name)` verifies bytes at lookup; future callers must handle use-time races.
+Workers cannot invoke ack or trust mutations against shared state through the tool guard.
+
+`tests/test_invariant_lint.py` guards UNKNOWN-keeps patterns with a shrinking baseline in
+`tests/invariant-lint-baseline.txt`. It recognizes local pid-state aliases and ALIVE comparisons
+near lexical release/remove calls or waiter filtering, plus literal absence/free returns from
+broad exception handlers in claim/release/free/dead/gone functions. This heuristic is not a
+control-flow proof. The one accepted false positive is `_waiters`: it filters FIFO ordering
+without releasing custody. New signatures fail; removed signatures require deleting their
+baseline entry too.

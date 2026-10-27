@@ -892,7 +892,7 @@ def _compile_config(key: str) -> dict:
     alt = '|'.join(re.escape(n) for n in sorted(names))
     # A script path followed by a verb: `.../twinlane/cli.py land`, `twinlane.py run`, `tl.py ship`.
     self_text = re.compile(r'(?<![\w.-])(?:' + alt + r')(?:[\\/](?:cli|__main__))?\.pyw?["\']?\s+["\']?'
-                           r'(?:run|_job|land|ship|resume|install|watch|wt\s+["\']?(?:prune|gc)|inbox\s+["\']?answer|wip\s+["\']?next)\b|(?:' + alt +
+                           r'(?:run|_job|land|ship|resume|install|watch|ack|trust\s+["\']?(?:add|remove)|wt\s+["\']?(?:prune|gc)|inbox\s+["\']?answer|wip\s+["\']?next)\b|(?:' + alt +
                            r')[\\/](?:cli|__main__)\.pyw?["\']?\s.*--best', re.I)
     return {'allow_subagents': allow, 'self_names': frozenset(names), 'deny_commands': tuple(deny_commands),
             'deny_text': tuple(deny_text), 'self_text': self_text}
@@ -979,6 +979,10 @@ def _self_reason(args: list[str], label: str) -> str | None:
         return why.format(pos[0])
     if pos[:2] == ['jobs', 'archive'] and any(a == '--a' or a.startswith('--ap') for a in low):
         return why.format('jobs archive --apply')
+    if pos[:2] == ['jobs', 'reindex']:
+        return why.format('jobs reindex')
+    if pos[0] == 'ack' or pos[0] == 'trust' and pos[1:2] != ['list']:
+        return why.format(' '.join(pos[:2]))
     if pos[0] in ('inbox', 'wip') and any(a in ('answer', 'next', 'pump') for a in pos[1:]):
         return why.format(' '.join(pos[:2]))
     if pos[0] == 'wt' and (len(pos) < 2 or pos[1] not in SELF_WT_ALLOWED or 'prune' in pos or

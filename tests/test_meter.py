@@ -889,6 +889,251 @@ for line in sys.stdin:
         self.assertIn('-32600', why)
 
 
+
+class CodexLastGoodTests(TempState):
+    def setUp(self):
+        super().setUp()
+        self.policy['meter']['codex_last_good_max_age_s'] = 600
+        self.policy['meter']['codex_rollout_fallback'] = False
+        self.login('ACCOUNT-A')  # reuse needs a proven account and plan
+
+    def probe(self, reading=None, rollout=False):
+        with mock.patch.object(meter, 'read_app_server', return_value=(reading, 'app-server timed out')):
+            return meter.read_codex_raw(policy=self.policy, rollout_fallback=rollout,
+                                        sessions_root=os.path.join(self.tmp, 'no-sessions'))
+
+    def both(self, claude=None):
+        with mock.patch.object(meter, 'read_app_server', return_value=(None, 'app-server timed out')):
+            return meter.read(fresh=True, policy=self.policy,
+                              _claude_reader=lambda: claude if claude is not None else claude_raw(20))
+
+    def test_off_by_default_and_malformed_settings_fail_closed(self):
+        self.assertEqual(common.load_policy()['meter']['codex_last_good_max_age_s'], 0)
+        self.probe(codex_raw(20))
+        for setting in (0, -1, True, None, '600', float('inf'), float('nan')):
+            with self.subTest(setting=setting):
+                self.policy['meter']['codex_last_good_max_age_s'] = setting
+                self.assertEqual(self.probe()['source'], 'none')
+
+    def test_disabled_probe_reads_no_login_and_writes_no_last_good(self):
+        self.policy['meter']['codex_last_good_max_age_s'] = 0
+        with mock.patch.object(meter, '_codex_auth_identity', side_effect=AssertionError('auth read')), \
+                mock.patch.object(meter, '_save_codex_last_good', side_effect=AssertionError('last-good write')):
+            self.assertEqual(self.probe(codex_raw(20))['source'], 'app-server')
+            self.assertEqual(self.probe()['source'], 'none')
+        self.assertFalse(os.path.exists(meter.codex_last_good_path()))
+
+    def test_fresh_app_server_last_good_is_usable_and_visible(self):
+        from twinlane import board, route
+        raw = codex_raw(40)
+        self.assertEqual(self.probe(raw)['source'], 'app-server')
+        saved = common.read_json(meter.codex_last_good_path())
+        m = self.both()
+        sec = m['codex']
+        self.assertEqual(sec['source'], 'last-good')
+        self.assertTrue(sec['stale'])
+        self.assertEqual(sec['reading_at'], raw['reading_at'])
+        self.assertEqual(sec['status'], 'ok')
+        self.assertIn('s old', sec['note'])
+        self.assertIn('app-server timed out', sec['note'])
+        self.assertFalse(route.decide('code', m, self.policy, engine='codex')['refused'])
+        self.assertIn('[last-good,', meter.format_line(m))
+        self.assertIn('stale]', meter.format_line(m))
+        views = board.collect_meters(self.policy, common.now())
+        self.assertEqual(views['codex']['source'], 'last-good')
+        self.assertTrue(views['codex']['stale'])
+        self.assertIn('stale]', board._engine_line('codex', views['codex']))
+        self.assertEqual(views['routes']['verify']['engine'], 'codex')
+        self.assertEqual(common.read_json(meter.codex_last_good_path()), saved)
+
+    def test_expired_boundary_and_future_readings_are_unknown(self):
+        now = common.now().replace(microsecond=0)
+        with mock.patch.object(common, 'now', return_value=now):
+            for age in (600, 601, 1200, -10):
+                with self.subTest(age=age):
+                    raw = codex_raw(20, age=age)
+                    common.write_json(meter.codex_last_good_path(), raw)
+                    self.assertEqual(self.probe()['source'], 'none')
+
+    def test_any_window_at_stop_is_refused_even_if_it_would_have_reset(self):
+        from twinlane import route
+        for pct in (85, 100):
+            for reset in (3600, -10):
+                with self.subTest(pct=pct, reset=reset):
+                    raw = codex_raw(20)
+                    raw['windows'].append({'name': 'another:weekly', 'limit': 'another',
+                                           'pct': pct, 'resets_at': iso_in(reset)})
+                    self.probe(raw)
+                    sec = meter.finish_codex(self.probe(), self.policy)
+                    self.assertEqual(sec['status'], 'unknown')
+                    self.assertFalse(route.usable('codex', sec, self.policy, urgent=True))
+
+    def test_newest_unsafe_reading_replaces_safe_and_old_completion_cannot_restore_it(self):
+        self.probe(codex_raw(20, age=60))
+        self.probe(codex_raw(90, age=5))
+        self.probe(codex_raw(10, age=30))
+        self.assertEqual(common.read_json(meter.codex_last_good_path())['windows'][0]['pct'], 90)
+        self.assertEqual(self.probe()['source'], 'none')
+
+    def test_rollout_readings_are_never_stored_and_no_rollout_still_means_no_session_reads(self):
+        raw = dict(codex_raw(20), source='rollout')
+        with mock.patch.object(meter, 'rollout_reading', return_value=raw) as rr:
+            self.assertEqual(self.probe(rollout=True)['source'], 'rollout')
+            self.assertFalse(os.path.exists(meter.codex_last_good_path()))
+            rr.assert_called_once()
+        self.probe(codex_raw(20))
+        with mock.patch.object(meter, 'rollout_reading', side_effect=AssertionError('session files opened')):
+            self.assertEqual(self.probe()['source'], 'last-good')
+
+    def test_claude_unknown_and_extra_usage_hold_are_unchanged(self):
+        from twinlane import route
+        self.probe(codex_raw(20))
+        for raw in ({'source': 'none'}, claude_raw(20, extra=None)):
+            with self.subTest(raw=raw):
+                m = self.both(raw)
+                self.assertEqual(m['claude']['status'], 'unknown')
+                self.assertEqual(m['codex']['source'], 'last-good')
+                self.assertTrue(route.decide('code', m, self.policy, engine='claude')['refused'])
+
+    def test_limits_billing_and_incomplete_responses_do_not_reuse_older_safe_evidence(self):
+        for change in ({'ordinary_usage_allowed': False}, {'limit_reached_type': 'weekly'},
+                       {'spend_control_reached': True}, {'on_credits': True}, {'windows': []},
+                       {'windows': [{'name': 'weekly', 'pct': True}]}):
+            with self.subTest(change=change):
+                self.probe(codex_raw(20, age=60))
+                self.probe(dict(codex_raw(20), **change))
+                self.assertEqual(self.probe()['source'], 'none')
+
+    def login(self, account, plan='pro'):
+        import base64
+        details = {'https://api.openai.com/auth': {'chatgpt_plan_type': plan}}
+        payload = base64.urlsafe_b64encode(json.dumps(details).encode()).decode().rstrip('=')
+        common.write_json(os.path.join(common.CODEX_DIR, 'auth.json'),
+                          {'tokens': {'account_id': account, 'id_token': 'x.' + payload + '.x',
+                                      'access_token': 'FAKE-PRIVATE-TOKEN'}})
+
+    def test_account_plan_changes_and_signout_or_incomplete_login_refuse_bound_reading(self):
+        path = os.path.join(common.CODEX_DIR, 'auth.json')
+        self.login('ACCOUNT-A')
+        self.probe(codex_raw(20))
+        self.assertEqual(self.probe()['source'], 'last-good')
+        for account, plan in (('ACCOUNT-B', 'pro'), ('ACCOUNT-A', 'plus')):
+            self.login(account, plan)
+            self.assertEqual(self.probe()['source'], 'none')
+        self.login('ACCOUNT-A')
+        self.assertEqual(self.probe()['source'], 'last-good')
+        for payload in ({}, {'tokens': {}}, {'tokens': {'account_id': 'ACCOUNT-A'}}):
+            with self.subTest(payload=payload):
+                common.write_json(path, payload)  # no account, or an account without a plan
+                self.assertEqual(self.probe()['source'], 'none')
+        os.remove(path)
+        self.assertEqual(self.probe()['source'], 'none')
+        self.assertNotIn('ACCOUNT-A', self.state_text())
+        self.assertNotIn('FAKE-PRIVATE-TOKEN', self.state_text())
+
+    def test_unreadable_or_api_key_login_never_reuses_subscription_allowance(self):
+        self.login('ACCOUNT-A')
+        self.probe(codex_raw(20))
+        path = os.path.join(common.CODEX_DIR, 'auth.json')
+        for payload in ('{broken', json.dumps({'auth_mode': 'apikey', 'OPENAI_API_KEY': 'FAKE-KEY'}),
+                        json.dumps({'tokens': 'invalid'})):
+            with self.subTest(payload=payload):
+                with open(path, 'w', encoding='utf-8') as handle:
+                    handle.write(payload)
+                self.assertEqual(self.probe()['source'], 'none')
+
+    def test_app_server_identity_is_fingerprinted_and_conflict_invalidates_old_evidence(self):
+        raw = meter.parse_app_server({'accountId': 'ACCOUNT-A', 'rateLimits': {
+            'planType': 'pro', 'primary': {'usedPercent': 20, 'windowDurationMins': 300}}})
+        self.assertNotIn('ACCOUNT-A', json.dumps(raw))
+        self.login('ACCOUNT-B')
+        self.probe(codex_raw(20, age=60))
+        self.probe(raw)
+        self.assertEqual(common.read_json(meter.codex_last_good_path())['source'], 'none')
+        self.assertEqual(self.probe()['source'], 'none')
+        os.remove(os.path.join(common.CODEX_DIR, 'auth.json'))
+        self.assertEqual(self.probe()['source'], 'none')
+
+    def test_cached_last_good_rechecks_age_policy_and_stop_without_refresh(self):
+        from twinlane import board, route
+        now = common.now().replace(microsecond=0)
+        with mock.patch.object(common, 'now', return_value=now):
+            self.policy['meter']['codex_last_good_max_age_s'] = 10
+            self.probe(codex_raw(40))
+            m = self.both()
+        with mock.patch.object(common, 'now', return_value=now + dt.timedelta(seconds=6)), \
+                mock.patch.object(meter, 'read_codex_raw', side_effect=AssertionError('unexpected refresh')):
+            self.assertEqual(meter.read(policy=self.policy)['codex']['status'], 'unknown')
+            self.assertFalse(route.usable('codex', m['codex'], self.policy, urgent=True))
+            self.assertEqual(board.collect_meters(self.policy, common.now())['codex']['status'], 'unknown')
+        with mock.patch.object(common, 'now', return_value=now):
+            for value in (0, 600):
+                self.policy['meter']['codex_last_good_max_age_s'] = value
+                self.policy['thresholds']['stop_pct'] = 30
+                self.assertEqual(meter.read(policy=self.policy)['codex']['status'], 'unknown')
+                self.assertFalse(route.usable('codex', m['codex'], self.policy, urgent=True))
+
+    def test_last_good_does_not_infer_reset_and_has_its_own_configured_lifetime(self):
+        raw = codex_raw(40, age=2000)
+        raw['windows'][0]['resets_at'] = iso_in(-100)
+        raw['identity'] = meter._codex_auth_identity()  # a hand-written reading is bound like a saved one
+        self.policy['meter']['codex_last_good_max_age_s'] = 3600
+        common.write_json(meter.codex_last_good_path(), raw)
+        sec = meter.finish_codex(self.probe(), self.policy)
+        self.assertEqual(sec['max_pct'], 40)
+        self.assertEqual(sec['status'], 'ok')
+        self.assertNotIn('rolled_over', sec['windows'][0])
+        # Metadata-preserving starts apply the same explicit lifetime without probing or writing.
+        from twinlane import jobs
+        common.write_json(meter.meter_path(), {'read_at': iso_in(0),
+                          'claude': meter.finish_claude(claude_raw(20), self.policy), 'codex': sec})
+        with mock.patch.object(jobs, '_read_meter', None), mock.patch.object(jobs, '_PRESERVING_METADATA') as mode:
+            mode.get.return_value = True
+            self.assertEqual(jobs._meter(self.policy)['codex']['status'], 'ok')
+            # A finite float lifetime the meter accepts is accepted at admission too, not refused as invalid.
+            self.policy['meter']['codex_last_good_max_age_s'] = 3600.0
+            self.assertEqual(jobs._meter(self.policy)['codex']['status'], 'ok')
+
+    def test_new_live_refusal_invalidates_an_already_cached_last_good(self):
+        from twinlane import route
+        self.probe(codex_raw(20, age=60))
+        m = self.both()
+        self.probe(codex_raw(90))
+        sec = meter.read(policy=self.policy)['codex']
+        self.assertEqual(sec['status'], 'unknown')
+        self.assertFalse(route.usable('codex', m['codex'], self.policy, urgent=True))
+
+    def test_failed_last_good_write_cannot_hide_a_published_live_refusal(self):
+        self.probe(codex_raw(20, age=60))
+        self.both()
+        with mock.patch.object(meter, '_save_codex_last_good', side_effect=lambda *args: None):
+            with mock.patch.object(meter, 'read_app_server', return_value=(codex_raw(90), '')):
+                live = meter.read(fresh=True, policy=self.policy, _claude_reader=lambda: claude_raw(20))
+        self.assertEqual(live['codex']['status'], 'stop')
+        self.assertEqual(self.probe()['source'], 'none')
+
+    def test_failed_write_cannot_hide_a_live_account_change_with_identical_usage(self):
+        now = common.now().replace(microsecond=0)
+        with mock.patch.object(common, 'now', return_value=now):
+            self.login('ACCOUNT-A')
+            self.probe(codex_raw(20))
+            changed =dict(codex_raw(20), identity=meter._codex_identity({'accountId': 'ACCOUNT-B', 'plan': 'pro'}))
+            with mock.patch.object(meter, '_save_codex_last_good', side_effect=lambda *args: None):
+                with mock.patch.object(meter, 'read_app_server', return_value=(changed, '')):
+                    meter.read(fresh=True, policy=self.policy, _claude_reader=lambda: claude_raw(20))
+            self.assertEqual(self.probe()['source'], 'none')
+
+    def test_last_good_write_is_deferred_and_failed_write_keeps_live_result(self):
+        with meter.deferred_cache_writes() as pending:
+            raw = self.probe(codex_raw(20))
+            self.assertFalse(os.path.exists(meter.codex_last_good_path()))
+        self.assertEqual(len(pending), 1)
+        meter.run_deferred(pending)
+        self.assertEqual(common.read_json(meter.codex_last_good_path())['reading_at'], raw['reading_at'])
+        with mock.patch.object(meter, '_cache_update', side_effect=PermissionError('fixture')):
+            self.assertEqual(self.probe(codex_raw(30))['source'], 'app-server')
+
+
 class ReadAndCacheTests(TempState):
     def test_read_uses_injected_readers_and_writes_cache(self):
         m = meter.read(fresh=True, policy=self.policy, _claude_reader=lambda: claude_raw(12),

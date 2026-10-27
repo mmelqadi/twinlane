@@ -40,6 +40,7 @@ class PreservingCodexStartTests(unittest.TestCase):
         self.store, self.state = self.root / 'jobs', self.root / 'state'
         self.cwd = str(self.root / 'work')
         (self.root / 'work' / 'README.md').write_text('synthetic work tree', encoding='utf-8')
+        (self.root / 'work' / '.git').mkdir()  # a Codex --cd must be a git work tree (git-cwd preflight)
         self.brief = self.root / 'brief.md'
         self.brief.write_text('Synthetic source-only task', encoding='utf-8')
         self.binary = self.root / 'local' / 'Programs' / 'OpenAI' / 'Codex' / 'bin' / 'codex.exe'

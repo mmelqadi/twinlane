@@ -377,7 +377,8 @@ class Papercuts(Fixture):
             self.assertNotIn('TWINLANE_CODEX_BIN', jobs.claude_env(jid()))
             brief = self.tmp / 'brief.md'
             brief.write_text('Review the fixture', encoding='utf-8')
-            args = jobs._run_parser().parse_args(['--brief', str(brief), '--cd', str(self.tmp),
+            (self.tmp / 'repo' / '.git').mkdir(parents=True)  # a Codex --cd must be a git work tree
+            args = jobs._run_parser().parse_args(['--brief', str(brief), '--cd', str(self.tmp / 'repo'),
                                                   '--engine', 'codex', '--kind', 'intel', '--dry-run'])
             with mock.patch.object(jobs, '_meter', return_value={}), \
                     mock.patch.object(jobs, '_route', return_value={'engine': 'codex', 'profile': 'intel'}), \

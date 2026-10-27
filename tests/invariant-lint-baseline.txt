@@ -1,0 +1,4 @@
+# Accepted FIFO-filter false positive: _waiters ignores unprovably alive runners when
+# ordering waiters; it does not release a writer claim, engine slot or worktree custody.
+# A disappearing hit must be removed from this baseline in the same change.
+twinlane/jobs.py:_waiters:alive-free:_pid_state(st.get('pid'), st.get('pid_created')) != common.ALIVE -> continue
