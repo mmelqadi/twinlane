@@ -51,6 +51,13 @@ class ConsoleHostGauge(unittest.TestCase):
         for reading in (self.CALM, dict(self.CALM, console_hosts=None)):
             self.assertEqual(hostload.effective_parallel(14, reading), (14, None))
 
+    def test_nan_and_infinite_counts_are_ignored_not_raised(self):
+        for bad in (float('nan'), float('inf'), float('-inf')):
+            reading = dict(self.CALM, console_hosts=bad, engine_procs=bad)
+            self.assertEqual(hostload.pressure(reading, hostload.settings(None)), (0.0, None))
+            self.assertEqual(hostload.effective_parallel(14, reading), (14, None))
+            hostload.line(reading, 14)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -1823,19 +1823,35 @@ def _run_codex(job_id, argv, cwd, timeout_s, files, params, policy=None, qualifi
 
 
 # A worker whose shell calls hung often ends with a short "I could not read the repo" and exit 0. That is not a result.
-UNREAD_PHRASES = ('could not read the repo', 'cannot read the repo', "can't read the repo", 'unable to read the repo',
-                  'could not access the repo', 'unable to access the repo', 'could not read any files',
-                  'cannot read any files', 'unable to read any files', 'shell is unavailable', 'shell unavailable',
-                  'no shell access')
+UNREAD_RE = re.compile(
+    r"(?:(?:could not|couldn't|cannot|can't|can not|unable to|was unable to|failed to|did not manage to) "
+    r"(?:read|access|open|inspect|see)"
+    r"(?: (?:any|all|the|your|this))?(?: (?:source|repo|repository|workspace|checkout|code|project))?"
+    r" (?:repo|repository|workspace|checkout|code|project|files?)"
+    r"|(?:shell|shell calls?|shell commands?|commands?) (?:is |are |was |were )?(?:unavailable|not available|hung|hanging|timed out)"
+    r"|no shell (?:access|available))")
+UNREAD_VERDICT_RE = re.compile(r"^[\s*_#>\-]*(?:pass|block|fail|approve|reject)\b", re.I)
+UNREAD_QUOTES = '"' + "'" + "`" + chr(0x201c) + chr(0x2018)
 UNREAD_HEAD_CHARS, UNREAD_MAX_CHARS = 600, 1500
 
 
 def _final_says_unread(text) -> bool:
-    """True for a short final message that opens by saying the repository or files could not be read."""
+    """True for a short final message that opens by saying the repository or files could not be read.
+
+    A message that opens with a verdict word (PASS, BLOCK, ...) is a result, and a phrase inside quotation marks is
+    being quoted, not reported; neither counts."""
     if not isinstance(text, str) or len(text.strip()) >= UNREAD_MAX_CHARS:
         return False
-    head = ' '.join(text.strip()[:UNREAD_HEAD_CHARS].lower().split()).replace('\u2019', "'")
-    return any(p in head for p in UNREAD_PHRASES)
+    body = text.strip()
+    if UNREAD_VERDICT_RE.match(body):
+        return False
+    head = ' '.join(body[:UNREAD_HEAD_CHARS].lower().split()).replace(chr(0x2019), "'")
+    for m in UNREAD_RE.finditer(head):
+        before = head[:m.start()].rstrip()
+        if before and before[-1] in UNREAD_QUOTES:
+            continue
+        return True
+    return False
 
 
 # ---------------------------------------------------------------- failover

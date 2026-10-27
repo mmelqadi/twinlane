@@ -365,6 +365,11 @@ def sample(policy: dict | None = None, now: float | None = None) -> dict | None:
 
 # ---------------------------------------------------------------- judging
 
+def _finite(value) -> bool:
+    """A usable count: a real number that is not NaN or infinite (a garbled cache file must not raise)."""
+    return type(value) in (int, float) and math.isfinite(value)
+
+
 def pressure(reading: dict | None, cfg: dict) -> tuple[float, str | None]:
     """(0..1, why). 0 means no pressure; 1 means every metric at its hard limit. `why` names the worst one."""
     if not isinstance(reading, dict):
@@ -384,11 +389,11 @@ def pressure(reading: dict | None, cfg: dict) -> tuple[float, str | None]:
         consider((cfg['ram_free_soft_mb'] - free) / (cfg['ram_free_soft_mb'] - cfg['ram_free_hard_mb']),
                  f'free RAM {free:.0f} MB')
     procs = reading.get('engine_procs')
-    if type(procs) in (int, float):
+    if _finite(procs):
         consider((procs - cfg['procs_soft']) / (cfg['procs_hard'] - cfg['procs_soft']),
                  f'{int(procs)} codex/sandbox processes')
     hosts = reading.get('console_hosts')
-    if type(hosts) in (int, float):
+    if _finite(hosts):
         consider((hosts - cfg['conhost_soft']) / (cfg['conhost_hard'] - cfg['conhost_soft']),
                  f'{int(hosts)} console hosts')
     return min(1.0, worst), why
@@ -421,9 +426,9 @@ def line(reading: dict | None, configured: int, policy: dict | None = None) -> s
         bits.append(f"cpu {reading['cpu_pct']:.0f}%")
     if type(reading.get('ram_free_mb')) in (int, float):
         bits.append(f"free RAM {reading['ram_free_mb'] / 1024:.1f} GB")
-    if type(reading.get('engine_procs')) in (int, float):
+    if _finite(reading.get('engine_procs')):
         bits.append(f"{int(reading['engine_procs'])} codex/sandbox procs")
-    if type(reading.get('console_hosts')) in (int, float):
+    if _finite(reading.get('console_hosts')):
         bits.append(f"{int(reading['console_hosts'])} console hosts")
     usable, why = effective_parallel(configured, reading, policy)
     tail = f'slots {usable}/{configured}' + (f' ({why})' if why else '')
