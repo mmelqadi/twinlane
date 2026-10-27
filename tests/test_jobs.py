@@ -1252,6 +1252,8 @@ class InlineRuns(JobsBase):
         self.assertFalse(said('`PASS` - the inline delta is correct. I could not read the repository files under docs/, which are outside this review.'))
         self.assertTrue(said('I could not read the repository because shell commands hung, so I cannot give a verdict.'))
         self.assertFalse(said('Reviewed every supplied file. I could not read the repository files under docs/ (out of scope).'))
+        self.assertFalse(said('Added a watchdog for shell commands hanging indefinitely.'))
+        self.assertTrue(said('The shell was unavailable, so I did nothing.'))
         self.assertFalse(said('Fixed the bug where shell commands hung; all checks now pass.'))
         self.assertFalse(said('I could not read the repo initially, but recovered and completed the review.'))
         self.assertTrue(said("Summary: I couldn't read the repository, and the 'fixture' wording is irrelevant."))

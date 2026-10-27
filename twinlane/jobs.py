@@ -1828,7 +1828,7 @@ UNREAD_RE = re.compile(
     r"(?:read|access|open|inspect|see)"
     r"(?: (?:any|all|the|your|this))?(?: (?:source|repo|repository|workspace|checkout|code|project))?"
     r" (?:repository|repo|workspace|checkout|codebase|code|project|files)\b(?!'s\b)"
-    r"|(?:shell|shell calls?|shell commands?|commands?) (?:is |are |was |were )?(?:unavailable|not available|hung|hanging|timed out)"
+    r"|(?:shell|shell calls?|shell commands?|commands?) (?:is|are|was|were) (?:unavailable|not available)"
     r"|no shell (?:access|available))")
 UNREAD_VERDICT_RE = re.compile(r"^[\s*_#>`-]*(?:verdict\s*[:-]?\s*)?[*_`]*(?:pass|block|approve|reject|lgtm)\b", re.I)
 UNREAD_QUOTED_RE = re.compile(
