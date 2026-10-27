@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 0.4.1 - 2026-10-27
+
+### Fixed
+- Packaging: `pyproject.toml` names the `twinlane` package explicitly. The 0.4.0 build failed on setuptools flat-layout discovery because the repository root also holds a `skills/` folder, so 0.4.0 was never published to PyPI; 0.4.1 carries the same code.
+
 ## 0.4.0 - 2026-10-27
 
 - Job admission waits on lock contention instead of failing: a runner that cannot take `slots.lock` or `writers.lock` keeps waiting with jittered backoff, shows `waiting for slot lock` (or writer lock) in `status.json`, and fails only after `jobs.lock_wait_s` (default 30 minutes) with the last observed holder. Process liveness is probed outside `slots.lock`, and every admission file is re-read under it, so the critical section stays short and the slot cap is still exact. One `jobs.lock_wait_s` bound covers a whole streak of lock waits and restarted scans; after three restarted scans in a row the next attempt probes inside the lock, so the oldest job always decides; `release_stale_writers` (a lead command) still fails after 30 s.

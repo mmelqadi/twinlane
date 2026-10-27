@@ -180,6 +180,11 @@ class DocumentedBoundaries(unittest.TestCase):
             self.assertEqual(top.group(1), version)
         self.assertEqual(re.search(r'(?m)^date-released: (\S+)', cff).group(1).strip('"\''), top.group(2))
 
+    def test_the_package_list_is_explicit_so_the_root_skills_folder_cannot_break_the_build(self):
+        import re
+        toml = (ROOT / 'pyproject.toml').read_text(encoding='utf-8')
+        self.assertRegex(toml, r'(?m)^packages = \["twinlane"\]')
+
 
 if __name__ == '__main__':
     unittest.main()
