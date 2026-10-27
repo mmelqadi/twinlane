@@ -81,7 +81,7 @@ def main():
                                           'total_tokens': total + 40}}}}) + '\n')
     if not limit:
         with open(os.path.join(out, 'last-message.md'), 'w', encoding='utf-8') as h:
-            h.write('Report: fake codex finished. تم\nfiles changed: none\n')
+            h.write(os.environ.get('FAKE_CODEX_FINAL') or 'Report: fake codex finished. تم\nfiles changed: none\n')
     sandbox = 'workspace-write' if opts['write'] else 'read-only'
     with open(os.path.join(out, 'result.txt'), 'w', encoding='utf-8') as h:
         h.write(f'exit={rc} seconds=1 model={model} effort=high sandbox={sandbox} session={sid} tokens=123 cli=fake\n')

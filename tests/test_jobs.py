@@ -1228,6 +1228,29 @@ class InlineRuns(JobsBase):
         self.assertIn('sandbox could not set up', notes)
         self.assertIn('unverified', notes)
 
+    def test_a_short_final_message_that_could_not_read_the_repo_is_a_failure(self):
+        said = jobs._final_says_unread
+        self.assertTrue(said('I could not read the repo, so there is nothing to report.'))
+        self.assertTrue(said('Sorry - the shell is unavailable.\nNothing was inspected.'))
+        self.assertTrue(said('I can\u2019t read the repo from this sandbox.'))
+        self.assertFalse(said('PASS - no findings.'))
+        self.assertFalse(said(''))
+        self.assertFalse(said(None))
+        self.assertFalse(said('Review done. ' + 'Detail line.\n' * 150 + 'Note: earlier I could not read the repo.'))
+        self.assertFalse(said('x ' * 400 + 'could not read the repo'))  # phrase after the opening 600 characters
+        os.environ['FAKE_CODEX_FINAL'] = 'I could not read the repo, so I made no changes.'
+        rc, out, _ = self.run_codex()
+        self.assertEqual(rc, common.EXIT_FAILED, out)
+        r = self.receipt(self.only_job())
+        self.assertEqual(r['status'], 'failed')
+        self.assertIn('could not read the repository', r['error'])
+
+    def test_a_normal_final_message_stays_done(self):
+        os.environ['FAKE_CODEX_FINAL'] = 'PASS - reviewed the diff; no findings.'
+        rc, out, _ = self.run_codex()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.receipt(self.only_job())['status'], 'done')
+
     def test_explicit_codex_binary_is_recorded(self):
         os.environ['TWINLANE_CODEX_BIN'] = self.fake_codex_bin
         rc, out, _ = self.cli('run', '--brief', self.brief, '--cd', self.work,

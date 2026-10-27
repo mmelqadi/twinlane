@@ -309,7 +309,7 @@ def collect(previous, deadline):
             findings.append(_error('hostload', ValueError('host cache missing, stale or unusable')))
         failed.add('hostload')
     if isinstance(reading, dict):
-        reading = {k: _number(reading.get(k), None) for k in ('cpu_pct', 'ram_free_mb', 'engine_procs')}
+        reading = {k: _number(reading.get(k), None) for k in ('cpu_pct', 'ram_free_mb', 'engine_procs', 'console_hosts')}
     pressure, why = hostload.pressure(reading, cfg) if cfg['enabled'] else (0, None)
     overload = (previous['overload_passes'] if 'hostload' in failed else
                 previous['overload_passes'] + 1 if pressure > 0 else 0)

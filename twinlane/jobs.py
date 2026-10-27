@@ -1808,6 +1808,9 @@ def _run_codex(job_id, argv, cwd, timeout_s, files, params, policy=None, qualifi
     else:
         out['status'] = 'failed'
     out['codex_error'] = c.get('error_text')
+    if out['status'] == 'done' and _final_says_unread(c['final_text']):
+        out['status'] = 'failed'
+        out['error'] = 'worker could not read the repository (its final message says so)'
     if sandbox_failed and out['status'] == 'done':
         out['status'] = 'failed'
         out['error'] = ("the Codex sandbox could not set up ('setup refresh had errors'); "
@@ -1817,6 +1820,22 @@ def _run_codex(job_id, argv, cwd, timeout_s, files, params, policy=None, qualifi
         if out['status'] == 'timeout':
             out['error'] = f'timed out after {timeout_s} s' + (f": {c['error_text']}" if c.get('error_text') else '')
     return _mark_stalled(out, stall)
+
+
+# A worker whose shell calls hung often ends with a short "I could not read the repo" and exit 0. That is not a result.
+UNREAD_PHRASES = ('could not read the repo', 'cannot read the repo', "can't read the repo", 'unable to read the repo',
+                  'could not access the repo', 'unable to access the repo', 'could not read any files',
+                  'cannot read any files', 'unable to read any files', 'shell is unavailable', 'shell unavailable',
+                  'no shell access')
+UNREAD_HEAD_CHARS, UNREAD_MAX_CHARS = 600, 1500
+
+
+def _final_says_unread(text) -> bool:
+    """True for a short final message that opens by saying the repository or files could not be read."""
+    if not isinstance(text, str) or len(text.strip()) >= UNREAD_MAX_CHARS:
+        return False
+    head = ' '.join(text.strip()[:UNREAD_HEAD_CHARS].lower().split()).replace('\u2019', "'")
+    return any(p in head for p in UNREAD_PHRASES)
 
 
 # ---------------------------------------------------------------- failover
