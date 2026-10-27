@@ -1835,6 +1835,7 @@ UNREAD_QUOTED_RE = re.compile(
     '"[^"]*"' + '|(`+)[^`]*?' + chr(92) + '1'
     + '|' + chr(0x201c) + '[^' + chr(0x201d) + ']*' + chr(0x201d)
     + "|(?<!\\w)'[^']*'(?!\\w)")
+UNREAD_RECOVERED_RE = re.compile(r"\b(?:but|however|although|though|recovered|resolved|fixed|fix|now|eventually|after|once|retried|succeeded)\b")
 UNREAD_SENTENCE_RE = re.compile(r"(?<=[.!?])\s|\n")
 UNREAD_HEAD_CHARS, UNREAD_MAX_CHARS = 300, 800
 
@@ -1844,7 +1845,8 @@ def _final_says_unread(text) -> bool:
 
     Real reports are long and a review opens with its verdict, so the check is deliberately narrow: a message of
     UNREAD_MAX_CHARS or more is never judged, one that starts with a verdict word (PASS, BLOCK, ...) is a result, a
-    phrase inside quotation marks or backticks is being quoted, and a caveat about one part ("the repository's
+    phrase inside quotation marks or backticks is being quoted, a sentence that goes on to say the worker recovered (but, fixed,
+    now, after, ...) is a result, and a caveat about one part ("the repository's
     README") or a later sentence is not the whole task. A message the rule misses stays `done` and the lead reads it."""
     if not isinstance(text, str):
         return False
@@ -1852,7 +1854,8 @@ def _final_says_unread(text) -> bool:
     if not raw or len(raw) >= UNREAD_MAX_CHARS or UNREAD_VERDICT_RE.match(raw):
         return False
     first = UNREAD_SENTENCE_RE.split(UNREAD_QUOTED_RE.sub(' ', raw).strip(), 1)[0]
-    return UNREAD_RE.search(' '.join(first[:UNREAD_HEAD_CHARS].lower().split())) is not None
+    head = ' '.join(first[:UNREAD_HEAD_CHARS].lower().split())
+    return UNREAD_RE.search(head) is not None and not UNREAD_RECOVERED_RE.search(head)
 
 
 # ---------------------------------------------------------------- failover
