@@ -1827,12 +1827,12 @@ UNREAD_RE = re.compile(
     r"(?:(?:could not|couldn't|cannot|can't|can not|unable to|was unable to|failed to|did not manage to) "
     r"(?:read|access|open|inspect|see)"
     r"(?: (?:any|all|the|your|this))?(?: (?:source|repo|repository|workspace|checkout|code|project))?"
-    r" (?:repository|repo|workspace|checkout|codebase|code|project|files?)\b(?!'s\b)"
+    r" (?:repository|repo|workspace|checkout|codebase|code|project|files)\b(?!'s\b)"
     r"|(?:shell|shell calls?|shell commands?|commands?) (?:is |are |was |were )?(?:unavailable|not available|hung|hanging|timed out)"
     r"|no shell (?:access|available))")
-UNREAD_VERDICT_RE = re.compile(r"^[\s*_#>\-]*(?:pass|block|fail|approve|reject)\b", re.I | re.M)
+UNREAD_VERDICT_RE = re.compile(r"\b(?:pass|block|approve|reject|verdict|lgtm)\b", re.I)
 UNREAD_QUOTED_RE = re.compile(
-    '"[^"]*"' + '|`[^`]*`'
+    '"[^"]*"' + '|(`+)[^`]*?' + chr(92) + '1'
     + '|' + chr(0x201c) + '[^' + chr(0x201d) + ']*' + chr(0x201d)
     + "|(?<!\\w)'[^']*'(?!\\w)")
 UNREAD_HEAD_CHARS, UNREAD_MAX_CHARS = 600, 1500
@@ -1841,9 +1841,9 @@ UNREAD_HEAD_CHARS, UNREAD_MAX_CHARS = 600, 1500
 def _final_says_unread(text) -> bool:
     """True for a short final message that opens by saying the repository or files could not be read.
 
-    A message with a verdict word (PASS, BLOCK, ...) at the start of any line is a result, a phrase inside quotation
-    marks or backticks is being quoted, not reported, and a caveat about one part ("the repository's README") is not
-    the whole repository; quoted spans are removed from the whole text before the head window is cut."""
+    A message that uses a verdict word (PASS, BLOCK, ...) anywhere is a result, a phrase inside quotation marks or
+    backticks is being quoted, not reported, and a caveat about one part ("the repository's README", one file) is
+    not the whole repository; quoted spans are removed from the whole text before the head window is cut."""
     if not isinstance(text, str) or len(text.strip()) >= UNREAD_MAX_CHARS:
         return False
     body = text.strip().replace(chr(0x2019), "'").replace(chr(0x2018), "'")
