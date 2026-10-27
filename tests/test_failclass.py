@@ -188,6 +188,22 @@ class PreflightReady(tj.JobsBase):
             jobs._run_claude(jid, ['fixture'], {'cwd': self.work}, params, self.brief, files, copy.deepcopy(tj.POLICY))
         self.assertEqual(wait.call_args.kwargs['deadline'], deadline)
 
+    def test_codex_runner_hands_its_absolute_deadline_to_the_watchdog(self):
+        jid = '20261026-100012-codex-aaaa'; os.makedirs(jobs.job_dir(jid))
+        files = jobs._attempt_files(jid, 1)
+        deadline = jobs.time.monotonic() + 50
+        params = {'profile': 'review', 'timeout_s': 10, 'deadline_monotonic': deadline, 'launch_min_s': 0}
+        proc = mock.Mock(pid=123)
+        class Handed(Exception):
+            pass
+        with mock.patch.object(common, 'acquire_codex_binary', return_value=('codex', None, None)),                 mock.patch.object(common, 'codex_version_refusal', return_value=None),                 mock.patch.object(common, 'release_codex'),                 mock.patch.object(jobs.subprocess, 'Popen', return_value=proc) as popen,                 mock.patch.object(common, 'contain_engine'),                 mock.patch.object(common, 'process_created', return_value=456),                 mock.patch.object(jobs, '_merge_status'),                 mock.patch.object(jobs.watchdog, 'wait', side_effect=Handed) as wait,                 mock.patch.object(jobs, '_note_unresolved_tree', return_value=True),                 mock.patch.object(jobs, '_cleanup_started_child', return_value=False),                 mock.patch.object(jobs, '_close_attempt_job', return_value=(False, None)),                 mock.patch.object(jobs, '_clear_child_starting'):
+            with self.assertRaises(Handed):
+                jobs._run_codex(jid, ['codex-run', '--timeout', '10'], self.work, 10, files, params,
+                                copy.deepcopy(tj.POLICY))
+        self.assertEqual(wait.call_args.kwargs['deadline'], deadline)
+        argv = popen.call_args.args[0]
+        self.assertLessEqual(float(argv[argv.index('--timeout') + 1]), 10)  # the adapter never outlives the job either
+
     def test_claude_ignores_git(self):
         with mock.patch.object(jobs.subprocess, 'run') as run:
             self.assertIsNone(jobs.git_cwd_preflight('claude', self.tmp)); run.assert_not_called()
@@ -633,7 +649,8 @@ class Retry(tj.JobsBase):
                 mock.patch.object(jobs, 'slot_lock', side_effect=TimeoutError('busy')) as lock:
             with self.assertRaises(TimeoutError):
                 jobs.slot_attempt(jid, 'codex', 1, 1, {}, deadline=102)
-        lock.assert_called_once_with(2)
+        # 0.4.0's slot_lock takes the absolute bound: the 2 s left at t=100 is deadline 102, never later.
+        lock.assert_called_once_with(job_id=jid, policy={}, deadline=102)
 
     def test_launch_rechecks_deadline_after_bookkeeping(self):
         with mock.patch.object(jobs.time, 'monotonic', return_value=102):
