@@ -13,6 +13,7 @@ from contextvars import ContextVar, copy_context
 import hashlib
 import json
 import os
+import random
 import re
 import secrets
 import shutil
@@ -21,7 +22,7 @@ import sys
 import threading
 import time
 
-from . import common, envhandoff, guard, observations
+from . import common, envhandoff, guard, hostload, observations, watchdog
 
 # Test hooks: meter.py / route.py / baton.py are imported lazily, and tests replace these.
 _read_meter = None      # callable(policy) -> meter dict
@@ -30,6 +31,7 @@ _record_baton = None    # callable(slug, receipt) -> None
 _PRESERVING_METADATA = ContextVar('twinlane_preserving_metadata', default=False)
 _CURRENT_JOB = ContextVar('twinlane_current_metadata_job', default=None)
 _REAPED_CHILDREN = ContextVar('twinlane_reaped_children', default=None)
+_JOB_LOCK_DEADLINE = ContextVar('twinlane_job_lock_deadline', default=None)
 
 
 @contextmanager
@@ -76,6 +78,7 @@ QUEUED_WITHOUT_PID_LOST_S = 120
 # jobs/<id>/survivor.json: written by the runner when an engine process outlives its kill. A receipt that
 # ended cleanly has no such file, so liveness is never probed for it.
 SURVIVOR = 'survivor.json'
+TREE_UNRESOLVED = 'tree-unresolved.json'  # a stall kill that was not proven complete: the claim stays until a person clears it
 CHILD_STARTING = 'child-starting.json'  # durable uncertainty before Popen, until child identity is recorded
 KILL_GRACE_S = 15          # how long a killed engine gets to be reaped before it counts as a survivor
 SESSION_SCAN_S = 3.0       # wall-clock budget of the --resume session-owner lookup
@@ -117,7 +120,7 @@ def archive_lock(job_id: str, timeout_s=30):
     if path in held:
         yield
         return
-    with common.file_lock(path, timeout_s):
+    with common.file_lock(path, timeout_s, wait_until=_JOB_LOCK_DEADLINE.get()):
         _ARCHIVE_LOCKS.held = held | {path}
         try:
             yield
@@ -129,7 +132,7 @@ def archive_lock(job_id: str, timeout_s=30):
 def lifecycle_lock(job_id: str, name: str, timeout_s=30):
     with archive_lock(job_id, timeout_s):
         _, inner = lock_paths(job_id, name)
-        with common.file_lock(inner, timeout_s, create_parent=False):
+        with common.file_lock(inner, timeout_s, create_parent=False, wait_until=_JOB_LOCK_DEADLINE.get()):
             yield
 
 
@@ -189,7 +192,7 @@ def _other(engine: str) -> str:
 
 # ---------------------------------------------------------------- meter / route / baton access
 
-def _meter(policy: dict, fresh: bool = False, auto_refresh: bool = True) -> dict:
+def _meter(policy: dict, fresh: bool = False, auto_refresh: bool = True, admission: bool = True) -> dict:
     """auto_refresh renews an expired Claude token once per expiry (policy.meter.auto_refresh_claude)."""
     if _read_meter is not None:
         return _read_meter(policy)
@@ -219,7 +222,7 @@ def _meter(policy: dict, fresh: bool = False, auto_refresh: bool = True) -> dict
                     'cached underlying allowance is stale, unreadable or future-dated; no refresh performed')))
             cached[engine] = section
         return cached
-    return meter.read(fresh=fresh, policy=policy, auto_refresh=auto_refresh)
+    return meter.read(fresh=fresh, policy=policy, auto_refresh=auto_refresh, admission=admission)
 
 
 def _cached_meter() -> dict | None:
@@ -754,10 +757,88 @@ def tripwire_diff(before: dict, after: dict, cwd: str) -> dict:
 
 # ---------------------------------------------------------------- slots
 
-def slot_lock(timeout_s: float = 120):
+def slot_lock(timeout_s: float = 120, *, job_id=None, policy=None, deadline=None):
     """state/slots.lock held with an OS file lock: released by the OS if its holder dies, so there is
     no staleness guess (two waiters could each remove the other's fresh lock)."""
+    if job_id is not None:
+        return _job_start_lock('slots', job_id, policy, deadline)
     return common.file_lock(os.path.join(common.STATE, 'slots.lock'), timeout_s)
+
+
+def _lock_wait_seconds(policy=None):
+    policy = common.load_policy() if policy is None else policy
+    value = (policy.get('jobs') or {}).get('lock_wait_s', 1800)
+    try:
+        value = float(value)
+        if 0 < value < float('inf'):
+            return value
+    except (TypeError, ValueError):
+        pass
+    return 1800.0
+
+
+@contextmanager
+def _job_start_lock(name, job_id=None, policy=None, deadline=None, report=True):
+    """Extended waits only for job admission; owner sidecars are diagnostic, never leases."""
+    deadline = time.monotonic() + _lock_wait_seconds(policy) if deadline is None else deadline
+    noted = [False]
+
+    def waiting():
+        cell = _SLOT_STUCK.get()
+        if cell is not None and name == 'slots' and cell[0] is None:
+            cell[0] = time.monotonic()  # a native extended wait counts towards the same overall bound
+        if noted[0] or job_id is None or not report:
+            return
+        noted[0] = True  # the reason is a courtesy: a missing job folder or a failed write never fails the wait
+        if not os.path.isdir(_p(job_id, '')):
+            return
+        try:
+            st = common.read_json(_p(job_id, 'status.json'), {}) or {}
+            spec = common.read_json(_p(job_id, 'job.json'), {}) or {}
+            fields = {k: v for k, v in st.items() if k not in ('status', 'pid', 'pid_created', 'updated_at')}
+            fields.update(queue_reason=f"waiting for {'slot' if name == 'slots' else 'writer'} lock",
+                          waiting_lock=name, waiting_since=st.get('waiting_since') or common.iso(common.now()))
+            if name == 'slots':
+                fields.update(waiting_slot=True, queue_priority=queue_priority(spec.get('kind')))
+            _write_status(job_id, 'queued', **fields)
+        except OSError:
+            pass
+
+    _self_created()  # do not make the first process-identity query while holding the global lock
+    token = _JOB_LOCK_DEADLINE.set(deadline)
+    try:
+        with common.file_lock(os.path.join(common.STATE, name + '.lock'),
+                              wait_until=deadline, on_wait=waiting):
+            yield
+    finally:
+        _JOB_LOCK_DEADLINE.reset(token)
+
+
+_SLOT_PROBES = ContextVar('twinlane_slot_probes', default=None)
+
+
+class _AdmissionChanged(Exception):
+    pass
+
+
+@contextmanager
+def _slot_snapshot(engine, job_id, freeze=True):
+    """Probe processes outside slots.lock; reread ALL admission files under the lock.
+
+    An identity not observed in this attempt forces a new outside scan. Thus a concurrently
+    admitted runner is counted, never hidden by an old running-count snapshot. Nothing here
+    persists across attempts, and DEAD observations are tied to the recorded creation stamp.
+    """
+    probes = {'values': {}, 'frozen': False}
+    token = _SLOT_PROBES.set(probes)
+    try:
+        _self_created()
+        running_count(engine, exclude=job_id)
+        _waiters(engine, job_id)
+        probes['frozen'] = freeze  # the in-lock fallback probes only identities that appeared after the scan
+        yield
+    finally:
+        _SLOT_PROBES.reset(token)
 
 
 _SELF_CREATED = []
@@ -769,7 +850,29 @@ def _self_created():
     return _SELF_CREATED[0]
 
 
+def _inlock_budget() -> None:
+    """Work done while holding slots.lock (the in-lock probes of the fallback) stops at the shared bound and unwinds it."""
+    probes = _SLOT_PROBES.get()
+    # the streak's deadline, else the one this very lock wait ran under (a first attempt has no streak yet)
+    deadline = _SLOT_DEADLINE.get() or _JOB_LOCK_DEADLINE.get()
+    if probes is not None and probes.get('locked') and deadline is not None and time.monotonic() > deadline:
+        raise common.LockWaitTimeout('slot admission scan exceeded the lock-wait bound while holding slots.lock')
+
+
 def _pid_state(pid, created) -> str:
+    _inlock_budget()
+    probes = _SLOT_PROBES.get()
+    if probes is not None:
+        key = (repr(pid), repr(created))
+        if key not in probes['values']:
+            if probes['frozen']:
+                raise _AdmissionChanged()
+            probes['values'][key] = _probe_pid_state(pid, created)
+        return probes['values'][key]
+    return _probe_pid_state(pid, created)
+
+
+def _probe_pid_state(pid, created) -> str:
     if _PRESERVING_METADATA.get() and not (pid is None and created is None):
         if not common._valid_pid(pid) or not common._valid_stamp(created):
             return common.UNKNOWN
@@ -810,11 +913,14 @@ def _survivor_state(s: dict) -> str:
 
 
 def _child_pending(job_id: str) -> bool:
-    """Reclaim launch uncertainty only when its own recorded child identity is proven gone."""
+    """Reclaim launch uncertainty only when its own recorded child identity is proven gone. An unresolved stalled
+    tree is uncertainty no pid can settle: it reads as pending for every liveness, slot and archive consumer."""
+    if os.path.exists(_p(job_id, TREE_UNRESOLVED)):
+        return True
     path = _p(job_id, CHILD_STARTING)
     if not os.path.exists(path):
         return False
-    if _preserve_job(job_id) or observations.active():
+    if _preserve_job(job_id) or observations.active() or _SLOT_PROBES.get() is not None:
         # Observe without reclaim. Pin bytes around the native check: a changed/unreadable
         # marker or invalid recorded identity holds; only definitive exact-stamp DEAD clears
         # the logical uncertainty. The file remains untouched, even across other tasks.
@@ -898,23 +1004,27 @@ def _cleanup_started_child(job_id: str, engine: str, proc, created, why: str) ->
 
     Return whether the child may still be alive. A failed bookkeeping write must never release its lease.
     """
+    killed = False
     try:
-        common.kill_tree(proc.pid)
+        killed = common.kill_tree(proc.pid)
     except BaseException:
         pass
+    if common.IS_WIN and killed is not True:
+        _note_unresolved_tree(job_id, engine, None, kill_confirmed=False)
     alive = not _engine_gone(proc)
     if alive:
         _note_survivor(job_id, engine, proc, created, why)
     return alive
 
 
-def _clear_child_starting(job_id: str, proc=None) -> None:
+def _clear_child_starting(job_id: str, proc=None, keep: bool = False) -> None:
     """Remove uncertainty only after proving the child reaped/not started.
 
     Persisting identity is insufficient: later cleanup and survivor persistence can both fail.
     Keep the durable marker for the entire child lifetime so a terminal receipt cannot hide it.
+    `keep` holds it when a stalled tree is unresolved and its own marker could not be written.
     """
-    if _preserve_job(job_id):
+    if keep or _preserve_job(job_id) or (common.IS_WIN and _tree_unresolved(job_id)):
         return
     try:
         if proc is None or proc.poll() is not None:
@@ -935,7 +1045,7 @@ def running_count(engine: str, exclude: str | None = None) -> int:
         # Launch uncertainty survives receipt/status write failures. If even its engine is
         # unreadable, reserve both engines conservatively rather than guessing one free.
         if _child_pending(jid):
-            pending = common.read_json(_p(jid, CHILD_STARTING))
+            pending = common.read_json(_p(jid, CHILD_STARTING)) or common.read_json(_p(jid, TREE_UNRESOLVED))
             pending_engine = pending.get('engine') if isinstance(pending, dict) else None
             if pending_engine not in ('claude', 'codex') or pending_engine == engine:
                 n += 1
@@ -985,23 +1095,126 @@ def running_count(engine: str, exclude: str | None = None) -> int:
 
 
 def try_acquire_slot(job_id: str, engine: str, attempt: int, max_parallel: int) -> bool:
-    with slot_lock():
-        if running_count(engine, exclude=job_id) >= max_parallel:
-            return False
-        _write_status(job_id, 'running', engine=engine, attempt=attempt)
-        return True
+    try:
+        with _slot_snapshot(engine, job_id), slot_lock(job_id=job_id):
+            _SLOT_PROBES.get()['locked'] = True
+            if running_count(engine, exclude=job_id) >= max_parallel:
+                return False
+            _inlock_budget()
+            _write_status(job_id, 'running', engine=engine, attempt=attempt)
+            return True
+    except _AdmissionChanged:
+        return False
+
+
+def queue_priority(kind) -> int:
+    """0 starts before 1: a review unblocks a land, so it goes ahead of other waiting work."""
+    return 0 if kind == 'review' else 1
+
+
+def _waiters(engine: str, exclude: str) -> list:
+    """Live jobs waiting for a slot of this engine as (priority, waiting_since, id), in service order.
+    A waiter whose runner is not provably alive is ignored: it must not hold the line."""
+    rows = []
+    for jid in _job_ids():
+        if jid == exclude or os.path.exists(_p(jid, 'result.json')):
+            continue
+        st = common.read_json(_p(jid, 'status.json'))
+        live = isinstance(st, dict) and st.get('status') == 'queued' and st.get('waiting_slot') \
+            and st.get('engine') == engine
+        if not live or _pid_state(st.get('pid'), st.get('pid_created')) != common.ALIVE:
+            continue
+        rows.append((st.get('queue_priority', 1), str(st.get('waiting_since') or ''), jid))
+    return sorted(rows)
+
+
+def _own_place(job_id: str) -> tuple:
+    st = common.read_json(_p(job_id, 'status.json'))
+    if isinstance(st, dict) and st.get('waiting_slot') and st.get('waiting_since'):
+        return st.get('queue_priority', 1), str(st['waiting_since']), job_id
+    spec = common.read_json(_p(job_id, 'job.json'), {}) or {}
+    return queue_priority(spec.get('kind') if isinstance(spec, dict) else None), common.iso(common.now()), job_id
+
+
+def slot_attempt(job_id: str, engine: str, attempt: int, configured: int, policy: dict) -> tuple:
+    """(started, why not). The usable slots shrink as the host gets busy (hostload), and waiting jobs are
+    served first-in-first-out with reviews first. A job is queued with a reason, never refused."""
+    usable, host_why = hostload.effective_parallel(configured, hostload.sample(policy), policy)
+    # After SLOT_INLOCK_AFTER restarts in a row the snapshot is not frozen: under the lock only the identities that
+    # appeared since the outside scan are probed (a few, never the whole store), so that attempt cannot be
+    # invalidated and the oldest job always decides.
+    snapshot = _slot_snapshot(engine, job_id, freeze=not _SLOT_INLOCK.get())
+    try:
+        with snapshot, slot_lock(job_id=job_id, policy=policy, deadline=_SLOT_DEADLINE.get()):
+            _SLOT_PROBES.get()['locked'] = True
+            running = running_count(engine, exclude=job_id)
+            if running >= usable:
+                return False, (f'engine slots full: {running}/{configured}' if running >= configured
+                               else host_why or f'engine slots full: {running}/{configured}')
+            ahead = [w for w in _waiters(engine, job_id) if w < _own_place(job_id)]
+            if len(ahead) >= usable - running:
+                return False, f"queued behind {len(ahead)} job{'' if len(ahead) == 1 else 's'}"
+            waited = (common.read_json(_p(job_id, 'status.json'), {}) or {}).get('waiting_lock')
+            _inlock_budget()
+            _write_status(job_id, 'running', engine=engine, attempt=attempt)
+            return True, 'waited for slot lock' if waited else None
+    except _AdmissionChanged:
+        return False, ADMISSION_CHANGED
+
+
+ADMISSION_CHANGED = 'slot observations changed; retrying admission'
+SLOT_INLOCK_AFTER = 3
+WRITER_SWEEP_WAIT_S = 30  # release_stale_writers is a lead command: it fails fast, only job runners wait long
+_SLOT_DEADLINE = ContextVar('twinlane_slot_deadline', default=None)
+_SLOT_STUCK = ContextVar('twinlane_slot_stuck', default=None)
+_SLOT_INLOCK = ContextVar('twinlane_slot_inlock', default=False)
 
 
 def acquire_slot(job_id: str, engine: str, attempt: int, policy: dict) -> bool:
-    """Blocks until a slot is free. Returns True when it had to wait."""
-    max_parallel = int(policy.get(engine, {}).get('max_parallel') or 4)
-    waiting = False
-    while not try_acquire_slot(job_id, engine, attempt, max_parallel):
-        if not waiting:
-            _write_status(job_id, 'queued', engine=engine, attempt=attempt, waiting_slot=True)
-            waiting = True
-        time.sleep(SLOT_POLL_S)
-    return waiting
+    """Blocks until a slot is free. Returns True when it had to wait. The reason it waits is in status.json."""
+    configured = int(policy.get(engine, {}).get('max_parallel') or 4)
+    waiting, last, since = False, None, None
+    stuck = [None]  # monotonic start of the current streak of lock waits / restarted scans; ONE bound covers it
+    changed = 0     # consecutive restarted scans
+    bound = _lock_wait_seconds(policy)
+    while True:
+        attempt_started = time.monotonic()
+        tokens = (_SLOT_DEADLINE.set(None if stuck[0] is None else stuck[0] + bound), _SLOT_STUCK.set(stuck),
+                  _SLOT_INLOCK.set(changed >= SLOT_INLOCK_AFTER))
+        try:
+            started, why = slot_attempt(job_id, engine, attempt, configured, policy)
+        except common.LockWaitTimeout:
+            raise
+        except TimeoutError as error:
+            if 'lock busy:' not in str(error):
+                raise
+            stuck[0] = attempt_started if stuck[0] is None else stuck[0]
+            if time.monotonic() - stuck[0] >= bound:
+                raise common.LockWaitTimeout(f'lock stayed busy for {bound / 60:.3f} '
+                                             'minutes: slots.lock') from error
+            started, why = False, 'waiting for slot lock'
+        finally:
+            for var, token in zip((_SLOT_DEADLINE, _SLOT_STUCK, _SLOT_INLOCK), tokens):
+                var.reset(token)
+        if started:
+            return waiting or why == 'waited for slot lock'
+        if why == ADMISSION_CHANGED:
+            changed += 1
+            stuck[0] = attempt_started if stuck[0] is None else stuck[0]
+            if time.monotonic() - stuck[0] >= bound:
+                raise common.LockWaitTimeout(f'slot admission stayed contended for {bound / 60:.3f} minutes')
+        else:
+            changed = 0
+            if why != 'waiting for slot lock':
+                stuck[0] = None  # a normal answer (slots full, queued behind, host busy) ends the streak
+        if not waiting or why != last:
+            since = since or (common.read_json(_p(job_id, 'status.json'), {}) or {}).get('waiting_since') \
+                or common.iso(common.now())
+            _write_status(job_id, 'queued', engine=engine, attempt=attempt, waiting_slot=True, queue_reason=why,
+                          waiting_since=since, queue_priority=_own_place(job_id)[0])
+            waiting, last = True, why
+        time.sleep(SLOT_POLL_S * random.uniform(0.75, 1.25)
+                   * (2.5 if (why or '').startswith('host busy') else 1))
 
 
 def _write_status(job_id: str, status: str, **extra) -> None:
@@ -1192,6 +1405,78 @@ def _pump(proc, fev, stream: ClaudeStream, errors: list) -> None:
         errors.append(f'stdout read stopped: {e}')
 
 
+def _kill_wrapper_unconfirmed(pid, created=None) -> bool:
+    """On macOS and Linux a process-group kill proves nothing about the whole tree: the packaged Codex runner starts
+    `codex exec` in its OWN session, and a Claude worker may start a helper with its own session. Without a handle
+    that contains every descendant the kill is reported unconfirmed (no retry, custody held); the group is still
+    killed."""
+    if created is None:
+        common.kill_tree(pid)
+    else:
+        common.kill_tree(pid, created)
+    return False
+
+
+def _close_attempt_job(job_id: str, engine: str, proc, unresolved: bool) -> tuple:
+    """Close the attempt's job object and record what could not be proven. -> (keep_launch_marker, interruption).
+    An interrupt during the drain is held until the unresolved-tree custody is persisted (the PID-less fallback
+    included); the caller re-raises it once its own cleanup has run."""
+    interrupt = None
+    try:
+        confirmed = common.close_engine_job(proc)
+    except BaseException as e:
+        confirmed, interrupt = False, e
+    if not confirmed and not _note_unresolved_tree(job_id, engine, None, kill_confirmed=False):
+        unresolved = True  # the marker could not be written: the rewritten launch marker is the custody
+    return unresolved, interrupt
+
+
+def _hold_uncontained(job_id: str, engine: str):
+    """Runs while an engine that no job object holds is still suspended: its descendants can never be proven gone,
+    so unresolved-tree custody is made durable BEFORE it runs (a killed runner or a `stop` then leaves the claim
+    held). When the marker file cannot be written the engine is not started."""
+    if not _note_unresolved_tree(job_id, engine, None, kill_confirmed=False) or not _tree_unresolved(job_id):
+        raise OSError('the engine could not be contained in a job object and the unresolved-tree marker could '
+                      'not be written; it was not started')
+
+
+def _watchdog_kill():
+    """The kill both watchdogs use: the default on Windows (the attempt job object answers), the unconfirmed
+    process-group kill elsewhere."""
+    return None if common.IS_WIN else _kill_wrapper_unconfirmed
+
+
+def _note_unresolved_tree(job_id: str, engine: str, stall, kill_confirmed=None) -> bool:
+    """A stall kill that did not report success may have left children running although the root is gone. Leave a
+    marker that keeps the worktree claim until a person has looked (`twinlane stop JOB --tree-gone`): no pid in it
+    can be trusted to identify what survived, so nothing here ever kills anything. Returns False when the marker
+    was needed and could not be written: the launch marker is then rewritten without a pid and the caller keeps it."""
+    if kill_confirmed is not False and (stall is None or not stall.tripped or stall.kill_confirmed is True):
+        return True
+    for _ in range(3):
+        try:
+            _write_job_json(job_id, TREE_UNRESOLVED, {'engine': engine, 'at': common.iso(common.now()),
+                                                      'why': 'the stalled engine tree was not proven stopped'
+                                                      if stall is not None and stall.tripped
+                                                      else 'the engine tree was not proven stopped'})
+            return True
+        except OSError:
+            time.sleep(0.2)
+    try:  # the launch marker names the dead root, which a slot scan would reap: rewrite it with no pid to find
+        _write_job_json(job_id, CHILD_STARTING, {'engine': engine, 'unresolved_tree': True})
+    except OSError:
+        pass  # even that failed: the old marker is kept, and a dead-root scan can still reap it
+    return False  # either way the launch marker stays: it is now the only record
+
+
+def _mark_stalled(out: dict, stall) -> dict:
+    """A killed hung worker: whatever it printed is not a result, so no final text and no verdict survive."""
+    if stall is not None and stall.tripped:
+        out.update(status='stalled', final_text='', limit_hit=False, error='stalled: ' + stall.reason(),
+                   stall_kill_confirmed=stall.kill_confirmed is True)
+    return out
+
+
 SURVIVED_TIMEOUT_KILL = 'engine process (pid {pid}) survived its kill after the timeout (kill {kill})'
 SURVIVED_INTERRUPT_KILL = ('engine process (pid {pid}) survived its kill after the runner was interrupted '
                            '(kill {kill})')
@@ -1203,14 +1488,19 @@ def _run_claude(job_id, argv, spec, params, brief_path, files, policy) -> dict:
     cwd, timeout_s = spec['cwd'], params['timeout_s']
     env = claude_env(job_id, params['profile'], cwd, stripped, common.extra_secret_patterns(policy))
     proc = None
+    stall = watchdog.make([files['events'], files['stderr']], policy)
+    unresolved = False
     try:
         _write_job_json(job_id, CHILD_STARTING, {'engine': 'claude'})
         with open(brief_path, 'rb') as fin, open(files['stderr'], 'wb') as ferr, open(files['events'], 'wb') as fev:
             proc = subprocess.Popen(argv, cwd=cwd, env=env, stdin=fin,
-                                    stdout=subprocess.PIPE, stderr=ferr, creationflags=NO_WINDOW,
+                                    stdout=subprocess.PIPE, stderr=ferr,
+                                    creationflags=NO_WINDOW | (common.CREATE_SUSPENDED if common.IS_WIN else 0),
                                     start_new_session=not common.IS_WIN)
             child_created = None
             try:
+                common.contain_engine(proc, before_resume=lambda contained: contained
+                                      or _hold_uncontained(job_id, 'claude'))
                 child_created = common.process_created(proc.pid)
                 _write_job_json(job_id, CHILD_STARTING,
                                   {'engine': 'claude', 'pid': proc.pid, 'created': child_created})
@@ -1218,10 +1508,17 @@ def _run_claude(job_id, argv, spec, params, brief_path, files, policy) -> dict:
                 reader = threading.Thread(target=_pump, args=(proc, fev, stream, errors), daemon=True)
                 reader.start()
                 try:
-                    rc = proc.wait(timeout=timeout_s)
+                    rc = watchdog.wait(proc, timeout_s, stall, watchdog.settings(policy)['poll_s'],
+                                       child_created=child_created,
+                                       kill=_watchdog_kill())
+                    unresolved = not _note_unresolved_tree(job_id, 'claude', stall)
+                    if rc is None:  # only a stall kill returns None: the tree outlived it
+                        raise subprocess.TimeoutExpired(argv, KILL_GRACE_S)
                 except subprocess.TimeoutExpired:
                     timed_out = True
                     killed = common.kill_tree(proc.pid)
+                    if common.IS_WIN and killed is not True:
+                        unresolved = not _note_unresolved_tree(job_id, 'claude', stall, kill_confirmed=False)
                     try:
                         rc = proc.wait(timeout=KILL_GRACE_S)
                     except subprocess.TimeoutExpired:
@@ -1230,13 +1527,20 @@ def _run_claude(job_id, argv, spec, params, brief_path, files, policy) -> dict:
                             pid=proc.pid, kill='reported success' if killed else 'failed'))
                 reader.join(timeout=15)
             except BaseException:
+                # An interrupt during the grace wait after a stall kill skips the note above: make it here, before
+                # the launch marker is cleared, or surviving children lose their custody protection.
+                unresolved = not _note_unresolved_tree(job_id, 'claude', stall)
                 _cleanup_started_child(job_id, 'claude', proc, child_created,
                                        'engine survived its kill after a post-start failure')
                 raise
     except OSError as e:
         return {'status': 'failed', 'exit_code': common.EXIT_MISSING, 'error': f'claude launch or bookkeeping failed: {e}'}
     finally:
-        _clear_child_starting(job_id, proc)
+        # the stream reader has consumed the result, but a descendant may outlive the root
+        unresolved, interrupt = _close_attempt_job(job_id, 'claude', proc, unresolved)
+        _clear_child_starting(job_id, proc, keep=unresolved)
+        if interrupt is not None:
+            raise interrupt
     s = stream.summary()
     out = {k: s[k] for k in ('session_id', 'served_models', 'served_models_note', 'num_turns', 'model_calls',
                              'subagent_model_calls', 'subtype', 'is_error', 'duration_ms',
@@ -1256,7 +1560,7 @@ def _run_claude(job_id, argv, spec, params, brief_path, files, policy) -> dict:
     out['status'] = _claude_status(s, rc, timed_out)
     if out['status'] == 'failed' and s['has_result'] and not s['is_error'] and s['subtype'] == 'success' and rc != 0:
         out['error'] = f'claude reported success but exited rc {rc}'
-    return out
+    return _mark_stalled(out, stall)
 
 
 CLAUDE_TOKEN_KEYS = {'input_tokens': 'input_tokens', 'output_tokens': 'output_tokens',
@@ -1420,23 +1724,36 @@ def _run_codex(job_id, argv, cwd, timeout_s, files, params, policy=None, qualifi
     env['TWINLANE_CODEX_BIN'] = binary
     child_alive = False
     proc = None
+    stall = watchdog.make([files['codex_log']] + ([os.path.join(files['codex_out'], 'events.jsonl')]
+                                                   if files.get('codex_out') else []), policy)
+    unresolved = False
     try:
         _write_job_json(job_id, CHILD_STARTING, {'engine': 'codex'})
         with open(files['codex_log'], 'wb') as log:
             proc = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=log,
-                                    stderr=subprocess.STDOUT, creationflags=NO_WINDOW,
+                                    stderr=subprocess.STDOUT,
+                                    creationflags=NO_WINDOW | (common.CREATE_SUSPENDED if common.IS_WIN else 0),
                                     start_new_session=not common.IS_WIN)
             child_created = None
             try:
+                common.contain_engine(proc, before_resume=lambda contained: contained
+                                      or _hold_uncontained(job_id, 'codex'))
                 child_created = common.process_created(proc.pid)
                 _write_job_json(job_id, CHILD_STARTING,
                                   {'engine': 'codex', 'pid': proc.pid, 'created': child_created})
                 _merge_status(job_id, child_pid=proc.pid if child_created else None, child_created=child_created)
                 try:
-                    rc = proc.wait(timeout=timeout_s)
+                    rc = watchdog.wait(proc, timeout_s, stall, watchdog.settings(policy)['poll_s'],
+                                       child_created=child_created,
+                                       kill=_watchdog_kill())
+                    unresolved = not _note_unresolved_tree(job_id, 'codex', stall)
+                    if rc is None:  # only a stall kill returns None: the tree outlived it
+                        raise subprocess.TimeoutExpired(argv, KILL_GRACE_S)
                 except subprocess.TimeoutExpired:
                     timed_out = True
                     killed = common.kill_tree(proc.pid)
+                    if common.IS_WIN and killed is not True:
+                        unresolved = not _note_unresolved_tree(job_id, 'codex', stall, kill_confirmed=False)
                     try:
                         rc = proc.wait(timeout=KILL_GRACE_S)
                     except subprocess.TimeoutExpired:
@@ -1444,16 +1761,20 @@ def _run_codex(job_id, argv, cwd, timeout_s, files, params, policy=None, qualifi
                         _note_survivor(job_id, 'codex', proc, child_created, SURVIVED_TIMEOUT_KILL.format(
                             pid=proc.pid, kill='reported success' if killed else 'failed'))
             except BaseException:
+                unresolved = not _note_unresolved_tree(job_id, 'codex', stall)  # see the claude runner
                 child_alive = _cleanup_started_child(job_id, 'codex', proc, child_created,
                                                     'engine survived its kill after a post-start failure')
                 raise
+        c = parse_codex_out(files['codex_out'])  # consume the result before closing the attempt job
     except OSError as e:
         return {'status': 'failed', 'exit_code': common.EXIT_MISSING, 'error': f'codex launch or bookkeeping failed: {e}'}
     finally:
-        _clear_child_starting(job_id, proc)
+        unresolved, interrupt = _close_attempt_job(job_id, 'codex', proc, unresolved)
+        _clear_child_starting(job_id, proc, keep=unresolved)
         if not child_alive:
             common.release_codex(lease)
-    c = parse_codex_out(files['codex_out'])
+        if interrupt is not None:
+            raise interrupt
     served = [c['model']] if c['model'] else ([params['model']] if params.get('model') else [])
     out = {'session_id': c['session_id'], 'served_models': served, 'served_models_note':
            'requested model; Codex CLI may not report the served model',
@@ -1495,7 +1816,7 @@ def _run_codex(job_id, argv, cwd, timeout_s, files, params, policy=None, qualifi
         out['error'] = c.get('error_text') or f'codex exited rc {rc} with no error event'
         if out['status'] == 'timeout':
             out['error'] = f'timed out after {timeout_s} s' + (f": {c['error_text']}" if c.get('error_text') else '')
-    return out
+    return _mark_stalled(out, stall)
 
 
 # ---------------------------------------------------------------- failover
@@ -1607,6 +1928,15 @@ def _writer_path(cwd: str) -> str:
     return os.path.join(common.STATE, 'writers', key + '.json')
 
 
+def _tree_unresolved(job_id: str) -> bool:
+    """A stalled engine tree that was not proven stopped holds the claim: either its own marker, or (when that could
+    not be written) the launch marker rewritten without a pid, which no check of the dead root can reap."""
+    if os.path.exists(_p(job_id, TREE_UNRESOLVED)):
+        return True
+    pending = common.read_json(_p(job_id, CHILD_STARTING))
+    return isinstance(pending, dict) and pending.get('unresolved_tree') is True
+
+
 def _writer_job_busy(job_id: str) -> bool:
     """Live/unknown engines hold the directory, except qualified post-exit child PID reuse."""
     path = _p(job_id, 'status.json')
@@ -1617,9 +1947,177 @@ def _writer_job_busy(job_id: str) -> bool:
         return True
     if os.path.exists(_p(job_id, SURVIVOR)) and _survivor(job_id) is None:
         return True
+    if _tree_unresolved(job_id):
+        return True
     engine = _engine_state(job_id, st or {})
     return engine != common.DEAD and not (engine == common.UNKNOWN and
                                          _finished_child_pid_reused(job_id, st or {}))
+
+
+CUSTODY_GRACE_S = 120  # a finished runner exits within seconds; this long after its receipt, an unreadable pid is stale
+
+
+def _custody_stale(job_id: str) -> str | None:
+    """Why the writer claim held for `job_id` is provably stale, or None when it must keep blocking.
+
+    Only a finished job qualifies: a terminal receipt, no survivor or unresolved child marker, and no process
+    that is provably still the job's runner or engine. A runner whose pid cannot be read (a reused pid, or a
+    probe failing under host overload) is accepted as gone once its receipt is older than CUSTODY_GRACE_S and
+    the runner marked itself finalized: that is the case that left a finished job holding its worktree."""
+    receipt = common.read_json(_p(job_id, 'result.json'))
+    st = common.read_json(_p(job_id, 'status.json'))
+    if not isinstance(receipt, dict) or receipt.get('status') not in TERMINAL \
+            or isinstance(receipt.get('survivor'), dict) or (st is not None and not isinstance(st, dict)):
+        return None
+    if any(os.path.exists(_p(job_id, marker)) for marker in (CHILD_STARTING, SURVIVOR, TREE_UNRESOLVED)):
+        return None
+    st = st or {}
+    pid, created = ((st.get('pid'), st.get('pid_created')) if st.get('pid') else _runner_pid(job_id))
+    states = [_pid_state(pid, created), _child_state(st)]
+    if common.ALIVE in states:
+        return None
+    if common.UNKNOWN not in states:
+        return 'job finished and its runner and engine are gone'
+    ended = common.parse_time(receipt.get('ended_at')) or common.parse_time(st.get('updated_at'))
+    if st.get('runner_finalized') is True and ended is not None \
+            and (common.now() - ended).total_seconds() >= CUSTODY_GRACE_S:
+        return (f'job finished {int((common.now() - ended).total_seconds())} s ago and marked itself finalized; '
+                'its pid identity cannot be read (reused pid or failing probe), so it is taken as gone')
+    return None
+
+
+def _log_custody_release(job_id: str, cwd, why: str) -> None:
+    """One JSON line per automatic release, so a claim never disappears without a record."""
+    try:
+        with open(os.path.join(common.STATE, 'custody-releases.jsonl'), 'a', encoding='utf-8') as h:
+            h.write(json.dumps({'at': common.iso(common.now()), 'job': job_id, 'cwd': cwd, 'why': why},
+                               sort_keys=True) + '\n')
+    except OSError:
+        pass
+
+
+def stale_writers_snapshot(deadline: float | None = None) -> list:
+    """Read-only custody evidence, without locks or writes. Any incomplete claim read raises.
+
+    A missing writers folder is complete and empty; other listing failures, vanished/unreadable
+    claims and malformed owners cannot prove earlier custody warnings resolved. Release still
+    takes its own lock and revalidates each claim through release_stale_writers.
+    """
+    folder = os.path.join(common.STATE, 'writers')
+    try:
+        names = sorted(n for n in os.listdir(folder) if n.endswith('.json'))
+    except FileNotFoundError:
+        return []
+    out = []
+    def object_file(path):
+        try:
+            with open(path, encoding='utf-8') as handle:
+                value = json.load(handle)
+        except FileNotFoundError:
+            return None
+        if not isinstance(value, dict):
+            raise ValueError('incomplete custody evidence: ' + os.path.basename(path))
+        return value
+
+    def present(path):
+        try:
+            os.stat(path)
+            return True
+        except FileNotFoundError:
+            return False
+
+    with common.nonspawning_liveness(), observations.scope():
+        for name in names:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError('custody scan budget exhausted')
+            with open(os.path.join(folder, name), encoding='utf-8') as handle:
+                owner = json.load(handle)
+            if not isinstance(owner, dict) or not isinstance(owner.get('id'), str):
+                raise ValueError('unreadable writer claim: ' + name)
+            jid = owner['id']
+            try:
+                os.stat(_p(jid, ''))
+            except FileNotFoundError:
+                why = 'owner job folder is gone and its runner pid is dead' \
+                    if _pid_state(owner.get('pid'), owner.get('created')) == common.DEAD else None
+            else:
+                # Read once, strictly. _custody_stale's tolerant None is also used by
+                # admission/release and cannot distinguish an unreadable receipt.
+                receipt = object_file(_p(jid, 'result.json'))
+                st = object_file(_p(jid, 'status.json')) or {}
+                if receipt is None and st.get('status') not in ('queued', 'running', 'waiting'):
+                    raise ValueError('incomplete custody evidence: missing receipt/status')
+                why = None
+                markers = [present(_p(jid, m)) for m in (CHILD_STARTING, SURVIVOR, TREE_UNRESOLVED)]
+                if receipt is not None and receipt.get('status') not in TERMINAL:
+                    raise ValueError('incomplete custody evidence: invalid receipt status')
+                if receipt is not None and not isinstance(receipt.get('survivor'), dict) and not any(markers):
+                    pid, created = st.get('pid'), st.get('pid_created')
+                    if not pid:
+                        try:
+                            with open(_p(jid, 'runner.pid'), encoding='utf-8') as handle:
+                                parts = handle.read().split()
+                        except FileNotFoundError:
+                            parts = []
+                        if parts and (len(parts) not in (1, 2) or not all(p.isascii() and p.isdigit() for p in parts)):
+                            raise ValueError('incomplete custody evidence: invalid runner identity')
+                        pid = int(parts[0]) if parts else None
+                        created = int(parts[1]) if len(parts) == 2 else None
+                    states = [_pid_state(pid, created), _child_state(st)]
+                    if common.ALIVE not in states:
+                        if common.UNKNOWN not in states:
+                            why = 'job finished and its runner and engine are gone'
+                        else:
+                            ended = common.parse_time(receipt.get('ended_at')) or common.parse_time(st.get('updated_at'))
+                            if st.get('runner_finalized') is True and ended is not None and \
+                                    (common.now() - ended).total_seconds() >= CUSTODY_GRACE_S:
+                                why = 'job finished past custody grace and marked itself finalized; pid identity unreadable'
+                            else:
+                                raise ValueError('incomplete custody evidence: process identity unreadable')
+            if why:
+                out.append({'id': jid, 'cwd': owner.get('cwd'), 'why': why, 'released': False})
+    return out
+
+
+def release_stale_writers(dry_run: bool = False, deadline: float | None = None) -> list:
+    """Remove writer claims whose job is finished and gone (see _custody_stale). -> rows with `released`."""
+    out = []
+    folder = os.path.join(common.STATE, 'writers')
+    try:
+        names = sorted(n for n in os.listdir(folder) if n.endswith('.json'))
+    except OSError:
+        return out
+    # a lead command (patrol, wt doctor --fix): it fails fast, only job runners wait on the long bound
+    wait_until = time.monotonic() + WRITER_SWEEP_WAIT_S if deadline is None else deadline
+    with _job_start_lock('writers', deadline=wait_until):
+        for name in names:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError('custody scan budget exhausted')
+            path = os.path.join(folder, name)
+            owner = common.read_json(path)
+            if not isinstance(owner, dict) or not isinstance(owner.get('id'), str):
+                continue
+            jid = owner['id']
+            if not os.path.isdir(_p(jid, '')):
+                # No job folder (archived or deleted): stale only if its runner is provably gone.
+                why = 'owner job folder is gone and its runner pid is dead' \
+                    if _pid_state(owner.get('pid'), owner.get('created')) == common.DEAD else None
+            else:
+                why = _custody_stale(jid)
+            if not why:
+                continue
+            row = {'id': jid, 'cwd': owner.get('cwd'), 'why': why, 'released': False}
+            if not dry_run:
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError('custody release budget exhausted')
+                try:
+                    os.remove(path)
+                    row['released'] = True
+                    _log_custody_release(jid, owner.get('cwd'), why)
+                except OSError as e:
+                    row['error'] = str(e)
+            out.append(row)
+    return out
 
 
 def _claim_writer(spec: dict) -> str | None:
@@ -1636,7 +2134,7 @@ def _claim_writer(spec: dict) -> str | None:
         raise Refusal(common.EXIT_REFUSED,
                       f'cannot establish the worktree root: git says {top.strip()}, the folder walk says {cwd}')
     path = _writer_path(cwd)
-    with common.file_lock(os.path.join(common.STATE, 'writers.lock'), 30):
+    with _job_start_lock('writers', jid):
         if os.path.exists(path):
             if _PRESERVING_METADATA.get():
                 raise Refusal(common.EXIT_REFUSED, 'existing writer reservation is protected; no replacement or cleanup')
@@ -1644,12 +2142,21 @@ def _claim_writer(spec: dict) -> str | None:
             if not isinstance(owner, dict) or owner.get('cwd') != cwd or not isinstance(owner.get('id'), str) \
                     or not isinstance(owner.get('pid'), int) or not isinstance(owner.get('created'), int):
                 raise Refusal(common.EXIT_REFUSED, 'writer reservation is unreadable or incomplete; ownership is unknown')
+            blocked = f"writer directory is owned by {owner['id']} (live or unknown); wait for its owner"
+            stale = None
             if _pid_state(owner['pid'], owner['created']) != common.DEAD or _writer_job_busy(owner['id']):
-                raise Refusal(common.EXIT_REFUSED, f"writer directory is owned by {owner['id']} (live or unknown); wait for its owner")
-            receipt = common.read_json(_p(owner['id'], 'result.json'))
-            if isinstance(receipt, dict) and receipt.get('status') in TERMINAL \
-                    and _repair_finished_status(owner['id'], require_dead_runner=True) == 'rejected':
-                raise Refusal(common.EXIT_REFUSED, f"writer directory is owned by {owner['id']} (live or unknown); wait for its owner")
+                stale = _custody_stale(owner['id'])
+                if not stale:
+                    raise Refusal(common.EXIT_REFUSED, blocked)
+            else:
+                receipt = common.read_json(_p(owner['id'], 'result.json'))
+                if isinstance(receipt, dict) and receipt.get('status') in TERMINAL \
+                        and _repair_finished_status(owner['id'], require_dead_runner=True) == 'rejected':
+                    stale = _custody_stale(owner['id'])
+                    if not stale:
+                        raise Refusal(common.EXIT_REFUSED, blocked)
+            if stale:
+                _log_custody_release(owner['id'], cwd, stale)
         # Include pre-reservation runners, which can still exist when an installation is upgraded.
         with os.scandir(common.JOBS) as entries:
             existing = list(entries)
@@ -1660,7 +2167,7 @@ def _claim_writer(spec: dict) -> str | None:
                 raise Refusal(common.EXIT_REFUSED, f'cannot verify writer ownership: nonmatching job folder {entry.name}')
             spec_path = os.path.join(entry.path, 'job.json')
             if not os.path.exists(spec_path) and not any(os.path.exists(os.path.join(entry.path, f))
-                    for f in ('status.json', 'runner.pid', RUNNER_LOCK, SURVIVOR, CHILD_STARTING)):
+                    for f in ('status.json', 'runner.pid', RUNNER_LOCK, SURVIVOR, CHILD_STARTING, TREE_UNRESOLVED)):
                 continue  # create_job allocated a folder but has not published its launchable spec yet.
             other = common.read_json(spec_path)
             if not isinstance(other, dict):
@@ -1687,12 +2194,20 @@ def _claim_writer(spec: dict) -> str | None:
                 if not isinstance(receipt, dict) or not receipt.get('status'):
                     raise Refusal(common.EXIT_REFUSED,
                                   f'legacy writer {entry.name} has unqualified prelaunch ownership; recovery required')
+            blocked = f'writer directory is owned by {entry.name} (live or unknown); wait for its owner'
             if _alive(pid, created) or _writer_job_busy(entry.name):
-                raise Refusal(common.EXIT_REFUSED, f'writer directory is owned by {entry.name} (live or unknown); wait for its owner')
+                stale = _custody_stale(entry.name)
+                if not stale:
+                    raise Refusal(common.EXIT_REFUSED, blocked)
+                _log_custody_release(entry.name, cwd, stale)
+                continue
             receipt = common.read_json(_p(entry.name, 'result.json'))
             if isinstance(receipt, dict) and receipt.get('status') in TERMINAL \
                     and _repair_finished_status(entry.name, require_dead_runner=True) == 'rejected':
-                raise Refusal(common.EXIT_REFUSED, f'writer directory is owned by {entry.name} (live or unknown); wait for its owner')
+                stale = _custody_stale(entry.name)
+                if not stale:
+                    raise Refusal(common.EXIT_REFUSED, blocked)
+                _log_custody_release(entry.name, cwd, stale)
         created = _self_created()
         if created is None:
             raise Refusal(common.EXIT_REFUSED, 'writer identity unavailable; cannot reserve its directory')
@@ -1702,7 +2217,7 @@ def _claim_writer(spec: dict) -> str | None:
 
 def _release_writer(path: str, job_id: str) -> None:
     try:
-        with common.file_lock(os.path.join(common.STATE, 'writers.lock'), 30):
+        with _job_start_lock('writers', job_id, report=False):
             owner = common.read_json(path)
             if isinstance(owner, dict) and owner.get('id') == job_id and not _writer_job_busy(job_id):
                 os.remove(path)
@@ -1787,6 +2302,10 @@ def _run_job(job_id: str) -> dict:
         if writer:
             _release_writer(writer, job_id)
         _release_runner(job_id)
+        if writer and not _PRESERVING_METADATA.get():
+            # A writer lane just freed up: start the next queued writer request, if one is ready.
+            from . import wip
+            wip.pump_quietly()
 
 
 def _run_claimed(job_id: str, spec: dict) -> dict:
@@ -1813,6 +2332,7 @@ def _run_claimed(job_id: str, spec: dict) -> dict:
         if err:
             notes.append(f'baton start: {err}')
         params, brief_path, resume = spec['primary'], _p(job_id, 'brief.md'), spec.get('resume')
+        stalls = 0
         for n in range(1, MAX_ATTEMPTS + 1):
             waited = acquire_slot(job_id, params['engine'], n, policy)
             if before is None:
@@ -1834,7 +2354,39 @@ def _run_claimed(job_id: str, spec: dict) -> dict:
                 break
             a = run_attempt(job_id, n, params, brief_path, spec, policy, resume)
             attempts.append(a)
-            if a['status'] != 'limit_hit' or n == MAX_ATTEMPTS or not spec.get('failover') or _stop_requested(job_id):
+            if a['status'] == 'stalled':
+                # A hung worker was killed. Requeue once (the slot wait applies the host-load limit again);
+                # a second stall means the host cannot run it: fail, with no verdict of any kind.
+                stalls += 1
+                alive = _survivor(job_id)
+                if a.get('stall_kill_confirmed') is not True or alive and _survivor_state(alive) != common.DEAD:
+                    # The kill of the tree is unproven, or an engine outlived it: a second attempt could write
+                    # into the same worktree while the first still runs. No retry; custody stays with the job.
+                    a['status'] = 'failed'
+                    a['error'] = ('host overload: ' + a['error'] + '; its process tree was not proven stopped, '
+                                  'so the job was not retried')
+                    notes.append(f"attempt {n}: {a['error']}")
+                    break
+                if stalls <= watchdog.STALL_REQUEUES and n < MAX_ATTEMPTS and not _stop_requested(job_id):
+                    a['requeued'] = True
+                    notes.append(f"attempt {n} stalled ({a['error']}); its process tree was killed and the job "
+                                 'was requeued once')
+                    continue
+                a['status'] = 'failed'
+                if _stop_requested(job_id):
+                    a['error'] = 'stalled and a stop was requested: ' + a['error']
+                elif stalls <= watchdog.STALL_REQUEUES:
+                    a['error'] = 'host overload: ' + a['error']
+                else:
+                    a['error'] = f"host overload: stalled {stalls} times ({a['error']})"
+                notes.append(f"attempt {n}: {a['error']}; the work did not run to a result")
+                break
+            if a['status'] == 'limit_hit' and n < MAX_ATTEMPTS and spec.get('failover') and _tree_unresolved(job_id):
+                # The attempt's tree is not proven gone: a second engine could write beside a survivor.
+                notes.append(f'attempt {n}: its process tree was not proven stopped, so no failover was started')
+                break
+            if a['status'] != 'limit_hit' or n >= MAX_ATTEMPTS or not spec.get('failover') \
+                    or _stop_requested(job_id):
                 break
             nxt, why = plan_failover(spec, a, policy)
             if nxt and nxt['engine'] == 'codex':
@@ -1863,6 +2415,11 @@ def _run_claimed(job_id: str, spec: dict) -> dict:
                              'status': 'interrupted' if interrupted else 'failed', 'error': str(e)})
         elif interrupted:
             attempts[-1]['status'] = 'interrupted'
+        elif attempts[-1].get('status') == 'stalled':
+            # The retry of a stalled attempt could not start. `stalled` is not terminal: fail it, stall evidence kept.
+            attempts[-1]['status'] = 'failed'
+            attempts[-1]['error'] = (f"host overload: {attempts[-1].get('error')}; "
+                                     f'the retry could not start ({type(e).__name__})')
     usage, meter_after = _job_usage(job_id, spec, attempts, seen, t0, policy, quick=interrupted)
     if usage and usage.get('after_note'):
         notes.append(usage['after_note'])
@@ -2020,9 +2577,9 @@ def _bounded_after_meter(policy: dict, timeout_s: float, notes: list | None = No
     def work():
         try:
             with meter_mod.deferred_cache_writes() as pending:
-                m = _meter(policy, auto_refresh=False)
+                m = _meter(policy, auto_refresh=False, admission=False)
                 if any(((common.age_s((m.get(e) or {}).get('reading_at')) or 0) > USAGE_AFTER_LAG_S) for e in ENGINES):
-                    m = _meter(policy, fresh=True, auto_refresh=False)
+                    m = _meter(policy, fresh=True, auto_refresh=False, admission=False)
             box['pending'], box['m'] = pending, m
         except BaseException as e:  # noqa: BLE001 - handed to the caller
             box['err'] = e
@@ -2197,7 +2754,7 @@ def _write_runner_receipt(jid, receipt):
         return
     try:
         with lifecycle_lock(jid, 'status.lock'):
-            if any(os.path.exists(_p(jid, marker)) for marker in (CHILD_STARTING, SURVIVOR)):
+            if any(os.path.exists(_p(jid, marker)) for marker in (CHILD_STARTING, SURVIVOR, TREE_UNRESOLVED)):
                 return
             st = common.read_json(_p(jid, 'status.json'))
             if not isinstance(st, dict):
@@ -2384,8 +2941,10 @@ def plan_run(args, policy: dict) -> dict:
         from . import wip
         try:
             with wip.lock():
-                wip.check(cwd, 'run', args.name or common.clip(os.path.splitext(os.path.basename(args.brief))[0], 40), policy,
-                          argv=getattr(args, '_requeue_argv', []), preserve=preserving)
+                request = wip.check(cwd, 'run', args.name or common.clip(os.path.splitext(os.path.basename(args.brief))[0], 40),
+                                    policy, argv=getattr(args, '_requeue_argv', []), preserve=preserving)
+            # The second admission (create_job) must name the same request: same argv, so same id.
+            _WIP_REQUEST.set((None if preserving else request, getattr(args, '_requeue_argv', [])))
         except (wip.WipError, TimeoutError) as e:
             raise Refusal(common.EXIT_REFUSED, str(e)) from e
     forced = None if args.engine == 'auto' else args.engine
@@ -2920,14 +3479,25 @@ def _coordination_parent():
     return parents[0][1]
 
 
+_WIP_REQUEST = ContextVar('twinlane_wip_request', default=None)  # the queued request this run replays
+
+
 def create_job(plan: dict) -> str:
     _validate_owner(plan.get('owner'))
+    request, requeue_argv = _WIP_REQUEST.get() or (None, None)
+    _WIP_REQUEST.set(None)
     if plan.get('write') or plan.get('profile') == 'code':
         from . import wip
         try:
             with wip.admission(plan['cwd'], 'run', plan.get('name') or plan.get('baton') or 'writer',
-                               preserve=plan.get('preserve_existing_metadata') is True):
-                return _admitted_job(plan)
+                               argv=requeue_argv, preserve=plan.get('preserve_existing_metadata') is True):
+                jid = _admitted_job(plan)
+                if request:  # the job is on disk now: only here is a pumped request really done
+                    try:
+                        wip.acknowledge(request, os.environ.get(wip.CLAIM_ENV))
+                    except OSError:
+                        pass  # the claim stays; a person sees a claimed request next to a running job
+                return jid
         except (wip.WipError, TimeoutError) as e:
             raise Refusal(common.EXIT_REFUSED, str(e)) from e
     return _admitted_job(plan)
@@ -3315,10 +3885,32 @@ def _request_stop(jid):
         pass
 
 
+def _clear_tree_unresolved(jid: str, as_json: bool) -> int:
+    """The person's word that the stalled tree is gone: remove the marker, with a record of it."""
+    if _preserve_job(jid):
+        print(f'twinlane stop: {jid} is being observed; nothing was changed', file=sys.stderr)
+        return common.EXIT_REFUSED
+    held = [m for m in (TREE_UNRESOLVED, CHILD_STARTING) if os.path.exists(_p(jid, m))]
+    if not held or not os.path.exists(_p(jid, 'result.json')):
+        common.emit({'id': jid, 'cleared': False}, as_json, f'{jid}: no unresolved process tree to clear')
+        return common.EXIT_OK
+    try:
+        for marker in held:
+            os.remove(_p(jid, marker))
+    except OSError as e:
+        print(f'twinlane stop: could not clear {jid}: {e}', file=sys.stderr)
+        return common.EXIT_FAILED
+    _log_custody_release(jid, None, 'a person confirmed the stalled engine tree is gone (stop --tree-gone)')
+    common.emit({'id': jid, 'cleared': True}, as_json, f'{jid}: unresolved tree cleared; its worktree claim can now be released')
+    return common.EXIT_OK
+
+
 def cmd_stop(argv) -> int:
     ap = argparse.ArgumentParser(prog='twinlane stop')
     ap.add_argument('job')
     ap.add_argument('--json', action='store_true')
+    ap.add_argument('--tree-gone', action='store_true',
+                    help='after checking by hand that nothing of the stalled engine tree still runs, release its worktree claim')
     args = _parse(ap, argv)
     if isinstance(args, int):
         return args
@@ -3327,6 +3919,12 @@ def cmd_stop(argv) -> int:
     except LookupError as e:
         print(f'twinlane stop: {e}', file=sys.stderr)
         return common.EXIT_USAGE
+    if args.tree_gone:
+        from . import projects
+        refused = projects.refuse_in_worker('stop --tree-gone')  # custody is released by a person, never a worker
+        if refused is not None:
+            return refused
+        return _clear_tree_unresolved(jid, args.json)
     _request_stop(jid)
     spec = common.read_json(_p(jid, 'job.json'), {}) or {}
     existing = common.read_json(_p(jid, 'result.json'))
@@ -3375,9 +3973,11 @@ def cmd_stop(argv) -> int:
             continue
         if common.kill_tree(pid, created):
             killed.append(int(pid))
-            _pid_gone(pid, created)  # a kill is asynchronous: give the process its grace to be gone
         else:
             failed.append(int(pid))
+        # A kill is asynchronous, and on Windows a cross-process kill is never reported as confirmed (the attempt's
+        # job handle lives in the runner), so the grace applies either way before the liveness check below.
+        _pid_gone(pid, created)
     alive = [int(pid) for pid, created in targets
              if pid and int(pid) != os.getpid() and common.pid_maybe_alive(pid, created)]
     if runner[0] and int(runner[0]) in alive:
@@ -3450,8 +4050,7 @@ def _stop_survivor(jid: str, receipt: dict, survivor: dict, as_json: bool) -> in
         common.emit({'id': jid, 'status': 'unknown', 'identity_unknown_pids': [pid], 'killed_pids': []}, as_json, msg)
         return common.EXIT_FAILED
     killed = common.kill_tree(pid, created)
-    if killed:  # SIGKILL is asynchronous on POSIX: the process may still be running the instant kill() returns
-        _pid_gone(pid, created)
+    _pid_gone(pid, created)  # a kill is asynchronous, and on Windows a cross-process kill is never reported as confirmed
     if common.pid_maybe_alive(pid, created):
         msg = (f'{jid}: stop FAILED: engine pid {pid} is still alive after the kill; the job stays orphaned and '
                f'holds its slot. Retry `twinlane stop {jid}` or end the process by hand.')
@@ -3475,6 +4074,9 @@ def _parse(ap: argparse.ArgumentParser, argv):
 # ---------------------------------------------------------------- listing / status
 
 def _job_ids() -> list[str]:
+    if _SLOT_PROBES.get() is not None:
+        # An enclosing board/command snapshot must not hide a newly admitted job.
+        return sorted(observations.Snapshot().directories(), reverse=True)
     return observations.job_ids()
 
 
@@ -3540,7 +4142,7 @@ def _finished_child_pid_reused(job_id: str, st: dict, receipt=None) -> bool:
     """
     receipt = common.read_json(_p(job_id, 'result.json')) if receipt is None else receipt
     if not _receipt_observed_child_exit(receipt, st) or os.path.exists(_p(job_id, SURVIVOR)) \
-            or os.path.exists(_p(job_id, CHILD_STARTING)):
+            or os.path.exists(_p(job_id, CHILD_STARTING)) or os.path.exists(_p(job_id, TREE_UNRESOLVED)):
         return False
     pid, created = (st.get('pid'), st.get('pid_created')) if st.get('pid') else _runner_pid(job_id)
     child, stamp = st.get('child_pid'), st.get('child_created')
@@ -3610,7 +4212,8 @@ def _repair_finished_status(job_id: str, *, require_dead_runner=False) -> str:
         if st is None or st.get('status') in TERMINAL:
             if not require_dead_runner and st and st.get('runner_finalized') is True \
                     and st.get('status') == receipt['status'] and 'survivor' not in receipt \
-                    and not any(os.path.exists(_p(job_id, marker)) for marker in (CHILD_STARTING, SURVIVOR)):
+                    and not any(os.path.exists(_p(job_id, marker))
+                                for marker in (CHILD_STARTING, SURVIVOR, TREE_UNRESOLVED)):
                 return 'already-final'
             with observations.scope():
                 if _writer_job_busy(job_id):

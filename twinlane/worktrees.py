@@ -1052,9 +1052,11 @@ def _project_dirs(policy: dict, repo: str | None) -> list[str]:
 def cli(argv) -> int:
     ap = argparse.ArgumentParser(prog='twinlane wt', description='Inspect (doctor) and prune linked worktrees.')
     sub = ap.add_subparsers(dest='cmd')
-    d = sub.add_parser('doctor', help='read-only report')
+    d = sub.add_parser('doctor', help='report; --fix also releases stale writer claims')
     d.add_argument('--repo')
     d.add_argument('--all', action='store_true', help='also every project in the user config')
+    d.add_argument('--fix', action='store_true',
+                   help='release stale writer claims (finished jobs whose runner is gone); never touches a worktree')
     fmt = d.add_mutually_exclusive_group()
     fmt.add_argument('--json', action='store_true')
     fmt.add_argument('--md', action='store_true')
@@ -1103,6 +1105,10 @@ def cli(argv) -> int:
         else:
             print(render_prune(res, command=args.cmd))
         return common.EXIT_FAILED if res['failed'] or res['aborted'] else common.EXIT_OK
+    if args.fix:
+        refused = projects.refuse_in_worker('wt doctor --fix')
+        if refused is not None:
+            return refused
     policy = common.load_policy()
     targets = _project_dirs(policy, args.repo) if args.all else [args.repo]
     reports, rc = [], common.EXIT_OK
@@ -1112,10 +1118,24 @@ def cli(argv) -> int:
         except (projects.ProjectError, WorktreeError) as e:
             print(f'twinlane wt doctor: {e}', file=sys.stderr)
             rc = common.EXIT_USAGE
+    from . import jobs
+    claims = jobs.release_stale_writers(dry_run=not args.fix)
     if args.json:
-        common.emit(_public(reports if args.all else (reports[0] if reports else {})), True)
+        out = reports if args.all else (reports[0] if reports else {})
+        if claims and not args.all and isinstance(out, dict):
+            out = dict(out, stale_writer_claims=claims)
+        common.emit(_public(out), True)
     else:
         render = render_doctor_md if args.md else render_doctor
         if reports:
             print('\n\n'.join(render(r) for r in reports))
+        if claims and args.fix:
+            released = [c for c in claims if c['released']]
+            print(f"released {len(released)} stale writer claim{'' if len(released) == 1 else 's'}"
+                  + ''.join(f"\n  {c['id']}  {c['cwd']}  ({c['why']})" for c in released)
+                  + ''.join(f"\n  NOT released {c['id']}: {c.get('error')}" for c in claims if not c['released']))
+        elif claims:
+            print(f"{len(claims)} stale writer claim{'' if len(claims) == 1 else 's'} (the job finished and its runner "
+                  'is gone); `twinlane wt doctor --fix` releases them'
+                  + ''.join(f"\n  {c['id']}  {c['cwd']}" for c in claims))
     return rc

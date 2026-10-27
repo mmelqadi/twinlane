@@ -19,6 +19,9 @@ from twinlane import common, jobs
 REAL_PID_STATE = jobs._pid_state
 
 
+REAL_PID_STATE = jobs._pid_state  # setUp replaces it; the slot-wait test needs the snapshot-caching original
+
+
 class PreservingStartTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(dir=test_support._HOME)
@@ -209,7 +212,8 @@ class PreservingStartTests(unittest.TestCase):
         def probe(pid, stamp):
             return next(states, common.DEAD) if pid == 102 else common.DEAD
         with jobs.preserving_metadata(self.new), self.protect_old_store(), \
-                mock.patch.object(jobs, '_pid_state', side_effect=probe), mock.patch.object(jobs.time, 'sleep') as sleep:
+                mock.patch.object(jobs, '_pid_state', REAL_PID_STATE), mock.patch.object(common, 'pid_state', side_effect=probe), \
+                mock.patch.object(jobs.time, 'sleep') as sleep:
             self.assertTrue(jobs.acquire_slot(self.new, 'claude', 1, {'claude': {'max_parallel': 1}}))
         self.assertEqual(sleep.call_count, 2)
         self.assertEqual(before, self.snapshot())

@@ -9,6 +9,7 @@ Env knobs:
   FAKE_SERVED_MODEL=M     model reported in result.modelUsage (default: the --model argument)
   FAKE_SESSION_ID=S       session id (default: --resume value, else a new uuid); a fork always gets a new id
   FAKE_SLEEP=SECONDS      sleep after init (timeout tests)
+  FAKE_SLEEP_ONCE=PATH    with FAKE_SLEEP, sleep only while PATH does not exist (the first run creates it)
   FAKE_TOUCH=NAME         create NAME in the cwd and report it as a Write tool_use (tripwire tests)
   FAKE_TOUCH_NO_TOOL_USE=1  create FAKE_TOUCH without a tool_use (a peer's write, as far as the job can tell)
   FAKE_TOOL_USE=JSON      emit one assistant tool_use {"name": ..., "input": {...}}
@@ -76,7 +77,11 @@ def main():
         emit({'type': 'assistant', 'session_id': sid, 'message': {'content': [
             {'type': 'tool_use', 'id': 'toolu_x', 'name': use['name'], 'input': use.get('input') or {}}]}})
     if os.environ.get('FAKE_SLEEP'):
-        time.sleep(float(os.environ['FAKE_SLEEP']))
+        once = os.environ.get('FAKE_SLEEP_ONCE')  # sleep only on the first run: the marker file records it
+        if not once or not os.path.exists(once):
+            if once:
+                open(once, 'w').close()
+            time.sleep(float(os.environ['FAKE_SLEEP']))
     echo = echo_line(brief)
     emit({'type': 'assistant', 'session_id': sid,
           'message': {'model': served, 'content': [{'type': 'text', 'text': f'working on it {echo}'.strip()}]}})

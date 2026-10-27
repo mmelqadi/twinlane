@@ -423,7 +423,7 @@ class RenderTests(BoardBase):
         rc, out = self.run_board('--json')
         self.assertEqual(rc, 0)
         data = json.loads(out)
-        self.assertEqual(set(data), {'generated_at', 'all', 'meters', 'attention', 'signals', 'sessions', 'lanes', 'jobs', 'batons', 'worktrees', 'waiting', 'capacity'})
+        self.assertEqual(set(data), {'generated_at', 'all', 'meters', 'attention', 'signals', 'sessions', 'lanes', 'jobs', 'batons', 'worktrees', 'waiting', 'capacity', 'host', 'queue'})
         self.assertEqual(set(data['jobs']), {'live', 'finished', 'unreadable', 'scanned'})
         self.assertNotIn('_all_finished', data['jobs'])
 

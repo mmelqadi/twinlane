@@ -557,6 +557,46 @@ class ClaimantParity(Base):
         self.assertTrue(self.claimant({(80, 800): DEAD}))  # the claimant deleted the marker, then admitted
         self.assertFalse((self.s.jobs / '20261013-000001-claude-abcd' / 'child-starting.json').exists())
 
+    def test_r8_unresolved_tree_forms_match_writer_busy_and_claimant(self):
+        jid = '20261013-000001-claude-abcd'
+        table = {(5, 7): DEAD, (6, 8): DEAD}
+        for marker in (jobs.TREE_UNRESOLVED, jobs.CHILD_STARTING):
+            with self.subTest(marker=marker):
+                self.s = Store(self)
+                self.s.job(jid, status={'status': 'failed', 'pid': 5, 'pid_created': 7,
+                                       'child_pid': 6, 'child_created': 8}, result={'status': 'failed'})
+                self.s.put(self.s.jobs / jid / marker, {'engine': 'claude', 'unresolved_tree': True})
+                report = self.explain(table)
+                with mock.patch.object(common, 'JOBS', str(self.s.jobs)), \
+                        mock.patch.object(jobs, '_pid_state', return_value=DEAD):
+                    self.assertTrue(jobs._writer_job_busy(jid))
+                self.assertFalse(self.claimant(table))
+                self.assertEqual(report['decision'], wa.BLOCKED)
+                self.assertEqual(report['jobs'][0]['engine']['engine_state'], UNKNOWN)
+                reason = ' '.join(self.reasons(report))
+                self.assertIn(marker, reason)
+                self.assertIn('a person must run twinlane stop JOB --tree-gone', reason)
+
+    def test_r8_tree_marker_only_folder_is_not_unpublished(self):
+        jid = '20261013-000001-claude-abcd'
+        self.s.job(jid, spec=None)
+        self.s.put(self.s.jobs / jid / jobs.TREE_UNRESOLVED, {})
+        self.assertEqual(self.explain()['decision'], wa.BLOCKED)
+        self.assertEqual(self.explain()['skipped']['unpublished'], 0)
+
+    def test_r8_tree_marker_appearance_changes_snapshot_generation(self):
+        jid = '20261013-000001-claude-abcd'
+        self.s.job(jid, status={'status': 'failed', 'pid': 5, 'pid_created': 7})
+        observe = table_observer({(5, 7): DEAD})
+
+        def marker_appears(pid, created):
+            self.s.put(self.s.jobs / jid / jobs.TREE_UNRESOLVED, {})
+            return observe(pid, created)
+
+        report = self.explain(observer=marker_appears)
+        self.assertFalse(report['snapshot']['stable'])
+        self.assertIn('file:' + jid + '/' + jobs.TREE_UNRESOLVED, report['snapshot']['races'])
+
     def test_real_self_observation_blocks_on_a_live_owner(self):
         me = common.process_created(os.getpid())
         self.assertIsNotNone(me)

@@ -208,7 +208,7 @@ def _routes(meter, policy: dict) -> dict:
 
 
 def collect_meters(policy: dict, now) -> dict:
-    raw = common.read_json(os.path.join(common.STATE, 'meter.json'))
+    raw = meter_mod.latest_observation(policy)
     if not isinstance(raw, dict) or not any(isinstance(raw.get(e), dict) for e in ENGINES):
         return {'cached': False, 'read_at': None, 'age_s': None, 'claude': None, 'codex': None, 'routes': {}}
     views = {e: _engine_view(e, raw.get(e), policy, now) for e in ENGINES}
@@ -406,7 +406,7 @@ def _mtime_ns(path: str) -> int:
         return 0
 
 
-def _baton_row(slug: str, raw, policy=None, session_rows=None) -> dict:
+def _baton_row(slug: str, raw, policy=None, session_rows=None, file_only=False) -> dict:
     from . import baton
     row = {'slug': slug, 'owner': None, 'age': '?', 'age_s': None, 'updated_at': None, 'next_action': None,
            'in_flight': [], 'approvals_pending': [], 'root': None, 'worktree': None, 'problems': []}
@@ -478,7 +478,8 @@ def _baton_row(slug: str, raw, policy=None, session_rows=None) -> dict:
     if not bad:
         row['stored_state'] = raw.get('state', 'active')
         from . import lanes
-        row['state'] = lanes.effective_state(raw, policy=policy, session_rows=session_rows)
+        row['state'] = raw.get('state', 'active') if file_only else lanes.effective_state(
+            raw, policy=policy, session_rows=session_rows)
         from . import inbox
         row['inbox'] = inbox.items([dict(raw, slug=slug)], policy=policy, session_rows=session_rows)
     else:
@@ -487,17 +488,26 @@ def _baton_row(slug: str, raw, policy=None, session_rows=None) -> dict:
 
 
 @observations.command
-def collect_batons(policy=None, session_rows=None) -> list[dict]:
+def collect_batons(policy=None, session_rows=None, file_only=False) -> list[dict]:
     """Read every baton file directly (not through baton.list_batons) so one damaged file becomes a row with
     `problems` instead of an exception."""
     from . import baton
     rows = []
-    for path in glob.glob(os.path.join(common.BATONS, '*.json')):
+    if file_only:
+        # glob suppresses scandir failures: patrol must distinguish denied from empty.
+        try:
+            names = os.listdir(common.BATONS)
+        except FileNotFoundError:
+            names = []
+        paths = [os.path.join(common.BATONS, n) for n in names if n.endswith('.json')]
+    else:
+        paths = glob.glob(os.path.join(common.BATONS, '*.json'))
+    for path in paths:
         slug = os.path.basename(path)[: -len('.json')]
         if not baton.valid_slug(slug):
             continue
         try:
-            row = _baton_row(slug, common.read_json(path), policy, session_rows)
+            row = _baton_row(slug, common.read_json(path), policy, session_rows, file_only=file_only)
         except Exception:  # noqa: BLE001
             row = dict(_baton_row(slug, None), problems=['unreadable'])
         row['_mtime'] = _mtime_ns(path)
@@ -683,11 +693,31 @@ def build_attention(meters: dict, jobs_data: dict, batons: list[dict], show_all:
 # ---------------------------------------------------------------- collect
 
 @observations.command
-def collect(show_all: bool = False, finished_n: int = FINISHED_DEFAULT, now=None, policy: dict | None = None) -> dict:
+def collect(show_all: bool = False, finished_n: int = FINISHED_DEFAULT, now=None, policy: dict | None = None,
+            file_only: bool = False) -> dict:
+    if file_only:
+        with common.nonspawning_liveness():
+            return _collect(show_all, finished_n, now, policy, file_only=True)
+    return _collect(show_all, finished_n, now, policy)
+
+
+def _collect(show_all, finished_n, now, policy, file_only=False):
     now = now or common.now()
     policy = policy or common.load_policy()
     meters = collect_meters(policy, now)
     jobs_data = collect_jobs(now, show_all, finished_n)
+    if file_only:  # patrol: no transcript scan, claims provider, host sampling or git probes
+        batons = collect_batons(policy, [], file_only=True)
+        signals = build_signals(meters, jobs_data, batons, show_all)
+        attention = build_attention(meters, jobs_data, batons, show_all)
+        finished = jobs_data.pop('_all_finished')
+        jobs_data['finished'] = []
+        for row in finished:
+            age = row.get('ended_age_s') if row.get('ended_age_s') is not None else row.get('age_s')
+            if age is not None and age <= ATTENTION_WINDOW_S:
+                jobs_data['finished'].append(row)
+        return _scrub({'meters': meters, 'jobs': jobs_data, 'batons': batons,
+                       'signals': signals, 'attention': attention})
     from . import sessions
     session_error = None
     try:
@@ -711,6 +741,7 @@ def collect(show_all: bool = False, finished_n: int = FINISHED_DEFAULT, now=None
                             key=lambda b: (b.get('waiting_since') or '', b['slug'])) for kind in ('lead', 'user')}
     capacity_line = capacity.line('?' if busy is None else len(busy), (policy.get('wip') or {}).get('max_writers', 5),
                                   len(wip.queue()), meters, now)
+    host_line, queue = host_and_queue(jobs_data['live'], policy)
     for row in lane_sessions:
         if (row.get('context') or {}).get('flag'):
             signals.append(_item(P_INFO, 'context', row['id'], context.label(row['context']) + ' (estimate)'))
@@ -721,8 +752,33 @@ def collect(show_all: bool = False, finished_n: int = FINISHED_DEFAULT, now=None
         b.pop('root', None)
     return _scrub({'generated_at': common.iso(now), 'all': show_all, 'meters': meters, 'attention': attention,
                    'signals': signals, 'sessions': lane_sessions, 'waiting': waiting, 'capacity': capacity_line,
+                   'host': host_line, 'queue': queue,
                    'lanes': {'busy': '?' if busy is None else len(busy), 'max': (policy.get('wip') or {}).get('max_writers', 5), 'idle': idle},
                    'jobs': jobs_data, 'batons': batons, 'worktrees': worktrees})
+
+
+def host_and_queue(live: list, policy: dict) -> tuple:
+    """The host-load line, and every job waiting for a slot with the reason it waits, in service order."""
+    from . import hostload, jobs
+    try:
+        reading = hostload.sample(policy)
+    except Exception:  # noqa: BLE001 - a sensor failure never breaks the board
+        reading = None
+    configured = max([int((policy.get(e) or {}).get('max_parallel') or 4) for e in ENGINES] or [4])
+    waiting = []
+    for r in live:
+        if r.get('status') != 'queued':
+            continue
+        st = common.read_json(jobs._p(r['id'], 'status.json'), {}) or {}
+        if not isinstance(st, dict):
+            continue
+        waiting.append({'id': r['id'], 'engine': r.get('engine'), 'kind': r.get('kind'), 'name': r.get('name'),
+                        'reason': st.get('queue_reason') or 'waiting for a slot',
+                        'waiting_since': st.get('waiting_since'), 'priority': st.get('queue_priority', 1)})
+    waiting.sort(key=lambda w: (w['engine'] or '', w['priority'], str(w['waiting_since'] or ''), w['id']))
+    for w in waiting:
+        w['waiting_age'] = common.fmt_age(common.age_s(w['waiting_since']))
+    return hostload.line(reading, configured, policy), waiting
 
 
 # ---------------------------------------------------------------- rendering
@@ -882,6 +938,8 @@ def render_text(data: dict) -> str:
             L.append(f"  note {e}: {v['note']}")
     L.append(_route_text(m))
     L.append(data.get('capacity', ''))
+    if data.get('host'):
+        L.append(data['host'])
     L.append(f"idle lanes: {data.get('lanes', {}).get('idle', 0)}")
     for kind in ('lead', 'user'):
         L.append(f'== Waiting on {kind}')
@@ -904,6 +962,10 @@ def render_text(data: dict) -> str:
     L += ['  ' + _live_text(r) for r in live] or ['  none running']
     if more:
         L.append(_more(more))
+    if data.get('queue'):
+        L.append(f"== QUEUE ({len(data['queue'])} waiting for a slot)")
+        L += [f"  {i}. {w['id']}  {w['engine'] or '-':6} {w['kind'] or '-':9} waited {w.get('waiting_age') or '?':>4}  {w['reason']}"
+              for i, w in enumerate(data['queue'], 1)]
     from . import context
     L.append('== SESSIONS (context is estimated)')
     L += [f"  {r['engine']} {r['id']} {r['state']} {context.label(r.get('context'))}"
@@ -955,6 +1017,8 @@ def render_md(data: dict) -> str:
     L.append('- ' + _engine_line('codex', m.get('codex')))
     L.append('- ' + _route_text(m))
     L.append('- ' + data.get('capacity', ''))
+    if data.get('host'):
+        L.append('- ' + data['host'])
     L.append(f"- idle lanes: {data.get('lanes', {}).get('idle', 0)}")
     for kind in ('lead', 'user'):
         L += ['', f'**Waiting on {kind}**']
@@ -980,6 +1044,11 @@ def render_md(data: dict) -> str:
                   _model_text(r), r['name'], r['worktree']] for r in live]) or ['- none running']
     if more:
         L.append(f'- ... +{more} more (`--all`)')
+    if data.get('queue'):
+        L += ['', f"**Queue ({len(data['queue'])} waiting for a slot)**"]
+        L += _table(['#', 'job', 'engine', 'kind', 'waited', 'reason'],
+                    [[i, _code(w['id']), w['engine'], w['kind'], w.get('waiting_age'), w['reason']]
+                     for i, w in enumerate(data['queue'], 1)])
     from . import context
     L += ['', '**Sessions** (estimated context)']
     L += _table(['engine', 'session', 'state', 'context', 'startedBy', 'custody'],

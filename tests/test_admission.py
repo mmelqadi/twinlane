@@ -172,6 +172,7 @@ runpy.run_path(sys.argv[0],run_name='__main__')
                 mock.patch.object(common, 'acquire_codex', return_value=('synthetic.exe', None, 'lease')), \
                 mock.patch.object(common, 'release_codex') as release, \
                 mock.patch.object(jobs.subprocess, 'Popen', return_value=proc), \
+                mock.patch.object(common, 'contain_engine'), \
                 mock.patch.object(common, 'process_created', side_effect=OSError('identity unavailable')), \
                 mock.patch.object(common, 'kill_tree', return_value=False) as kill:
             out = jobs._run_codex(self.jid, ['synthetic'], str(self.root), 1,
@@ -191,6 +192,7 @@ runpy.run_path(sys.argv[0],run_name='__main__')
         files = {k: str(self.root / k) for k in ('stderr', 'events')}
         with mock.patch.object(jobs, 'claude_env', return_value={}), \
                 mock.patch.object(jobs.subprocess, 'Popen', return_value=proc), \
+                mock.patch.object(common, 'contain_engine'), \
                 mock.patch.object(common, 'process_created', side_effect=OSError('identity unavailable')), \
                 mock.patch.object(common, 'kill_tree', return_value=False) as kill:
             out = jobs._run_claude(self.jid, ['synthetic'], {'cwd': str(self.root)},

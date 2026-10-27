@@ -258,7 +258,7 @@ class ProcessIdentity(unittest.TestCase):
             self.assertFalse(common.kill_tree(child.pid, created + 1))
             time.sleep(0.3)
             self.assertIsNone(child.poll(), 'kill_tree killed a process whose identity did not match')
-            self.assertTrue(common.kill_tree(child.pid, created))
+            self.assertIs(common.kill_tree(child.pid, created), not common.IS_WIN)
             child.wait(timeout=10)
         finally:
             if child.poll() is None:

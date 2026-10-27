@@ -92,7 +92,7 @@ def unreadable_identity(*pids):
 
 class JobsBase(unittest.TestCase):
     ENV_KEYS = ('TWINLANE_HOME', 'TWINLANE_CONFIG', 'TWINLANE_CLAUDE_BIN', 'TWINLANE_CODEX_RUN', 'ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL',
-                'FAKE_LIMIT', 'FAKE_SERVED_MODEL', 'FAKE_SESSION_ID', 'FAKE_SLEEP', 'FAKE_TOUCH', 'FAKE_ARGV_OUT',
+                'FAKE_LIMIT', 'FAKE_SERVED_MODEL', 'FAKE_SESSION_ID', 'FAKE_SLEEP', 'FAKE_SLEEP_ONCE', 'FAKE_TOUCH', 'FAKE_ARGV_OUT',
                 'FAKE_CODEX_LIMIT', 'FAKE_CODEX_EXIT', 'FAKE_CODEX_ARGV_OUT', 'FAKE_TOUCH_NO_TOOL_USE',
                 'FAKE_TOOL_USE', 'FAKE_BAD_EVENTS', 'FAKE_CODEX_FINAL', 'TWINLANE_CODEX_ADAPTER_STRICT_CREDITS',
                 'TWINLANE_CODEX_BIN', 'LOCALAPPDATA', 'TWINLANE_TEST_ISOLATION', 'FAKE_CODEX_USAGE', 'FAKE_CODEX_ROLLOUT_ROOT',
@@ -674,6 +674,7 @@ class RunnerFinalization(JobsBase):
                 mock.patch.object(jobs, 'parse_codex_out', return_value=parsed), \
                 mock.patch.object(jobs, '_stop_requested', side_effect=lambda job_id: requested and bool(launched)), \
                 mock.patch.object(common, '_read_codex_version', return_value=None), \
+                mock.patch.object(common, 'contain_engine'), \
                 mock.patch.object(jobs.subprocess, 'Popen', side_effect=popen), \
                 mock.patch.object(common, 'kill_tree', return_value=kill_result):
             receipt = jobs.run_job(jid)
@@ -712,6 +713,15 @@ class RunnerFinalization(JobsBase):
                             jid, receipt = self.run_fixture(engine, outcome, kill_result)
                         self.assertEqual(receipt['status'], outcome)
                         st = common.read_json(jobs._p(jid, 'status.json'))
+                        if common.IS_WIN and outcome == 'timeout' and kill_result is False:
+                            # Reaping the synthetic root cannot resolve an unconfirmed tree.
+                            self.assertEqual(st['status'], 'running')
+                            self.assertNotIn('runner_finalized', st)
+                            self.assertTrue(jobs._tree_unresolved(jid))
+                            self.assertTrue(jobs._child_pending(jid))
+                            self.assertEqual(jobs.job_status(jid), 'unknown')
+                            self.assertEqual(jobs.running_count(engine), 1)
+                            continue
                         self.assertEqual(st['status'], outcome)
                         self.assertTrue(st['runner_finalized'])
                         self.assertFalse(os.path.exists(jobs._p(jid, jobs.CHILD_STARTING)))
@@ -1039,6 +1049,7 @@ class InlineRuns(JobsBase):
             return real_popen(argv, *a, **kw)
 
         with mock.patch.object(common, '_read_codex_version', return_value=None), \
+                mock.patch.object(common, 'contain_engine'), \
                 mock.patch.object(jobs.subprocess, 'Popen', side_effect=popen), \
                 mock.patch.object(common, 'kill_tree', return_value=False):
             self.run_codex()
@@ -1239,7 +1250,8 @@ class InlineRuns(JobsBase):
             if isinstance(argv, list) and FAKE_CODEX in argv:
                 return Unkillable()
             return real_popen(argv, *a, **kw)
-        with mock.patch.object(jobs.subprocess, 'Popen', side_effect=popen), \
+        with mock.patch.object(common, 'contain_engine'), \
+                mock.patch.object(jobs.subprocess, 'Popen', side_effect=popen), \
                 mock.patch.object(common, 'kill_tree', return_value=False):
             self.cli('run', '--brief', self.brief, '--cd', self.work,
                      '--kind', 'parallel', '--engine', 'codex')
@@ -1296,13 +1308,21 @@ class InlineRuns(JobsBase):
                 return proc
             return real_popen(argv, *a, **kw)
 
-        args = ['run', '--brief', self.brief, '--cd', self.work, '--timeout', '2']
-        if engine == 'codex':
-            args += ['--kind', 'parallel', '--engine', 'codex']
+        # Test lifecycle behavior with an inert engine, independently of lead-only dispatch.
+        jid = '20261025-000001-' + engine + '-fixture'
+        params = {'engine': engine, 'profile': 'intel', 'timeout_s': 2, 'max_turns': 2,
+                  'model': 'fixture-model', 'effort': 'low', 'tier': 'luna'}
+        spec = {'id': jid, 'engine': engine, 'primary': params, 'profile': 'intel',
+                'kind': 'intel', 'cwd': self.work, 'failover': False}
+        os.makedirs(jobs.job_dir(jid))
+        common.write_json(jobs._p(jid, 'job.json'), spec)
+        common.write_text(jobs._p(jid, 'brief.md'), 'fixture brief')
+        jobs._write_status(jid, 'queued', engine=engine)
         with mock.patch.object(common, '_read_codex_version', return_value=None), \
+                mock.patch.object(common, 'contain_engine'), \
                 mock.patch.object(jobs.subprocess, 'Popen', side_effect=popen), \
                 mock.patch.object(common, 'kill_tree', return_value=kill_result) as kill:
-            self.cli(*args)
+            jobs.run_job(jid)
         return self.only_job(), kill
 
     def _check_a_surviving_engine_stays_visible_and_stoppable(self, engine):
@@ -1332,6 +1352,11 @@ class InlineRuns(JobsBase):
         self.assertEqual(rc, 0, self._kill_diagnosis(out, real_kill, child, stamp))
         real_kill.assert_called_once_with(child.pid, stamp)
         child.wait(timeout=15)
+        if common.IS_WIN:
+            self.assertTrue(jobs._tree_unresolved(jid))
+            self.assertEqual(jobs.job_status(jid), 'unknown')
+            self.assertEqual(jobs.running_count(engine), 1)
+            self.assertEqual(self.cli('stop', jid, '--tree-gone')[0], 0)
         self.assertEqual(jobs.job_status(jid), 'timeout')
         self.assertEqual(jobs.running_count(engine), 0)
         self.assertEqual(self.receipt(jid)['status'], 'timeout')
@@ -1359,6 +1384,9 @@ class InlineRuns(JobsBase):
                 self.assertEqual((jobs.job_status(jid), jobs.running_count(engine)), ('orphaned', 1))
                 self.assertEqual(self.cli('stop', jid)[0], 0)
                 child.wait(timeout=15)
+                if common.IS_WIN:
+                    self.assertTrue(jobs._tree_unresolved(jid))
+                    self.assertEqual(self.cli('stop', jid, '--tree-gone')[0], 0)
                 self.assertEqual((jobs.job_status(jid), jobs.running_count(engine)), ('interrupted', 0))
 
     def test_an_interrupt_whose_kill_worked_leaves_no_survivor(self):
@@ -1394,7 +1422,9 @@ class InlineRuns(JobsBase):
             with self.subTest(engine=engine):
                 self.fresh_jobs()
                 child, _ = self._stuck_engine()
-                with mock.patch.object(common, 'process_created', return_value=None):
+                created = common.process_created
+                with mock.patch.object(common, 'process_created',
+                                       side_effect=lambda pid: None if pid == child.pid else created(pid)):
                     jid, _ = self._run_timing_out(engine, self.EngineProc(child.pid, stuck=99), True)
                 saved = common.read_json(os.path.join(common.JOBS, jid, jobs.SURVIVOR))
                 self.assertEqual((saved['pid'], saved['created']), (child.pid, None))
@@ -1406,7 +1436,7 @@ class InlineRuns(JobsBase):
 
     def test_a_clean_timeout_is_unchanged_and_needs_no_process_probe(self):
         for engine in ('claude', 'codex'):
-            for kill_result in (True, False):  # a failed kill of a child that exits anyway is still clean
+            for kill_result in (True, False):  # a dead root cannot resolve an unconfirmed Windows tree
                 with self.subTest(engine=engine, kill=kill_result):
                     self.fresh_jobs()
                     jid, _ = self._run_timing_out(engine, self.EngineProc(os.getpid(), stuck=1), kill_result)
@@ -1415,14 +1445,22 @@ class InlineRuns(JobsBase):
                     self.assertNotIn('survivor', r)
                     self.assertNotIn('survived', json.dumps(r['notes']))
                     self.assertFalse(os.path.exists(os.path.join(common.JOBS, jid, jobs.SURVIVOR)))
-                    # A receipt that ended cleanly is trusted without looking at any process
+                    unresolved = common.IS_WIN and not kill_result
+                    expected = 'unknown' if unresolved else 'timeout'
+                    self.assertEqual(jobs._tree_unresolved(jid), unresolved)
+                    # Both a qualified exit and an unresolved marker need no root-pid probe.
                     with mock.patch.object(common, 'pid_state', side_effect=AssertionError('process probe')), \
                             mock.patch.object(common, 'kill_tree') as kill:
-                        self.assertEqual(jobs.job_status(jid), 'timeout')
-                        self.assertEqual(jobs.running_count(engine), 0)
-                        self.assertEqual([j['status'] for j in jobs.list_jobs()], ['timeout'])
-                        self.assertIn('already finished', self.cli('stop', jid)[1])
+                        self.assertEqual(jobs.job_status(jid), expected)
+                        self.assertEqual(jobs.running_count(engine), int(unresolved))
+                        self.assertEqual([j['status'] for j in jobs.list_jobs()], [expected])
+                        if not unresolved:
+                            self.assertIn('already finished', self.cli('stop', jid)[1])
                     kill.assert_not_called()
+                    if unresolved:
+                        # Stop must recheck the runner; the unresolved marker cannot authorize release.
+                        self.assertEqual(self.cli('stop', jid)[0], common.EXIT_RUNNING)
+                        self.assertTrue(jobs._tree_unresolved(jid))
 
     def test_requested_codex_model_is_not_claimed_as_verified(self):
         rc, out, _ = self.cli('run', '--brief', self.brief, '--cd', self.work,
@@ -2707,7 +2745,7 @@ class SlotsAndLifecycle(JobsBase):
                                 child_created=common.process_created(child.pid))
             rc, out, _ = self.cli('stop', jid, '--json')
             self.assertEqual(rc, 0)
-            self.assertIn(child.pid, json.loads(out)['killed_pids'])
+            self.assertIn(child.pid, json.loads(out)['kill_failed_pids' if common.IS_WIN else 'killed_pids'])
             child.wait(timeout=15)
             self.assertEqual(self.receipt(jid)['status'], 'stopped')
             self.assertIn('already finished', self.cli('stop', jid)[1])
@@ -2725,7 +2763,7 @@ class SlotsAndLifecycle(JobsBase):
             rc, out, _ = self.cli('stop', jid, '--json')
             self.assertEqual(rc, 0)
             payload = json.loads(out)
-            self.assertIn(child.pid, payload['killed_pids'])
+            self.assertIn(child.pid, payload['kill_failed_pids' if common.IS_WIN else 'killed_pids'])
             self.assertNotEqual(payload.get('already_finished'), True)
             child.wait(timeout=15)
             self.assertEqual(self.receipt(jid)['status'], 'stopped')
@@ -2781,6 +2819,30 @@ class SlotsAndLifecycle(JobsBase):
             self.assertEqual((data['status'], data['alive_pids']), ('stop_failed', [child.pid]))
             self.assertIsNone(common.read_json(os.path.join(common.JOBS, jid, 'result.json')))
             self.assertEqual([f['job'] for f in baton.load('stuck')['progress']['in_flight']], [jid])
+        finally:
+            common.kill_tree = orig
+            if child.poll() is None:
+                child.kill()
+
+    def test_stop_waits_for_an_unconfirmed_kill_to_land_before_judging_the_target_alive(self):
+        # On Windows a cross-process kill is never reported as confirmed, yet the process does die a moment later:
+        # the liveness check must not run before the grace, or a stop that worked reads as "still alive".
+        import threading
+        child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+        orig = common.kill_tree
+        try:
+            jid = self.fake_job('20261008-000001-claude-aaaa', pid=self.dead_pid(), child_pid=child.pid,
+                                child_created=common.process_created(child.pid))
+
+            def late_kill(pid, created=None):
+                threading.Timer(0.6, child.kill).start()
+                return False  # the kill was requested but is not confirmed
+
+            common.kill_tree = late_kill
+            rc, out, _ = self.cli('stop', jid, '--json')
+            self.assertEqual(rc, 0, out)
+            child.wait(timeout=15)
+            self.assertEqual(self.receipt(jid)['status'], 'stopped')
         finally:
             common.kill_tree = orig
             if child.poll() is None:
@@ -3160,15 +3222,16 @@ class UsageReceipts(JobsBase):
     def test_the_after_reading_is_re_read_once_when_it_predates_the_end_and_never_by_a_model(self):
         seen = []
 
-        def fake_meter(policy, fresh=False, auto_refresh=True):
-            seen.append((fresh, auto_refresh))
+        def fake_meter(policy, fresh=False, auto_refresh=True, admission=True):
+            seen.append((fresh, auto_refresh, admission))
             return usage_meter(at=-300) if not fresh else usage_meter(claude=(12.0, 40.0))
 
         spec = {'meter_before': usage_meter(at=-400), 'cwd': self.work}
         attempts = [{'engine': 'claude', 'argv': ['x'], 'started_at': common.iso(common.now())}]
         with mock.patch.object(jobs, '_meter', fake_meter):
             usage, after = jobs._job_usage('x', spec, attempts, {}, common.now(), None, quick=False)
-        self.assertEqual(seen, [(False, False), (True, False)])  # never an auto (model) refresh
+        # never an auto (model) refresh, and the usage receipt never takes the stale-ok admission substitute
+        self.assertEqual(seen, [(False, False, False), (True, False, False)])
         self.assertEqual(after['claude']['windows'][0]['pct'], 12.0)
         self.assertEqual(usage['claude']['delta']['five_hour'], 2.0)
 
@@ -3215,7 +3278,7 @@ class UsageReceipts(JobsBase):
     def test_bounded_after_meter_returns_at_the_deadline_with_a_daemon_thread(self):
         release = threading.Event()
         try:
-            with mock.patch.object(jobs, '_meter', lambda policy, fresh=False, auto_refresh=True: release.wait(30)):
+            with mock.patch.object(jobs, '_meter', lambda policy, fresh=False, auto_refresh=True, admission=True: release.wait(30)):
                 t0 = time.monotonic()
                 m, timed_out = jobs._bounded_after_meter({}, 0.2)
             self.assertTrue(timed_out)
@@ -3756,7 +3819,7 @@ class AutoRefreshPlanning(JobsBase):
         m['claude'].update(status='unknown', max_pct=None, windows=[],
                            token_expired_at=common.iso(common.now() - dt.timedelta(minutes=5)))
         # The refresh is a model call: it runs only when the last recorded reading shows extra usage OFF.
-        with mock.patch.object(jobs, '_meter', lambda policy, fresh=False, auto_refresh=True: m), \
+        with mock.patch.object(jobs, '_meter', lambda policy, fresh=False, auto_refresh=True, admission=True: m), \
                 mock.patch('twinlane.meter.refresh_blocker', return_value=None):
             rc, out, err = self.cli('run', '--brief', self.brief, '--cd', self.work, '--dry-run', '--json')
         self.assertEqual(rc, 0, out + err)
@@ -3771,7 +3834,7 @@ class AutoRefreshPlanning(JobsBase):
         m['claude'].update(status='unknown', max_pct=None, windows=[],
                            token_expired_at=common.iso(common.now() - dt.timedelta(minutes=5)))
         # The refresh is a model call: it runs only when the last recorded reading shows extra usage OFF.
-        with mock.patch.object(jobs, '_meter', lambda policy, fresh=False, auto_refresh=True: m),                 mock.patch('twinlane.meter.refresh_blocker', return_value=None):
+        with mock.patch.object(jobs, '_meter', lambda policy, fresh=False, auto_refresh=True, admission=True: m),                 mock.patch('twinlane.meter.refresh_blocker', return_value=None):
             rc, out, err = self.cli('run', '--brief', self.brief, '--cd', self.work, '--dry-run', '--json')
         self.assertEqual(rc, 0, out + err)
         text = json.dumps(json.loads(out))

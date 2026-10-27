@@ -188,6 +188,9 @@ class PreservingCodexStartTests(unittest.TestCase):
 
     def fake_child(self, record):
         """A mocked child that leaves the runner's evidence; nothing is executed."""
+        # This Popen has no kernel process/thread handle. Containment belongs to
+        # the real-child tests; keep the native-probe tripwire active elsewhere.
+        self.stack.enter_context(mock.patch.object(common, 'contain_engine'))
         def popen(argv, cwd=None, env=None, **kwargs):
             # Only the two hand-off variables: a failure message must never echo the rest of the environment.
             record.append({'argv': list(argv), 'env': {k: v for k, v in (env or {}).items()

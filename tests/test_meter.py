@@ -845,8 +845,12 @@ for line in sys.stdin:
         shutil.rmtree(os.path.join(self.tmp, 'sessions'))
         m = self._read_with_failed_server(self.policy, rollout_fallback=False)
         self.assertEqual(m['codex']['status'], 'unknown')
-        # the cache holds what was read: no rollout reading reached it
-        self.assertNotEqual(common.read_json(meter.meter_path())['codex'].get('source'), 'rollout')
+        # a failed read never reaches the allowance cache: it keeps the earlier genuine (rollout) reading byte for byte
+        # and the failure goes to its own sidecar, so the two later failed reads read back as unknown, not as rollout
+        self.assertEqual(common.read_json(meter.meter_path())['codex'].get('source'), 'rollout')
+        failed = common.read_json(meter._failed_observation_path())
+        self.assertEqual(failed['codex']['status'], 'unknown')
+        self.assertNotEqual(failed['codex'].get('source'), 'rollout')
 
     def test_cli_no_rollout_flag(self):
         sessions = self._rollout_fixture()
