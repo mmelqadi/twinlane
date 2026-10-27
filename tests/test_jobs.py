@@ -1264,6 +1264,7 @@ class InlineRuns(JobsBase):
         self.assertFalse(said('I could not read the repo because ' + 'the sandbox was slow and ' * 12 + 'but recovered and completed the review.'))
         self.assertFalse(said('I could not read the files in the optional attachments; completed the requested inline-source review successfully. No findings.'))
         self.assertFalse(said('I could not read the files in the optional attachments; the requested review is complete.'))
+        self.assertFalse(said('The shell was unavailable, so I used the supplied inline diff and found no issues.'))
         self.assertFalse(said(''))
         self.assertFalse(said(None))
         self.assertFalse(said('Review done. ' + 'Detail line.\n' * 150 + 'Note: earlier I could not read the repo.'))

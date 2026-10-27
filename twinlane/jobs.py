@@ -1835,7 +1835,7 @@ UNREAD_QUOTED_RE = re.compile(
     '"[^"]*"' + '|(`+)[^`]*?' + chr(92) + '1'
     + '|' + chr(0x201c) + '[^' + chr(0x201d) + ']*' + chr(0x201d)
     + "|(?<!\\w)'[^']*'(?!\\w)")
-UNREAD_RECOVERED_RE = re.compile(r"\b(?:but|however|although|though|recovered|resolved|fixed|fix|now|eventually|after|once|retried|succeeded|completed|finished|reviewed|done)\b")
+UNREAD_RECOVERED_RE = re.compile(r"\b(?:but|however|although|though|recovered|resolved|fixed|fix|now|eventually|after|once|retried|succeeded|completed|finished|reviewed|done|used|using|found|instead|supplied|inline|findings|issues)\b")
 UNREAD_SENTENCE_RE = re.compile(r"(?<=[.!?])\s|\n")
 UNREAD_HEAD_CHARS, UNREAD_MAX_CHARS = 300, 800
 
