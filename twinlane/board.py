@@ -326,7 +326,8 @@ def _job_row(jid: str, now) -> dict | None:
     cwd = _s(spec.get('cwd'))
     row.update({'name': _txt(spec.get('name') or receipt.get('name'), 40) or None,
                 'kind': _s(spec.get('kind')) or _s(receipt.get('kind')),
-                'engine': _s(receipt.get('engine')) or _s(st.get('engine')) or _s(prim.get('engine')),
+                'engine': ('cloud' if receipt.get('where') == 'cloud' else
+                           _s(receipt.get('engine')) or _s(st.get('engine')) or _s(prim.get('engine'))),
                 'requested': _s(req.get('model')) or _s(req.get('tier')) or _s(prim.get('model'))
                 or _s(prim.get('tier')),
                 'served': served[0] if served else None, 'cwd': cwd,
@@ -778,7 +779,22 @@ def host_and_queue(live: list, policy: dict) -> tuple:
     waiting.sort(key=lambda w: (w['engine'] or '', w['priority'], str(w['waiting_since'] or ''), w['id']))
     for w in waiting:
         w['waiting_age'] = common.fmt_age(common.age_s(w['waiting_since']))
-    return hostload.line(reading, configured, policy), waiting
+    line = hostload.line(reading, configured, policy)
+    cloud = cloud_line(live, policy)
+    return (line + ' | ' + cloud if cloud and line else cloud or line), waiting
+
+
+def cloud_line(live: list, policy: dict):
+    """One short phrase on cloud use next to the host load; None while the cloud is off and unused."""
+    cfg = policy.get('cloud') or {}
+    rows = [r for r in live if r.get('engine') == 'cloud']
+    if not rows and not cfg.get('enabled'):
+        return None
+    running = sum(r.get('status') == 'running' for r in rows)
+    queued = sum(r.get('status') == 'queued' for r in rows)
+    local = sum(r.get('engine') == 'codex' and r.get('status') == 'running' for r in live)
+    return (f"cloud {running} running, {queued} queued (max {int(cfg.get('max_parallel') or 20)}); "
+            f"local codex {local}/{int((policy.get('codex') or {}).get('max_parallel') or 4)}")
 
 
 # ---------------------------------------------------------------- rendering
