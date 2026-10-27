@@ -1,8 +1,8 @@
 cff-version: 1.2.0
 message: "If you use twinlane, please cite this release."
 title: "twinlane"
-version: 0.2.0
-date-released: 2026-10-14
+version: 0.4.0
+date-released: 2026-10-27
 authors:
   - name: twinlane contributors
 repository-code: https://github.com/mmelqadi/twinlane
