@@ -46,6 +46,11 @@
     "timeout_s": 3600, "preflight_max_age_s": 300, "stale_reading_max_age_s": 1800,
     "binary_source": "auto", "exec_config": [], "min_cli_version": null, "allow_older_env_bin": false
   },
+  "cloud": {"enabled": false, "env": null, "remote": null, "clone_dir": null, "binary": null,
+    "max_parallel": 20, "attempts": 1, "poll_s": 30, "poll_fail_max": 8, "timeout_s": 5400, "default_ref": null,
+    "inline_prompt_max": 6000, "apply_to_worktree": true, "default_where": "local", "needs_local": [], "occupancy_ttl_s": 86400,
+    "mirror": {"argv": null, "success_re": null, "branch": "cloud/{job}", "lock": true, "add_flag": "--add", "timeout_s": 1800, "reuse": null, "dropped_note_file": null},
+    "firewall": {}},
   "guard": {"allow_subagents": false, "self_aliases": [], "deny_commands": [], "deny_text": []},
   "secrets": {"extra_env_name_patterns": []},
   "land": {"heartbeat_s": 15, "heartbeat_stale_s": 120, "gate_timeout_s": 1800},

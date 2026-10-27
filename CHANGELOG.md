@@ -1,9 +1,14 @@
 # Changelog
 
-## Unreleased
+## 0.5.0 - 2026-10-27
 
 ### Added
 - Host-load admission counts Windows console hosts (`hostload.conhost_soft` / `conhost_hard`, default 80 / 120). Past about 150 of them a started worker's shell calls hang, so the usable slots shrink first and queued work waits with "host busy: N console hosts". The count shows on the board host line; a missing count never throttles.
+- `run --where cloud`: run a Codex job in Codex Cloud with the same fields, receipt, board row and rules as a local one. New `--ref`, `--attach SRC[=DEST]` and `--follow-up JOB`. A per-job snapshot branch comes from a configured mirror command, results return as a hash-checked `result.patch` applied only inside the linked worktree, a failure is never re-run locally, and many jobs share one status poll. Settings live under `cloud` in the policy (off by default).
+- Data firewall (`twinlane/firewall.py`) for everything a cloud job sends: token patterns, bulk phone/e-mail thresholds, `deny_literals`, extra patterns, size and encoding limits, an optional command hook. Reasons name the rule and line, never the matched text.
+- Cloud-first mode: `cloud.default_where: "cloud"` with `cloud.needs_local` regexes keeps database and dry-run work local; `--where local` always wins.
+- `twinlane redact FILE`: writes a copy with secrets and contact data replaced by `[redacted:RULE]`, for sending a local report back to a cloud job.
+- Board: cloud jobs show engine `cloud`; the host line gains a cloud running/queued count.
 
 ### Fixed
 - A Codex run whose short final message opens by saying it could not read the repository or files (for example after hung shell calls) is now `failed`, not `done`. Longer reports that merely quote the phrase stay `done`.

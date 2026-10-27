@@ -355,6 +355,34 @@ Settings, all optional, in the user config:
 
 Between `soft` and `hard` the usable slots shrink linearly from `max_parallel` to `min_parallel`. A reading that cannot be taken never throttles. The CPU figure is the average over the last `cpu_window_s` seconds (5 to 120, default 20) from a short history of kernel counters kept in `state/hostload-cpu.json`, so a burst of short spikes does not read as an overload while a sustained one still does; with under 5 s of history it takes the lowest of three short samples.
 
+## Codex Cloud (`--where cloud`)
+
+When the bottleneck is the laptop, run Codex jobs in Codex Cloud and keep a small local pool for what only this machine can do (a database, a dry run). Cloud is off until you configure it.
+
+```
+twinlane run --where cloud --kind review --brief review.md --cd REPO --bg
+twinlane run --where cloud --kind code --write --cd LINKED_WORKTREE --brief b.md --bg   # patch is applied to that worktree
+twinlane run --where cloud --follow-up JOB --attach report.md --brief next.md --cd REPO --bg
+```
+
+- **Same job, other place.** A cloud job has the same fields, receipt, board row and rules as a local one; the receipt adds `where: cloud` and the task id, URL and patch hash. It is Codex only (`--engine claude`, `--resume` and `--continue-job` are refused with `--where cloud`; use `--follow-up JOB` to continue).
+- **One data firewall.** Everything that leaves the machine (the composed brief, every `--attach`, the snapshot) is scanned first: token patterns, bulk phone numbers and e-mail addresses, your own `deny_literals` and patterns, size and UTF-8 limits, and an optional `command` hook. A hit refuses the job and names the rule and line, never the matched text.
+- **Snapshot.** The task runs on a branch of a code-only mirror that your `cloud.mirror` command publishes for each job (`{job} {ref} {sha} {branch}`; one lock so two jobs never publish at once; an unchanged ref can reuse the last branch). twinlane ships no mirror tool and no company name.
+- **Results come back as patches.** The runner polls `codex cloud status` through one shared cache (many jobs, one poll), fetches `codex cloud diff` into `result.patch` with its sha256, refuses a patch that touches `.cloud/`, and for a writing job runs `git apply --check` and `git apply` only inside the linked worktree. It never runs `codex cloud apply` in a shared checkout.
+- **Failure stays failure.** A cloud task that fails, or an unreachable service, is recorded as failed. It is never silently re-run locally; the lead decides. The CLI cannot cancel a task, so `twinlane stop` ends the job and leaves the task running remotely.
+- **Cloud-first.** `cloud.default_where: "cloud"` sends every Codex job there unless you pass `--where local`, it is a resume/continue, or the brief matches one of `cloud.needs_local` (regexes). A misconfigured cloud runs locally with a visible note. `--where local` always wins. The ordinary `codex.max_parallel` stays the size of the local pool; `cloud.max_parallel` (default 20) caps cloud jobs, which do not shrink with host load.
+- **Chained work.** Build in the cloud, verify locally, send a sanitized report back with `--follow-up JOB --attach report.md`; the earlier job's final report is added to the brief (clipped) and is scanned like everything else. `twinlane redact report.md` writes `report.md.redacted` with secrets, every phone number and non-allow-listed e-mail address replaced by `[redacted:RULE]`, and refuses to write it if the text still fails the scan.
+- **Left-out files and leaving slots.** `cloud.mirror.dropped_note_file` names a text file your mirror command writes (the paths it left out); it is scanned and appended to the prompt so the worker asks for a file instead of inventing it. A task that is still running remotely when its runner times out or is stopped keeps counting against `cloud.max_parallel` until a status call shows it finished or `cloud.occupancy_ttl_s` (default 24 h) passes.
+
+```json
+{"cloud": {"enabled": true, "env": "<codex cloud environment id>", "default_where": "cloud",
+           "needs_local": ["\\bsqlsrv\\b", "dry run"],
+           "mirror": {"argv": ["python", "mirror.py", "{job}", "{ref}", "{sha}", "{branch}"], "branch": "cloud/{job}"},
+           "firewall": {"deny_literals": ["internal-hostname"]}}}
+```
+
+`twinlane board` shows cloud jobs as engine `cloud` and adds a `cloud N running, M queued (max 20)` line next to the local pool.
+
 ## Worktree health
 
 ```sh
