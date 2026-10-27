@@ -21,6 +21,10 @@
   twinlane resume [JOB ...] [--all-lost] [--yes]                  (restart jobs lost to a host restart)
   twinlane jobs | wait JOB... [--any] [--timeout S] | result JOB [--full] | stop JOB
   twinlane jobs archive [--older-than DAYS] [--include-unread] [--apply] [--json]
+  twinlane jobs reindex [--dry-run] [--json]
+  twinlane ack JOB... | ack --older-than DAYS [--owner SLUG|--name GLOB] [--dry-run]
+  twinlane completions [--since ISO|--unacked] [--json]          (read the optional completion log)
+  twinlane trust list|add NAME PATH|remove NAME
   twinlane explain-writer-admission --cwd DIR [--job-id ID] [--json]   (read-only; a proposal, never a grant)
   twinlane baton new|set|snap|show|list ...
   twinlane handoff (SLUG | --cd DIR | --session ID) [--to claude|codex] [--out F]
@@ -77,7 +81,9 @@ def status(argv):
                     f"finished_at={data['finished_at']} receipt_status={data['receipt_status']} receipt={data['receipt_path']}")
         return 0
     m = meter.cached_observation()
-    js = [j for j in jobs.list_jobs(limit=50) if j.get('status') in ('queued', 'running', 'orphaned', 'unknown')]
+    policy = common.load_policy()
+    js = [j for j in jobs.list_jobs(limit=50, live_only=True)
+          if j.get('status') in ('queued', 'running', 'orphaned', 'unknown')]
     bs = baton.list_batons()[:10]
     from twinlane import capacity, wip
     try:
@@ -85,7 +91,7 @@ def status(argv):
     except wip.WipError as e:  # status still reports; only writer admission fails closed
         writers = '?'
         print(f'twinlane: writer count unknown: {e}', file=sys.stderr)
-    cap = capacity.line(writers, (common.load_policy().get('wip') or {}).get('max_writers', 5),
+    cap = capacity.line(writers, (policy.get('wip') or {}).get('max_writers', 5),
                         len(wip.queue()), m, common.now())
     if as_json:
         common.emit({'meter': m, 'running_jobs': js, 'batons': bs, 'capacity': cap}, True)
@@ -147,18 +153,28 @@ def main(argv=None):
     if argv and argv[0] == 'patrol':
         from twinlane import patrol
         return patrol.cli(argv[1:])
+    if argv and argv[0] == 'completions':  # read-only, even with an absent home
+        from twinlane import completions
+        return completions.cli(argv[1:])
     if argv and argv[0] == 'board':  # read-only: dispatched before ensure_dirs, so it creates no directory
         from twinlane import board
         return board.cli(argv[1:])
     if argv and argv[0] == 'explain-writer-admission':  # read-only too: no lock, no write, no directory
         from twinlane import writer_admission
         return writer_admission.cli(argv[1:])
+    if argv and argv[0] == 'seats':  # status and bench --dry-run must not create a home
+        from twinlane import seats
+        return seats.cli(argv[1:])
     common.ensure_dirs()
     if not argv or argv[0] in ('-h', '--help', 'help'):
         print(__doc__.strip())
+        from twinlane import seats
+        if seats.enabled():
+            print('\n  twinlane seats status|start N|stop|bench --n K --dry-run '
+                  '(experimental custody scaffolding; execution held)')
         return 0
     cmd, rest = argv[0], argv[1:]
-    if cmd in ('wip', 'inbox'):
+    if cmd in ('wip', 'inbox', 'ack', 'trust'):
         from importlib import import_module
         return import_module('twinlane.' + cmd).cli(rest)
     if cmd == 'meter':

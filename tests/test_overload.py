@@ -595,11 +595,11 @@ class StallFlow(tj.JobsBase):
         real = jobs.acquire_slot
         calls = []
 
-        def second_fails(job_id, engine, attempt, policy):
+        def second_fails(job_id, engine, attempt, policy, record=None, deadline=None):
             calls.append(attempt)
             if attempt == 2:
                 raise OSError('state disk went away')
-            return real(job_id, engine, attempt, policy)
+            return real(job_id, engine, attempt, policy, record=record, deadline=deadline)
 
         with mock.patch.object(jobs, 'acquire_slot', second_fails):
             rc, out, _ = self.cli('run', '--brief', self.brief, '--cd', self.work, '--kind', 'review')

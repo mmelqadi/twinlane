@@ -275,7 +275,7 @@ def check(cwd, kind, ident, policy=None, argv=None, preserve=False, slots=1, new
         mine = os.environ.get(CLAIM_ENV)
         for x in held:
             if mine and x.get('claim') == mine and x.pop('pumping_at', None) is not None:
-                x.pop('claim', None)
+                _drop_claim(x)
                 save_queue(pending)
     if not preserve and not held:
         pending.append({'id': request_id, 'kind': kind, 'name': ident, 'worktree': key, 'cwd': os.getcwd(),
@@ -309,6 +309,7 @@ def acknowledge(request_id, claim):
 CLAIM_ENV = 'TWINLANE_WIP_CLAIM'  # the token of the pump claim a replayed run carries
 PUMP_MAX_AGE_S = 86400  # a request older than this was probably forgotten: never launched unseen
 PUMP_CLAIM_S = 300      # a pump's claim on a request; an older one is a pump that died, and needs a human
+PUMP_MAX_TRIES = 5      # starts a request gets from the pump before it is left for a person (counted at claim)
 
 
 def _brief_path(row):
@@ -345,6 +346,10 @@ def launchable(row, now=None):
     if not os.path.isfile(brief if os.path.isabs(brief) else os.path.join(base, brief)):
         return 'brief file is gone'
     claimed = common.parse_time(row.get('pumping_at'))
+    tries = row.get('pump_tries', 0)  # only an absent count defaults: a falsey non-int is unknown
+    if row.get('pumping_at') is None and (type(tries) is not int or tries >= PUMP_MAX_TRIES):
+        return (f'the pump started it {tries} times and it was never admitted: check `twinlane jobs`, '
+                'then `twinlane wip next`')
     if row.get('pumping_at') is not None:
         if claimed is not None and (now or common.now()).timestamp() - claimed.timestamp() <= PUMP_CLAIM_S:
             return 'a pump is starting it'
@@ -353,6 +358,87 @@ def launchable(row, now=None):
     if queued is None or (now or common.now()).timestamp() - queued.timestamp() > PUMP_MAX_AGE_S:
         return 'request is too old to run unseen'
     return None
+
+
+def _claimed_job_exists(row):
+    """True when some job carries this row's pump claim (its run was admitted), or when that cannot be ruled out.
+
+    Only job folders named from a day before the claim are read: a job id starts with its UTC creation stamp."""
+    import datetime
+    claim, at = row.get('claim'), common.parse_time(row.get('pumping_at'))
+    if not isinstance(claim, str) or at is None:
+        return True
+    floor = (at - datetime.timedelta(days=1)).strftime('%Y%m%d-%H%M%S')
+    try:
+        names = [n for n in os.listdir(common.JOBS) if observations.JOB_DIRECTORY_RE.fullmatch(n) and n >= floor]
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    for name in names:
+        spec = common.read_json(os.path.join(common.JOBS, name, 'job.json'))
+        if not isinstance(spec, dict):
+            return True  # missing, unreadable or not an object: it may be the admitted run, so nothing is proven
+        if spec.get('wip_claim') == claim:
+            return True
+    return False
+
+
+CLAIM_FIELDS = ('pumping_at', 'claim', 'pump_pid', 'pump_created', 'pump_claim')
+
+
+def _drop_claim(row):
+    """Remove a claim together with the child identity recorded for it; the retry count (pump_tries) stays."""
+    for k in CLAIM_FIELDS:
+        row.pop(k, None)
+
+
+def release_dead_claims(rows, now=None):
+    """Give back the claim of a pumped request whose run provably never got admitted, so the next pump retries it.
+
+    Releases only when all hold: the claim is older than PUMP_CLAIM_S, the pump recorded the child's identity,
+    that exact process is DEAD (not merely unreadable), and no job folder carries the claim. Otherwise the claim
+    stays for a person, as before. After PUMP_MAX_TRIES starts the request stays claimed. Caller holds lock().
+    Returns the ids released."""
+    released = []
+    now = now or common.now()
+    for r in rows:
+        at = common.parse_time(r.get('pumping_at'))
+        if at is None or now.timestamp() - at.timestamp() <= PUMP_CLAIM_S:
+            continue
+        pid, created = r.get('pump_pid'), r.get('pump_created')
+        tries = r.get('pump_tries', 0)
+        if type(pid) is not int or type(created) is not int or type(tries) is not int or tries >= PUMP_MAX_TRIES:
+            continue  # the last allowed start stays claimed for a person
+        if not isinstance(r.get('claim'), str) or r.get('pump_claim') != r.get('claim'):
+            continue  # the recorded child belongs to another claim: it proves nothing about this one
+        if common.pid_state(pid, created) != common.DEAD or _claimed_job_exists(r):
+            continue
+        _drop_claim(r)
+        released.append(r.get('id'))
+    return released
+
+
+def outstanding_claim(claim) -> bool:
+    """True while a queued request still carries this pump claim, or when the queue cannot be read. A job carrying
+    such a claim is the only durable proof its request was admitted, so archive keeps it in place until the request is
+    acknowledged. A claim token is never reused, so once no row carries it, none ever will again."""
+    try:
+        return any(r.get('claim') == claim for r in queue())
+    except WipError:
+        return True
+
+
+def stuck_summary(rows, now=None):
+    """{reason: count} for queued requests the pump cannot start by itself (the board shows them apart)."""
+    out = {}
+    for r in rows:
+        why = launchable(r, now)
+        if why and why != 'a pump is starting it':
+            key = 'claimed by a pump that did not finish' if why.startswith('an earlier pump') else \
+                'pump start limit reached' if why.startswith('the pump started it') else why
+            out[key] = out.get(key, 0) + 1
+    return out
 
 
 def _priority(row):
@@ -395,6 +481,11 @@ def pump(policy=None, dry_run=False, busy=None, spawn=None, reading=None, deadli
         if not pending:
             out['note'] = 'queue empty'
             return out
+        if not dry_run:
+            freed = release_dead_claims(pending)
+            if freed:
+                save_queue(pending)
+                out['released'] = freed
         lanes = len(collect(policy)) if busy is None else busy
         if lanes >= usable:
             out['note'] = host_why or f'{lanes}/{maximum} writer lanes busy'
@@ -417,8 +508,12 @@ def pump(policy=None, dry_run=False, busy=None, spawn=None, reading=None, deadli
             return out
         stamp = common.iso(now)
         for i in chosen:  # claimed, not removed: a pump that dies from here on leaves the request in the queue
+            _drop_claim(pending[i])  # no identity of an earlier child may describe this new claim
             pending[i]['pumping_at'] = stamp
             pending[i]['claim'] = secrets.token_hex(8)
+            # Counted here, under the lock that publishes the claim: a child that re-arms its request before
+            # _settle runs has still used one start.
+            pending[i]['pump_tries'] = pending[i].get('pump_tries', 0) + 1  # launchable() proved it an int
         if deadline is not None and time.monotonic() >= deadline:
             raise TimeoutError('pump budget exhausted')
         if chosen:
@@ -428,9 +523,9 @@ def pump(policy=None, dry_run=False, busy=None, spawn=None, reading=None, deadli
         if deadline is not None and time.monotonic() >= deadline:
             raise TimeoutError('pump budget exhausted; claimed requests need inspection')
         try:
-            (spawn or _spawn)(row)
+            child = (spawn or _spawn)(row)
             out['launched'].append({'id': row.get('id'), 'argv': row['argv'], 'launched': True})
-            _settle(row, stamp, started=True)
+            _settle(row, stamp, started=True, child=child, **({'deadline': deadline} if deadline is not None else {}))
         except Exception as e:  # noqa: BLE001 - a request that failed to start stays queued, never lost
             if deadline is None:
                 _settle(row, stamp, started=False)
@@ -440,11 +535,26 @@ def pump(policy=None, dry_run=False, busy=None, spawn=None, reading=None, deadli
     return out
 
 
-def _settle(row, stamp, started, deadline=None):
+def _settle(row, stamp, started, child=None, deadline=None):
     """After the spawn. A started run keeps its claim: the request leaves the queue only when that run is admitted
     (`check` removes it), so a child that dies at once, or is ended with a job object it was born into, leaves a
-    claimed request for a person instead of nothing. A run that did not start gives the claim back."""
+    claimed request instead of nothing. The child's identity is recorded with the claim so a later pump can prove it
+    died unadmitted (`release_dead_claims`); without one the claim waits for a person. A run that did not start
+    gives the claim back."""
     if started:
+        if isinstance(child, dict) and type(child.get('pid')) is int and type(child.get('created')) is int:
+            try:
+                if deadline is not None and time.monotonic() >= deadline:
+                    return  # no identity recorded: the claim stays for a person, as before
+                with lock(30 if deadline is None else max(0, deadline - time.monotonic())):
+                    rows = queue()
+                    for r in rows:
+                        if r.get('id') == row.get('id') and r.get('pumping_at') == stamp \
+                                and r.get('claim') == row.get('claim'):
+                            r.update(pump_pid=child['pid'], pump_created=child['created'], pump_claim=row.get('claim'))
+                    save_queue(rows, deadline=deadline)
+            except (OSError, TimeoutError, WipError):
+                pass  # no identity recorded: the claim stays for a person, as before
         return
     if deadline is not None and time.monotonic() >= deadline:
         return

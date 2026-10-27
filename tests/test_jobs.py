@@ -138,6 +138,8 @@ class JobsBase(unittest.TestCase):
         os.makedirs(self.work)
         with open(os.path.join(self.work, 'seed.txt'), 'w', encoding='utf-8') as h:
             h.write('a plain, non-repo working folder; an empty one is refused as a leftover\n')
+        # Successful Codex runs now require a scratch Git repository.
+        git(self.work, 'init', '-q')
         self.brief = os.path.join(self.tmp, 'task-brief.md')
         with open(self.brief, 'w', encoding='utf-8') as h:
             h.write(f'Investigate the thing.\nECHO: {ARABIC}\n')
@@ -642,7 +644,8 @@ class RunnerFinalization(JobsBase):
     def run_fixture(self, engine, outcome='done', kill_result=True, survivor=False, stop_requested=None):
         jid = '20261017-000001-' + engine + '-fixture'
         os.makedirs(jobs.job_dir(jid))
-        params = {'engine': engine, 'profile': 'intel', 'timeout_s': 2,
+        # The fake engine never sleeps; the budget only has to outlast the runner's own git bookkeeping, which one job deadline now charges to it.
+        params = {'engine': engine, 'profile': 'intel', 'timeout_s': 30,
                   'max_turns': 2, 'model': 'fixture-model', 'effort': 'low', 'tier': 'luna'}
         spec = {'id': jid, 'engine': engine, 'primary': params, 'profile': 'intel',
                 'kind': 'intel', 'cwd': self.work, 'failover': False}
@@ -1310,7 +1313,8 @@ class InlineRuns(JobsBase):
 
         # Test lifecycle behavior with an inert engine, independently of lead-only dispatch.
         jid = '20261025-000001-' + engine + '-fixture'
-        params = {'engine': engine, 'profile': 'intel', 'timeout_s': 2, 'max_turns': 2,
+        # The fake engine never sleeps; the budget only has to outlast the runner's own git bookkeeping, which one job deadline now charges to it.
+        params = {'engine': engine, 'profile': 'intel', 'timeout_s': 30, 'max_turns': 2,
                   'model': 'fixture-model', 'effort': 'low', 'tier': 'luna'}
         spec = {'id': jid, 'engine': engine, 'primary': params, 'profile': 'intel',
                 'kind': 'intel', 'cwd': self.work, 'failover': False}

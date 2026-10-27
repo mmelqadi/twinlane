@@ -89,6 +89,18 @@ class ArchiveRaceTests(unittest.TestCase):
                     p.unlink()
                 live.rmdir()
 
+    def test_a_stale_running_status_beside_a_terminal_receipt_is_quiescent_only_when_dead(self):
+        good, folder = self.job()
+        jid, live = self.job(state={'status': 'running', 'pid': 1234, 'pid_created': 1})
+        with mock.patch.object(common, 'pid_state', return_value=common.DEAD):
+            self.assertEqual(archive.quiescence(), [])
+        for state in (common.ALIVE, common.UNKNOWN):
+            with self.subTest(state=state), mock.patch.object(common, 'pid_state', return_value=state):
+                self.assertEqual([r['id'] for r in archive.quiescence()], [jid])
+        common.write_json(str(live / 'status.json'), {'status': 'starting'})
+        with mock.patch.object(common, 'pid_state', return_value=common.DEAD):
+            self.assertEqual([r['reason'] for r in archive.quiescence()], ['job status starting'])
+
     def test_old_inner_holder_prevents_move(self):
         jid, folder = self.job()
         for name in ('runner.claim', 'status.lock'):

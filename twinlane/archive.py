@@ -150,8 +150,11 @@ def quiescence():
             st = _json(os.path.join(live, 'status.json'), optional=True)
             if receipt.get('status') not in jobs.TERMINAL:
                 raise ValueError('job is not terminal')
-            if st.get('status') in ('queued', 'running', 'orphaned', 'unknown', 'starting'):
+            if st.get('status') in ('orphaned', 'unknown', 'starting'):
                 raise ValueError('job status ' + st['status'])
+            # A terminal receipt next to a status.json still reading queued/running is the normal leftover of
+            # older runners (they never rewrote status.json after the receipt). It is quiescent only on the
+            # same proof as any other job: runner, runner.pid, launch marker, survivor and engine all DEAD.
             _dead_evidence(jid, st)
         except (OSError, ValueError, TypeError, OverflowError, RecursionError) as error:
             blocked.append({'id': jid, 'reason': str(error) if isinstance(error, ValueError)
@@ -194,6 +197,10 @@ def eligibility(jid, days, include_unread):
             if collected is None or collected < when:
                 raise ValueError('invalid or stale read marker')
         _dead_evidence(jid, st)
+        if isinstance(spec.get('wip_claim'), str):
+            from . import wip
+            if wip.outstanding_claim(spec['wip_claim']):
+                raise ValueError('writer-queue request not yet acknowledged')  # the pump's only admission proof
         why = _baton_check(jid, spec)
         if why:
             raise ValueError(why)

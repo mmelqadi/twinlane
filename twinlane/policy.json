@@ -1,6 +1,10 @@
 {
+  "seats": {"enabled": false},
   "policy_version": 1,
+  "retry": {"max": 2, "backoff_s": [30, 90]},
   "jobs": {"archive_after_days": 14},
+  "jobs_index": {"enabled": false},
+  "notify": {"completions_log": false, "toast": false},
   "wip": {"max_writers": 5, "session_active_s": 1800, "count_main_checkout": true, "claims_command": null, "claims_timeout_s": 10},
   "lanes": {"stale_after_s": 86400, "claude_agents": true, "claude_agents_timeout_s": 8, "state_file_ttl_s": 86400, "park_timeout_s": 259200},
   "inbox": {"show": 5},
@@ -8,7 +12,8 @@
   "sessions": {"lead_session_id": null, "lead_family": []},
   "thresholds": {"caution_pct": 75, "handoff_pct": 80, "stop_pct": 85, "hard_pct": 100},
   "meter": {"cache_ttl_s": 120, "hook_cache_max_age_s": 300, "auto_refresh_claude": false,
-    "codex_rollout_fallback": true, "after_read_timeout_s": 10, "overlap_scan_timeout_s": 5},
+    "codex_rollout_fallback": true, "codex_last_good_max_age_s": 0,
+    "after_read_timeout_s": 10, "overlap_scan_timeout_s": 5},
   "claude": {
     "models": {"default": "claude-opus-5-5", "fast": "claude-sonnet-5-5", "cheap": "claude-haiku-4-5"},
     "fast_kinds": [],

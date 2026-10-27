@@ -17,12 +17,13 @@ import random
 import re
 import secrets
 import shutil
+import stat
 import subprocess
 import sys
 import threading
 import time
 
-from . import common, envhandoff, guard, hostload, observations, watchdog
+from . import common, envhandoff, failclass, guard, hostload, observations, retry, watchdog
 
 # Test hooks: meter.py / route.py / baton.py are imported lazily, and tests replace these.
 _read_meter = None      # callable(policy) -> meter dict
@@ -32,6 +33,7 @@ _PRESERVING_METADATA = ContextVar('twinlane_preserving_metadata', default=False)
 _CURRENT_JOB = ContextVar('twinlane_current_metadata_job', default=None)
 _REAPED_CHILDREN = ContextVar('twinlane_reaped_children', default=None)
 _JOB_LOCK_DEADLINE = ContextVar('twinlane_job_lock_deadline', default=None)
+_COMPLETION_POLICY = ContextVar('twinlane_completion_policy', default=None)
 
 
 @contextmanager
@@ -151,6 +153,9 @@ def _write_job_file(job_id, name, write):
 
 def _write_job_json(job_id, name, data):
     _write_job_file(job_id, name, lambda path: common.write_json(path, data, create_parent=False))
+    if common.JOBS_INDEX_ENABLED and name in ('status.json', 'result.json'):
+        from . import jobs_index
+        jobs_index.update(job_id)  # advisory, AFTER the authoritative folder write
 
 
 def _write_job_text(job_id, name, text):
@@ -214,7 +219,10 @@ def _meter(policy: dict, fresh: bool = False, auto_refresh: bool = True, admissi
             stamp = common.parse_time(section.get('reading_at'))
             age = common.age_s(section.get('reading_at'))
             limit = (policy.get(engine) or {}).get('stale_reading_max_age_s', 1800)
-            if type(limit) is not int or limit < 0:
+            if engine == 'codex' and section.get('source') == 'last-good':
+                # Already validated (finite, positive, or 0 = off) by the same reader the meter uses.
+                limit = meter.codex_last_good_max_age(policy)
+            elif type(limit) is not int or limit < 0:
                 raise Refusal(common.EXIT_REFUSED, f'{engine} freshness policy is invalid')
             if stamp is None or age is None or age > limit or (stamp - now).total_seconds() > meter.FUTURE_SKEW_S:
                 section['status'] = 'unknown'
@@ -1039,7 +1047,7 @@ def _clear_child_starting(job_id: str, proc=None, keep: bool = False) -> None:
 
 def running_count(engine: str, exclude: str | None = None) -> int:
     n = 0
-    for jid in _job_ids():
+    for jid in _live_candidates():
         if jid == exclude:
             continue
         # Launch uncertainty survives receipt/status write failures. If even its engine is
@@ -1116,7 +1124,7 @@ def _waiters(engine: str, exclude: str) -> list:
     """Live jobs waiting for a slot of this engine as (priority, waiting_since, id), in service order.
     A waiter whose runner is not provably alive is ignored: it must not hold the line."""
     rows = []
-    for jid in _job_ids():
+    for jid in _live_candidates():
         if jid == exclude or os.path.exists(_p(jid, 'result.json')):
             continue
         st = common.read_json(_p(jid, 'status.json'))
@@ -1136,17 +1144,45 @@ def _own_place(job_id: str) -> tuple:
     return queue_priority(spec.get('kind') if isinstance(spec, dict) else None), common.iso(common.now()), job_id
 
 
-def slot_attempt(job_id: str, engine: str, attempt: int, configured: int, policy: dict) -> tuple:
+class JobDeadline(TimeoutError):
+    """The job's monotonic launch budget expired; never retry lock polling."""
+
+
+MIN_RETRY_LAUNCH_S = 1.0
+
+
+def _check_deadline(deadline):
+    if deadline is not None and time.monotonic() >= deadline:
+        raise JobDeadline('timeout budget exhausted while waiting for a slot')
+
+
+def _launch_budget(params, timeout_s):
+    deadline = params.get('deadline_monotonic')
+    if deadline is None:
+        return timeout_s
+    remaining = deadline - time.monotonic()
+    if remaining <= params.get('launch_min_s', MIN_RETRY_LAUNCH_S):
+        raise JobDeadline('timeout budget exhausted before engine launch')
+    return min(timeout_s, remaining)
+
+
+def slot_attempt(job_id: str, engine: str, attempt: int, configured: int, policy: dict,
+                 deadline=None) -> tuple:
     """(started, why not). The usable slots shrink as the host gets busy (hostload), and waiting jobs are
     served first-in-first-out with reviews first. A job is queued with a reason, never refused."""
     usable, host_why = hostload.effective_parallel(configured, hostload.sample(policy), policy)
+    _check_deadline(deadline)
     # After SLOT_INLOCK_AFTER restarts in a row the snapshot is not frozen: under the lock only the identities that
     # appeared since the outside scan are probed (a few, never the whole store), so that attempt cannot be
     # invalidated and the oldest job always decides.
     snapshot = _slot_snapshot(engine, job_id, freeze=not _SLOT_INLOCK.get())
+    lock_deadline = _SLOT_DEADLINE.get()
+    if deadline is not None:  # the job's own budget also bounds the lock wait
+        lock_deadline = deadline if lock_deadline is None else min(lock_deadline, deadline)
     try:
-        with snapshot, slot_lock(job_id=job_id, policy=policy, deadline=_SLOT_DEADLINE.get()):
+        with snapshot, slot_lock(job_id=job_id, policy=policy, deadline=lock_deadline):
             _SLOT_PROBES.get()['locked'] = True
+            _check_deadline(deadline)
             running = running_count(engine, exclude=job_id)
             if running >= usable:
                 return False, (f'engine slots full: {running}/{configured}' if running >= configured
@@ -1156,6 +1192,7 @@ def slot_attempt(job_id: str, engine: str, attempt: int, configured: int, policy
                 return False, f"queued behind {len(ahead)} job{'' if len(ahead) == 1 else 's'}"
             waited = (common.read_json(_p(job_id, 'status.json'), {}) or {}).get('waiting_lock')
             _inlock_budget()
+            _check_deadline(deadline)
             _write_status(job_id, 'running', engine=engine, attempt=attempt)
             return True, 'waited for slot lock' if waited else None
     except _AdmissionChanged:
@@ -1170,22 +1207,39 @@ _SLOT_STUCK = ContextVar('twinlane_slot_stuck', default=None)
 _SLOT_INLOCK = ContextVar('twinlane_slot_inlock', default=False)
 
 
-def acquire_slot(job_id: str, engine: str, attempt: int, policy: dict) -> bool:
-    """Blocks until a slot is free. Returns True when it had to wait. The reason it waits is in status.json."""
+SLOT_WAIT_REASONS_MAX = 5  # distinct queue reasons kept per attempt in the receipt
+
+
+def acquire_slot(job_id: str, engine: str, attempt: int, policy: dict, record: dict | None = None,
+                 deadline=None) -> bool:
+    """Blocks until a slot is free. Returns True when it had to wait. The reason it waits is in status.json.
+
+    Transient contention on slots.lock is a wait, not a failure: a busy host must not turn queued work into failed
+    work. Sustained contention past the lock-wait bound raises LockWaitTimeout, and the job's own deadline raises
+    JobDeadline (it wins when both have elapsed).
+    When `record` is a dict and the job waited, it receives `slot_wait_s` and the distinct `slot_wait_reasons`
+    (first SLOT_WAIT_REASONS_MAX), so the receipt shows what held a job back instead of only that it started late."""
     configured = int(policy.get(engine, {}).get('max_parallel') or 4)
     waiting, last, since = False, None, None
     stuck = [None]  # monotonic start of the current streak of lock waits / restarted scans; ONE bound covers it
     changed = 0     # consecutive restarted scans
     bound = _lock_wait_seconds(policy)
+    t0, reasons = time.monotonic(), []
     while True:
+        _check_deadline(deadline)
         attempt_started = time.monotonic()
         tokens = (_SLOT_DEADLINE.set(None if stuck[0] is None else stuck[0] + bound), _SLOT_STUCK.set(stuck),
                   _SLOT_INLOCK.set(changed >= SLOT_INLOCK_AFTER))
         try:
-            started, why = slot_attempt(job_id, engine, attempt, configured, policy)
+            started, why = slot_attempt(job_id, engine, attempt, configured, policy,
+                                       **({'deadline': deadline} if deadline is not None else {}))
+        except JobDeadline:
+            raise
         except common.LockWaitTimeout:
+            _check_deadline(deadline)  # a lock wait cut short by the job's own budget is the job's timeout
             raise
         except TimeoutError as error:
+            _check_deadline(deadline)
             if 'lock busy:' not in str(error):
                 raise
             stuck[0] = attempt_started if stuck[0] is None else stuck[0]
@@ -1197,7 +1251,14 @@ def acquire_slot(job_id: str, engine: str, attempt: int, policy: dict) -> bool:
             for var, token in zip((_SLOT_DEADLINE, _SLOT_STUCK, _SLOT_INLOCK), tokens):
                 var.reset(token)
         if started:
-            return waiting or why == 'waited for slot lock'
+            waited = waiting or why == 'waited for slot lock'
+            if waited and isinstance(record, dict):
+                record['slot_wait_s'] = round(time.monotonic() - t0, 1)
+                record['slot_wait_reasons'] = reasons or ['waiting for slot lock']
+            return waited
+        _check_deadline(deadline)
+        if why and why not in reasons and len(reasons) < SLOT_WAIT_REASONS_MAX:
+            reasons.append(why)
         if why == ADMISSION_CHANGED:
             changed += 1
             stuck[0] = attempt_started if stuck[0] is None else stuck[0]
@@ -1213,8 +1274,9 @@ def acquire_slot(job_id: str, engine: str, attempt: int, policy: dict) -> bool:
             _write_status(job_id, 'queued', engine=engine, attempt=attempt, waiting_slot=True, queue_reason=why,
                           waiting_since=since, queue_priority=_own_place(job_id)[0])
             waiting, last = True, why
-        time.sleep(SLOT_POLL_S * random.uniform(0.75, 1.25)
-                   * (2.5 if (why or '').startswith('host busy') else 1))
+        pause = SLOT_POLL_S * random.uniform(0.75, 1.25) * (2.5 if (why or '').startswith('host busy') else 1)
+        _check_deadline(deadline)
+        time.sleep(min(pause, max(0, deadline - time.monotonic())) if deadline is not None else pause)
 
 
 def _write_status(job_id: str, status: str, **extra) -> None:
@@ -1222,6 +1284,7 @@ def _write_status(job_id: str, status: str, **extra) -> None:
         st = {'status': status, 'pid': os.getpid(), 'pid_created': _self_created(),
               'updated_at': common.iso(common.now())}
         old = common.read_json(_p(job_id, 'status.json'), {}) or {}
+        st['phase'] = 'starting' if status == 'running' else old.get('phase', 'starting')
         st['started_at'] = old.get('started_at') or (st['updated_at'] if status == 'running' else None)
         st.update(extra)
         _write_job_json(job_id, 'status.json', st)
@@ -1286,6 +1349,50 @@ def _preserving_engine_refusal(spec: dict, engine: str) -> str | None:
     return f'preserving Codex start refused at preflight: {problem}' if problem else None
 
 
+def git_cwd_preflight(engine, cwd):
+    """Only a definite non-repository blocks Codex; anything unreadable stays Unknown.
+    A filesystem walk for `.git`, never a git process: planning starts no child (and no console host)."""
+    if engine != 'codex':
+        return None
+
+    def kind(path):
+        # os.path.isdir/isfile answer False on ANY stat error; only a definite absence may count as absent.
+        try:
+            mode = os.stat(path).st_mode
+        except (FileNotFoundError, NotADirectoryError):
+            return None
+        return 'dir' if stat.S_ISDIR(mode) else 'file' if stat.S_ISREG(mode) else 'other'
+
+    try:
+        here = os.path.abspath(cwd)
+        if kind(here) != 'dir':
+            return f'git-cwd preflight unknown for --cd {cwd}; not a readable directory'
+        while True:
+            marker = os.path.join(here, '.git')
+            found = kind(marker)
+            if found == 'dir':
+                return None
+            if found == 'other':  # a FIFO or device: never opened (a FIFO without a writer blocks the read)
+                return f'git-cwd preflight unknown for --cd {cwd}; {marker} is not a regular file'
+            if found == 'file':
+                with open(marker, encoding='utf-8', errors='replace') as handle:
+                    line = handle.readline().strip()
+                if line.startswith('gitdir:'):
+                    target = line[len('gitdir:'):].strip()
+                    if kind(target if os.path.isabs(target) else os.path.join(here, target)) == 'dir':
+                        return None
+                return f'git-cwd preflight unknown for --cd {cwd}; {marker} names no readable gitdir'
+            parent = os.path.dirname(here)
+            if parent == here:
+                break
+            here = parent
+    except OSError as error:
+        return f'git-cwd preflight unknown for --cd {cwd}; {type(error).__name__}'
+    raise Refusal(common.EXIT_REFUSED,
+                  f'--cd {cwd} is not a git work tree; codex refuses it. '
+                  'Use a worktree, or `git init` a scratch folder', {'failure_class': 'preflight'})
+
+
 def preflight(spec: dict, params: dict, policy: dict, fresh: bool,
               seen: dict | None = None) -> tuple[str | None, str | None]:
     """Re-check the meter right before an attempt starts: a queued job may have waited while the
@@ -1300,6 +1407,13 @@ def preflight(spec: dict, params: dict, policy: dict, fresh: bool,
         why = _preserving_engine_refusal(spec, engine)
         if why:
             return why, None
+    # After the engine/binary refusals, which must decide before this touches the --cd tree.
+    try:
+        note = git_cwd_preflight(engine, spec['cwd']) if spec.get('cwd') else None
+    except Refusal as error:
+        return str(error), None
+    if note and note not in spec.setdefault('notes', []):
+        spec['notes'].append(note)
     try:
         meter = _meter(policy, fresh=fresh, auto_refresh=engine != 'codex')
         if seen is not None and 'meter' not in seen:
@@ -1364,7 +1478,7 @@ def run_attempt(job_id: str, n: int, params: dict, brief_path: str, spec: dict, 
     a = {'n': n, 'engine': params['engine'], 'model': params.get('model'), 'effort': params.get('effort'),
          'tier': params.get('tier'), 'profile': params['profile'], 'max_turns': params.get('max_turns'),
          'timeout_s': params['timeout_s'], 'resume': resume, 'brief_path': brief_path,
-         'started_at': common.iso(started)}
+         'started_at': common.iso(started), 'ready': False, 'engine_started': False}
     settings = guard_settings(job_dir(job_id), intel_settings_deny(params, policy, spec['cwd'])) \
         if params['engine'] == 'claude' else None
     argv = build_argv(params, policy, brief_path, spec['cwd'], files['codex_out'], resume, settings)
@@ -1384,13 +1498,16 @@ def run_attempt(job_id: str, n: int, params: dict, brief_path: str, spec: dict, 
     if text:
         _write_job_text(job_id, os.path.basename(files['final']), text)
         a['final_path'] = files['final']
+    a['failure_class'] = failclass.classify(a)
     return a
 
 
-def _pump(proc, fev, stream: ClaudeStream, errors: list) -> None:
+def _pump(proc, fev, stream: ClaudeStream, errors: list, capture=None) -> None:
     """Copy claude's stdout to events.jsonl and the parser. Whatever fails, it keeps reading, so the
     child can never block on a full pipe and sit idle until the timeout."""
     sink = fev
+    if capture is not None:
+        capture['started'] = True
     try:
         for raw in iter(proc.stdout.readline, b''):
             if sink is not None:
@@ -1401,6 +1518,9 @@ def _pump(proc, fev, stream: ClaudeStream, errors: list) -> None:
                     errors.append(f'events.jsonl write failed, still draining: {e}')
                     sink = None
             stream.feed(raw.decode('utf-8', errors='replace'))
+        if capture is not None:
+            capture['drained'] = True
+            capture['clean'] = sink is not None and not errors
     except (OSError, ValueError) as e:
         errors.append(f'stdout read stopped: {e}')
 
@@ -1482,17 +1602,73 @@ SURVIVED_INTERRUPT_KILL = ('engine process (pid {pid}) survived its kill after t
                            '(kill {kill})')
 
 
+class EngineReady:
+    """Incremental event reader called by the existing watchdog polling loop."""
+
+    def __init__(self, job_id, engine, paths, proc, created):
+        self.job_id, self.engine, self.paths = job_id, engine, paths
+        self.proc, self.created, self.ready = proc, created, False
+        self.offsets = {}
+
+    def _is_ready(self, event):
+        kind = event.get('type')
+        if self.engine == 'codex':
+            return kind in ('thread.started', 'turn.started') or (
+                kind in ('item.started', 'item.updated', 'item.completed')
+                and isinstance(event.get('item'), dict)
+                and event['item'].get('type') == 'agent_message')
+        if self.engine == 'claude':
+            return (kind == 'system' and event.get('subtype') == 'init') or kind == 'assistant'
+        return False
+
+    def __call__(self):
+        if self.ready:
+            return
+        for path in self.paths:
+            event = None
+            try:
+                with open(path, 'rb') as stream:
+                    stream.seek(self.offsets.get(path, 0))
+                    while True:
+                        raw = stream.readline()
+                        if not raw or not raw.endswith(b'\n'):
+                            break  # partial events are checked again next poll
+                        self.offsets[path] = stream.tell()
+                        try:
+                            candidate = json.loads(raw)
+                        except (ValueError, UnicodeError):
+                            continue
+                        if isinstance(candidate, dict) and self._is_ready(candidate):
+                            event = candidate
+                            break
+            except OSError:
+                continue
+            if event is not None:
+                self.ready = True
+                evidence = {'at': common.iso(common.now()), 'engine': self.engine,
+                            'pid': self.proc.pid, 'pid_created': self.created, 'evidence': event['type']}
+                # Keep the first evidence for the job, even after a retry/failover.
+                # Bookkeeping failures propagate; they are not mistaken for an absent event.
+                if not os.path.exists(_p(self.job_id, 'engine-ready.json')):
+                    _write_job_json(self.job_id, 'engine-ready.json', evidence)
+                _merge_status(self.job_id, phase='working')
+                return
+
+
 def _run_claude(job_id, argv, spec, params, brief_path, files, policy) -> dict:
     stream, errors, stripped = ClaudeStream(), [], []
+    capture = {'started': False, 'drained': False, 'clean': False}
+    capture_complete = False
     timed_out = False
     cwd, timeout_s = spec['cwd'], params['timeout_s']
     env = claude_env(job_id, params['profile'], cwd, stripped, common.extra_secret_patterns(policy))
-    proc = None
+    proc, ready = None, None
     stall = watchdog.make([files['events'], files['stderr']], policy)
     unresolved = False
     try:
         _write_job_json(job_id, CHILD_STARTING, {'engine': 'claude'})
         with open(brief_path, 'rb') as fin, open(files['stderr'], 'wb') as ferr, open(files['events'], 'wb') as fev:
+            timeout_s = _launch_budget(params, timeout_s)
             proc = subprocess.Popen(argv, cwd=cwd, env=env, stdin=fin,
                                     stdout=subprocess.PIPE, stderr=ferr,
                                     creationflags=NO_WINDOW | (common.CREATE_SUSPENDED if common.IS_WIN else 0),
@@ -1505,12 +1681,13 @@ def _run_claude(job_id, argv, spec, params, brief_path, files, policy) -> dict:
                 _write_job_json(job_id, CHILD_STARTING,
                                   {'engine': 'claude', 'pid': proc.pid, 'created': child_created})
                 _merge_status(job_id, child_pid=proc.pid if child_created else None, child_created=child_created)
-                reader = threading.Thread(target=_pump, args=(proc, fev, stream, errors), daemon=True)
+                ready = EngineReady(job_id, 'claude', [files['events']], proc, child_created)
+                reader = threading.Thread(target=_pump, args=(proc, fev, stream, errors, capture), daemon=True)
                 reader.start()
                 try:
                     rc = watchdog.wait(proc, timeout_s, stall, watchdog.settings(policy)['poll_s'],
-                                       child_created=child_created,
-                                       kill=_watchdog_kill())
+                                       child_created=child_created, kill=_watchdog_kill(), progress=ready,
+                                       deadline=params.get('deadline_monotonic'))
                     unresolved = not _note_unresolved_tree(job_id, 'claude', stall)
                     if rc is None:  # only a stall kill returns None: the tree outlived it
                         raise subprocess.TimeoutExpired(argv, KILL_GRACE_S)
@@ -1526,6 +1703,9 @@ def _run_claude(job_id, argv, spec, params, brief_path, files, policy) -> dict:
                         _note_survivor(job_id, 'claude', proc, child_created, SURVIVED_TIMEOUT_KILL.format(
                             pid=proc.pid, kill='reported success' if killed else 'failed'))
                 reader.join(timeout=15)
+                capture_complete = (not reader.is_alive() and capture['started'] and capture['drained']
+                                    and capture['clean'] and not timed_out and rc is not None)
+                ready()
             except BaseException:
                 # An interrupt during the grace wait after a stall kill skips the note above: make it here, before
                 # the launch marker is cleared, or surviving children lose their custody protection.
@@ -1534,7 +1714,11 @@ def _run_claude(job_id, argv, spec, params, brief_path, files, policy) -> dict:
                                        'engine survived its kill after a post-start failure')
                 raise
     except OSError as e:
-        return {'status': 'failed', 'exit_code': common.EXIT_MISSING, 'error': f'claude launch or bookkeeping failed: {e}'}
+        return {'status': 'timeout' if isinstance(e, JobDeadline) else 'failed',
+                'exit_code': common.EXIT_MISSING, 'error': f'claude launch or bookkeeping failed: {e}',
+                'ready': bool(ready and ready.ready), 'engine_started': proc is not None, 'events_path': files['events'],
+                'event_capture_started': capture['started'], 'event_capture_complete': False,
+                'event_capture_error': 'launch, bookkeeping or capture failed; clean EOF not proven'}
     finally:
         # the stream reader has consumed the result, but a descendant may outlive the root
         unresolved, interrupt = _close_attempt_job(job_id, 'claude', proc, unresolved)
@@ -1560,6 +1744,11 @@ def _run_claude(job_id, argv, spec, params, brief_path, files, policy) -> dict:
     out['status'] = _claude_status(s, rc, timed_out)
     if out['status'] == 'failed' and s['has_result'] and not s['is_error'] and s['subtype'] == 'success' and rc != 0:
         out['error'] = f'claude reported success but exited rc {rc}'
+    out.update(ready=bool(ready and ready.ready), engine_started=proc is not None)
+    out.update(event_capture_started=capture['started'],
+               event_capture_complete=capture_complete and not errors and not s['parse_errors'])
+    if not out['event_capture_complete']:
+        out['event_capture_error'] = 'event reader did not finish with a clean, fully captured EOF'
     return _mark_stalled(out, stall)
 
 
@@ -1723,13 +1912,17 @@ def _run_codex(job_id, argv, cwd, timeout_s, files, params, policy=None, qualifi
         env.pop(common.CODEX_BIN_QUALIFIED, None)  # a stray hand-off never constrains an ordinary start
     env['TWINLANE_CODEX_BIN'] = binary
     child_alive = False
-    proc = None
+    proc, ready = None, None
     stall = watchdog.make([files['codex_log']] + ([os.path.join(files['codex_out'], 'events.jsonl')]
                                                    if files.get('codex_out') else []), policy)
     unresolved = False
     try:
         _write_job_json(job_id, CHILD_STARTING, {'engine': 'codex'})
         with open(files['codex_log'], 'wb') as log:
+            timeout_s = _launch_budget(params, timeout_s)
+            if params.get('deadline_monotonic') is not None:
+                argv = list(argv)
+                argv[argv.index('--timeout') + 1] = str(min(params['timeout_s'], timeout_s))
             proc = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=log,
                                     stderr=subprocess.STDOUT,
                                     creationflags=NO_WINDOW | (common.CREATE_SUSPENDED if common.IS_WIN else 0),
@@ -1742,10 +1935,12 @@ def _run_codex(job_id, argv, cwd, timeout_s, files, params, policy=None, qualifi
                 _write_job_json(job_id, CHILD_STARTING,
                                   {'engine': 'codex', 'pid': proc.pid, 'created': child_created})
                 _merge_status(job_id, child_pid=proc.pid if child_created else None, child_created=child_created)
+                ready = EngineReady(job_id, 'codex', [os.path.join(files['codex_out'], 'events.jsonl'),
+                                                       files['codex_log']], proc, child_created)
                 try:
                     rc = watchdog.wait(proc, timeout_s, stall, watchdog.settings(policy)['poll_s'],
-                                       child_created=child_created,
-                                       kill=_watchdog_kill())
+                                       child_created=child_created, kill=_watchdog_kill(), progress=ready,
+                                       deadline=params.get('deadline_monotonic'))
                     unresolved = not _note_unresolved_tree(job_id, 'codex', stall)
                     if rc is None:  # only a stall kill returns None: the tree outlived it
                         raise subprocess.TimeoutExpired(argv, KILL_GRACE_S)
@@ -1765,9 +1960,16 @@ def _run_codex(job_id, argv, cwd, timeout_s, files, params, policy=None, qualifi
                 child_alive = _cleanup_started_child(job_id, 'codex', proc, child_created,
                                                     'engine survived its kill after a post-start failure')
                 raise
+        if ready:
+            ready()
         c = parse_codex_out(files['codex_out'])  # consume the result before closing the attempt job
     except OSError as e:
-        return {'status': 'failed', 'exit_code': common.EXIT_MISSING, 'error': f'codex launch or bookkeeping failed: {e}'}
+        return {'status': 'timeout' if isinstance(e, JobDeadline) else 'failed',
+                'exit_code': common.EXIT_MISSING, 'error': f'codex launch or bookkeeping failed: {e}',
+                'ready': bool(ready and ready.ready), 'engine_started': proc is not None,
+                'events_path': os.path.join(files['codex_out'], 'events.jsonl') if files.get('codex_out') else None,
+                'event_capture_started': False, 'event_capture_complete': False,
+                'event_capture_error': 'launch, bookkeeping or adapter capture failed'}
     finally:
         unresolved, interrupt = _close_attempt_job(job_id, 'codex', proc, unresolved)
         _clear_child_starting(job_id, proc, keep=unresolved)
@@ -1816,6 +2018,11 @@ def _run_codex(job_id, argv, cwd, timeout_s, files, params, policy=None, qualifi
         out['error'] = c.get('error_text') or f'codex exited rc {rc} with no error event'
         if out['status'] == 'timeout':
             out['error'] = f'timed out after {timeout_s} s' + (f": {c['error_text']}" if c.get('error_text') else '')
+    out.update(ready=bool(ready and ready.ready), engine_started=proc is not None)
+    # Adapters supply event files but no positive capture/EOF attestation.
+    # A failed adapter and an empty file cannot authorize a second writer.
+    out.update(event_capture_started=False, event_capture_complete=False,
+               event_capture_error='Codex adapter did not attest complete event capture')
     return _mark_stalled(out, stall)
 
 
@@ -2234,12 +2441,19 @@ def run_job(job_id: str, *, preserve_existing_metadata=False) -> dict:
         return {'id': job_id, 'status': 'refused', 'exit_code': common.EXIT_REFUSED,
                 'notes': ['metadata preservation mode missing or malformed; no runner claimed']}
     token = _REAPED_CHILDREN.set({})
+    completion_policy = _COMPLETION_POLICY.set(None)
     try:
         if isinstance(spec, dict) and spec.get('preserve_existing_metadata') is True:
             with preserving_metadata(job_id):
-                return _run_job(job_id)
-        return _run_job(job_id)
+                receipt = _run_job(job_id)
+        else:
+            receipt = _run_job(job_id)
+        # _run_job has released every lifecycle/slot/writer lock and finished all receipt rewrites.
+        if not receipt.get('duplicate_runner'):
+            _completion(job_id, receipt, policy=_COMPLETION_POLICY.get())
+        return receipt
     finally:
+        _COMPLETION_POLICY.reset(completion_policy)
         _REAPED_CHILDREN.reset(token)
 
 
@@ -2308,8 +2522,108 @@ def _run_job(job_id: str) -> dict:
             wip.pump_quietly()
 
 
+def _work_free(spec, attempt):
+    """Read-only attempts may repeat. Writers need a complete tool-free event log."""
+    if not spec.get('write') and spec.get('profile') != 'code':
+        return True
+    def reject(reason):
+        attempt['retry_blocked_reason'] = reason
+        return False
+    if attempt.get('ready') is not False:
+        return reject('engine readiness observed or unknown')
+    if attempt.get('engine_started') is False:
+        return True  # refused by preflight, before any engine launch
+    if attempt.get('engine_started') is not True:
+        return reject('engine launch state unknown')
+    if attempt.get('event_capture_started') is not True or attempt.get('event_capture_complete') is not True \
+            or attempt.get('event_capture_error') or attempt.get('stream_errors'):
+        return reject(attempt.get('event_capture_error') or 'event capture start and clean EOF not proven')
+    if attempt.get('tool_uses') or attempt.get('tools_count'):
+        return reject('attempt reported tool use')
+    def has_call(value):
+        if isinstance(value, list):
+            return any(has_call(x) for x in value)
+        if isinstance(value, dict):
+            kind = str(value.get('type') or '').lower()
+            if kind in ('tool_use', 'function_call', 'custom_tool_call', 'file_change', 'mcp_tool_call', 'apply_patch') or kind.startswith(('exec', 'command_execution')):
+                return True
+            return any(has_call(x) for x in value.values() if isinstance(x, (dict, list)))
+        return False
+    path = attempt.get('events_path')
+    if not path:
+        return reject('event log path missing')
+    safe_events = {'thread.started', 'turn.started', 'turn.completed', 'turn.failed', 'error',
+                   'system', 'result', 'rate_limit_event'}
+    try:
+        with open(path, 'rb') as stream:
+            for raw in stream:
+                if not raw.endswith(b'\n'):
+                    return reject('event log has a partial final event')
+                event = json.loads(raw)
+                if not isinstance(event, dict) or has_call(event):
+                    return reject('event log contains a tool call or an unknown event')
+                kind = event.get('type')
+                if kind in ('item.started', 'item.updated', 'item.completed'):
+                    item = event.get('item')
+                    if not isinstance(item, dict) or item.get('type') not in ('agent_message', 'reasoning'):
+                        return reject('event log contains tool activity or an unknown item')
+                elif kind in ('assistant', 'user'):
+                    content = (event.get('message') or {}).get('content')
+                    if not isinstance(content, list) or any(not isinstance(x, dict) or x.get('type') != 'text'
+                                                           for x in content):
+                        return reject('event log contains non-text message content')
+                elif kind not in safe_events:
+                    return reject('event log contains an unknown event type')
+    except (OSError, ValueError, TypeError, AttributeError):
+        return reject('event log missing, unreadable or malformed')
+    return True
+
+
+def _retry_admission(job_id, spec, policy):
+    """Revalidate the retained writer reservation and normal WIP/coordination admission."""
+    if spec.get('coordination'):
+        from . import coordination
+        coordination.validate_runner(spec, job_id)
+    if spec.get('write') or spec.get('profile') == 'code':
+        from . import wip
+        if not common.is_linked_worktree(spec['cwd']):
+            raise Refusal(common.EXIT_REFUSED, '--write needs a LINKED worktree before retry')
+        with wip.lock():
+            wip.check(spec['cwd'], 'run', spec.get('name') or 'writer', policy, preserve=True)
+        with common.file_lock(os.path.join(common.STATE, 'writers.lock'), 30):
+            owner = common.read_json(_writer_path(_writer_cwd(spec['cwd'])))
+            if not isinstance(owner, dict) or owner.get('id') != job_id \
+                    or owner.get('pid') != os.getpid() or owner.get('created') != _self_created():
+                raise Refusal(common.EXIT_REFUSED, 'writer directory ownership changed before retry')
+
+
+def _retry_backoff(job_id, engine, n, delay, deadline=None):
+    # Custody stays owned; only the engine slot is released. Never sleep under a lock.
+    _write_status(job_id, 'queued', engine=engine, attempt=n, retry_backoff_s=delay)
+    left = delay
+    while left > 0:
+        if _stop_requested(job_id) or deadline is not None and time.monotonic() >= deadline:
+            return False
+        chunk = min(left, 1)
+        if deadline is not None:
+            chunk = min(chunk, max(0, deadline - time.monotonic()))
+        time.sleep(chunk)
+        left -= chunk
+    return not _stop_requested(job_id) and (deadline is None or time.monotonic() < deadline)
+
+
+def _job_deadline(spec):
+    deadline = spec.get('deadline_monotonic')
+    if deadline is None:
+        return time.monotonic() + spec['primary']['timeout_s']
+    if type(deadline) not in (int, float) or not 0 < deadline < float('inf'):
+        raise ValueError('invalid monotonic job deadline; no launch')
+    return deadline
+
+
 def _run_claimed(job_id: str, spec: dict) -> dict:
     t0 = common.now()
+    began = time.monotonic()
     attempts, notes, failover = [], list(spec.get('notes') or []), None
     if CONTAIN and common.IS_WIN and not common.contain_children():
         notes.append('engine children are not in a kill-on-close job object (the OS refused)')
@@ -2328,32 +2642,99 @@ def _run_claimed(job_id: str, spec: dict) -> dict:
     policy, seen = None, {}
     try:
         policy = common.load_policy()
+        _COMPLETION_POLICY.set(policy)  # reuse this read; disabled sinks add no policy I/O or waiting
         err = _baton(spec.get('baton'), _start_receipt(spec))
         if err:
             notes.append(f'baton start: {err}')
         params, brief_path, resume = spec['primary'], _p(job_id, 'brief.md'), spec.get('resume')
-        stalls = 0
-        for n in range(1, MAX_ATTEMPTS + 1):
-            waited = acquire_slot(job_id, params['engine'], n, policy)
+        stalls = retries = stage = 0
+        retry_of = None
+        maximum, delays = retry.settings(policy)
+        maximum = min(maximum, spec.get('retry_max', 0))
+        deadline = _job_deadline(spec) if 'deadline_monotonic' in spec else began + spec['primary']['timeout_s']
+        while stage < MAX_ATTEMPTS:
+            n = len(attempts) + 1
+            if retry_of is not None:
+                policy = common.load_policy()
+                if retries > retry.settings(policy)[0]:
+                    notes.append('not retried: current retry policy no longer permits this attempt')
+                    break
+                try:
+                    _retry_admission(job_id, spec, policy)
+                except (Refusal, ValueError, OSError, TimeoutError) as error:
+                    attempts.append({'n': n, 'engine': params['engine'], 'status': 'refused',
+                                     'error': str(error), 'ready': False, 'engine_started': False,
+                                     'retry_of': retry_of, 'retry_failure_class': attempts[-1]['failure_class']})
+                    break
+            slot_wait = {}
+            try:
+                waited = acquire_slot(job_id, params['engine'], n, policy, record=slot_wait, deadline=deadline)
+            except JobDeadline as error:
+                notes.append(f'not launched: {error}')
+                if not attempts:
+                    attempts.append({'n': n, 'engine': params['engine'], 'status': 'timeout',
+                                     'error': str(error), 'ready': False, 'engine_started': False, **slot_wait})
+                break
             if before is None:
-                # After the slot wait, so queue time does not count as the job's own window.
+                # Take the tripwire after slot admission; queue time still consumes the launch budget.
                 before = tripwire_snapshot(spec['cwd'])
                 main_before = tripwire_snapshot(main_root) if main_root else None
-            why, wait_until = preflight(spec, params, policy, fresh=waited, seen=seen)
+            why, wait_until = preflight(spec, params, policy, fresh=waited or retry_of is not None, seen=seen)
             if not why and n == 1:
                 why = _continue_blocked(spec.get('continue_job')) or next(
                     filter(None, (_continue_blocked(j, f'--resume (session of job {j})')
                                   for j in spec.get('resume_jobs') or ())), None)
             if why:
                 attempts.append({'n': n, 'engine': params['engine'], 'status': 'refused', 'error': why,
-                                 'wait_until': wait_until, 'started_at': common.iso(common.now())})
-                break
-            if _stop_requested(job_id):
+                                 'wait_until': wait_until, 'started_at': common.iso(common.now()),
+                                 'ready': False, 'engine_started': False, **slot_wait})
+                a = attempts[-1]
+            if not why and _stop_requested(job_id):
                 notes.append(f'stop requested; attempt {n} was not launched')
                 stop_hit = True
                 break
-            a = run_attempt(job_id, n, params, brief_path, spec, policy, resume)
-            attempts.append(a)
+            if not why:
+                # Admission, slot waiting, snapshots and preflight all spend the same budget.
+                remaining = deadline - time.monotonic()
+                minimum = MIN_RETRY_LAUNCH_S if n > 1 else 0
+                if remaining <= minimum:
+                    notes.append('not launched: timeout budget exhausted after preflight')
+                    if not attempts:
+                        attempts.append({'n': n, 'engine': params['engine'], 'status': 'timeout',
+                                         'error': notes[-1], 'ready': False, 'engine_started': False})
+                    break
+                params = dict(params, timeout_s=min(params['timeout_s'], remaining),
+                              deadline_monotonic=deadline, launch_min_s=minimum)
+                a = run_attempt(job_id, n, params, brief_path, spec, policy, resume)
+                if isinstance(a, dict):
+                    a.update(slot_wait)
+                attempts.append(a)
+            a['failure_class'] = failclass.classify(a)
+            if retry_of is not None:
+                a.update(retry_of=retry_of, retry_failure_class=attempts[-2]['failure_class'])
+                retry_of = None
+            if a['failure_class'] in ('transient_start', 'transient_engine') and retries < maximum:
+                delay = delays[min(retries, len(delays) - 1)]
+                remaining = deadline - time.monotonic()
+                if not _work_free(spec, a):
+                    notes.append('not retried: could not prove the attempt did no work')
+                elif _tree_unresolved(job_id) or _engine_state(job_id, common.read_json(_p(job_id, 'status.json'), {}) or {}) != common.DEAD:
+                    notes.append('not retried: process tree or engine is not proven DEAD')
+                elif not _stop_requested(job_id) and remaining > delay + MIN_RETRY_LAUNCH_S:
+                    retries += 1
+                    retry_of = n
+                    notes.append(f'attempt {n}: retry {retries}/{maximum} on {params["engine"]} after {delay} s')
+                    if not _retry_backoff(job_id, params['engine'], n, delay, deadline=deadline):
+                        if not _stop_requested(job_id):
+                            notes.append('not retried: timeout budget exhausted during backoff')
+                        break
+                    remaining = deadline - time.monotonic()
+                    if remaining <= MIN_RETRY_LAUNCH_S:
+                        notes.append('not retried: timeout budget exhausted during backoff')
+                        break
+                    continue
+                elif remaining <= delay + MIN_RETRY_LAUNCH_S:
+                    notes.append('not retried: timeout budget does not cover backoff')
             if a['status'] == 'stalled':
                 # A hung worker was killed. Requeue once (the slot wait applies the host-load limit again);
                 # a second stall means the host cannot run it: fail, with no verdict of any kind.
@@ -2367,7 +2748,8 @@ def _run_claimed(job_id: str, spec: dict) -> dict:
                                   'so the job was not retried')
                     notes.append(f"attempt {n}: {a['error']}")
                     break
-                if stalls <= watchdog.STALL_REQUEUES and n < MAX_ATTEMPTS and not _stop_requested(job_id):
+                if stalls <= watchdog.STALL_REQUEUES and stage + 1 < MAX_ATTEMPTS and not _stop_requested(job_id):
+                    stage += 1
                     a['requeued'] = True
                     notes.append(f"attempt {n} stalled ({a['error']}); its process tree was killed and the job "
                                  'was requeued once')
@@ -2381,11 +2763,11 @@ def _run_claimed(job_id: str, spec: dict) -> dict:
                     a['error'] = f"host overload: stalled {stalls} times ({a['error']})"
                 notes.append(f"attempt {n}: {a['error']}; the work did not run to a result")
                 break
-            if a['status'] == 'limit_hit' and n < MAX_ATTEMPTS and spec.get('failover') and _tree_unresolved(job_id):
+            if a['status'] == 'limit_hit' and stage + 1 < MAX_ATTEMPTS and spec.get('failover') and _tree_unresolved(job_id):
                 # The attempt's tree is not proven gone: a second engine could write beside a survivor.
                 notes.append(f'attempt {n}: its process tree was not proven stopped, so no failover was started')
                 break
-            if a['status'] != 'limit_hit' or n >= MAX_ATTEMPTS or not spec.get('failover') \
+            if a['status'] != 'limit_hit' or stage + 1 >= MAX_ATTEMPTS or not spec.get('failover') \
                     or _stop_requested(job_id):
                 break
             nxt, why = plan_failover(spec, a, policy)
@@ -2396,10 +2778,11 @@ def _run_claimed(job_id: str, spec: dict) -> dict:
             if nxt is None:
                 a['failover_refused'] = why
                 break
-            brief_path = _p(job_id, 'brief-a2.md')
+            brief_path = _p(job_id, f'brief-a{n + 1}.md')
             _write_job_text(job_id, os.path.basename(brief_path), continuation_brief(job_id, nxt['engine'], spec['profile'],
                                                              spec['brief_text'], a))
             failover = {'from': a['engine'], 'to': nxt['engine'], 'reason': 'limit_hit'}
+            stage += 1
             params, resume = nxt, None
         if before is not None:
             trip = tripwire_diff(before, tripwire_snapshot(spec['cwd']), spec['cwd'])
@@ -2420,6 +2803,7 @@ def _run_claimed(job_id: str, spec: dict) -> dict:
             attempts[-1]['status'] = 'failed'
             attempts[-1]['error'] = (f"host overload: {attempts[-1].get('error')}; "
                                      f'the retry could not start ({type(e).__name__})')
+    notes.extend(x for x in spec.get('notes', []) if x not in notes)
     usage, meter_after = _job_usage(job_id, spec, attempts, seen, t0, policy, quick=interrupted)
     if usage and usage.get('after_note'):
         notes.append(usage['after_note'])
@@ -2677,6 +3061,11 @@ def _receipt_error(receipt: dict) -> str | None:
 
 def _finalize(receipt: dict) -> dict:
     """Stamp every terminal receipt, including refusal and stop paths without attempts."""
+    for attempt in receipt.get('attempts') or []:
+        attempt.setdefault('ready', False)
+        attempt['failure_class'] = failclass.classify(attempt)
+    receipt['failure_class'] = (receipt['attempts'][-1]['failure_class'] if receipt.get('attempts')
+                                else failclass.classify(receipt))
     if receipt.get('status') not in ('running', 'queued'):
         receipt['finished_at'] = receipt.get('finished_at') or receipt.get('ended_at') or common.iso(common.now())
         receipt['error'] = (receipt.get('error') or _receipt_error(receipt)) if receipt.get('status') != 'done' else None
@@ -2708,6 +3097,20 @@ def _notify_owner(spec, receipt):
 
 OWNER_PENDING = 'owner-pending.json'
 OWNER_NOTIFIED = 'owner-notified.json'
+
+
+def _completion(jid, receipt, policy=None):
+    """Only newly published receipts reach here; advisory sinks never change an outcome."""
+    try:
+        from . import completions
+        completions.notify(jid, receipt, policy=policy)
+    except Exception:
+        # Even an unavailable sink module must leave the job's receipt/exit status intact.
+        try:
+            with open(_p(jid, 'runner.log'), 'a', encoding='utf-8') as handle:
+                handle.write('completion sinks skipped: internal error\n')
+        except OSError:
+            pass
 
 
 def repair_owner(jid):
@@ -2875,6 +3278,8 @@ def _run_parser() -> argparse.ArgumentParser:
     ap.add_argument('--name')
     ap.add_argument('--baton')
     ap.add_argument('--owner', help='existing baton that collects this job')
+    ap.add_argument('--allow-duplicate', action='store_true',
+                    help='start even when a live job already runs this same brief in this folder on this engine')
     ap.add_argument('--task-id', help='opt-in stable CLI coordination task identity')
     ap.add_argument('--dispatch-id', help='idempotent request identity within --task-id')
     ap.add_argument('--actor', help='sender identity in the recorded delegation lineage')
@@ -2973,9 +3378,11 @@ def plan_run(args, policy: dict) -> dict:
     tier_name = codex_tier_model(args.model, policy) if engine == 'codex' else None
     if tier_name:
         raise Refusal(common.EXIT_USAGE, f'--model {args.model} is a Codex tier; use --tier {tier_name}')
+    # After the binary and path refusals: those must run before this touches the --cd tree.
+    git_note = git_cwd_preflight(engine, cwd)
     params = engine_params(engine, kind, d, policy, profile, args.model, args.effort, args.tier, args.timeout,
                            args.max_turns)
-    notes, resume, resume_jobs = [], args.resume, []
+    notes, resume, resume_jobs = ([git_note] if git_note else []), args.resume, []
     if pf:
         notes.append(f"codex CLI {pf['version'] or 'unknown'} ({pf['origin']})")
         if pf['note']:
@@ -3026,8 +3433,9 @@ def plan_run(args, policy: dict) -> dict:
             'brief_src': os.path.abspath(args.brief), 'brief_text': brief,
             'caller_brief': caller_brief, 'decision': d, 'meter_before': meter, 'engine': engine, 'profile': profile, 'primary': params,
             'resume': resume, 'resume_jobs': resume_jobs, 'continue_job': prior['id'] if prior else None,
-            'failover': failover,
+            'failover': failover, 'retry_max': retry.settings(policy)[0],
             'write': bool(args.write), 'urgent': bool(args.urgent), 'baton': args.baton, 'owner': owner,
+            'allow_duplicate': bool(getattr(args, 'allow_duplicate', False)),
             **({'preserve_existing_metadata': True}
                if args.preserve_existing_metadata or _PRESERVING_METADATA.get() else {}),
             **({'codex_binary': codex_binary} if codex_binary is not None else {}),
@@ -3100,6 +3508,13 @@ def _status_ok(r: dict) -> bool:
     return _runner_status(r.get('status'))
 
 
+def _attempt_limit(job_id):
+    """Persisted retry allowance bounds recovery; legacy jobs keep their original limit."""
+    spec = common.read_json(_p(job_id, 'job.json'), {}) or {}
+    maximum = spec.get('retry_max', 0) if isinstance(spec, dict) else 0
+    return MAX_ATTEMPTS + (maximum if type(maximum) is int and maximum >= 0 else 0)
+
+
 def _receipt_inconsistency(job_id: str, r: dict | None, claimed: int, latest: int) -> str | None:
     if not r:
         return None
@@ -3107,7 +3522,7 @@ def _receipt_inconsistency(job_id: str, r: dict | None, claimed: int, latest: in
         return 'receipt status is missing, empty or not a runner status'
     atts = r.get('attempts') or []
     numbers = _receipt_attempts(r)
-    if numbers and (numbers != sorted(set(numbers)) or any(n > MAX_ATTEMPTS for n in numbers)):
+    if numbers and (numbers != sorted(set(numbers)) or any(n > _attempt_limit(job_id) for n in numbers)):
         return 'receipt attempts are out of order, duplicated, or beyond the runner limit'
     st = common.read_json(_p(job_id, 'status.json'), {}) or {}
     status_n = st.get('attempt')
@@ -3193,7 +3608,7 @@ def _job_sessions(job_id: str) -> set:
         names = [n for n in os.listdir(job_dir(job_id)) if re.fullmatch(r'events(-a\d+)?\.jsonl', n)]
     except OSError:
         names = []
-    for n in names[:MAX_ATTEMPTS + 1]:
+    for n in names[:_attempt_limit(job_id) + 1]:
         try:
             with open(_p(job_id, n), 'rb') as f:
                 head = f.read(SESSION_EVENTS_BYTES).decode('utf-8', 'replace')
@@ -3242,7 +3657,7 @@ def _attempt_file_numbers(job_id: str) -> tuple[list[int], list[str]]:
         files = _attempt_files(job_id, n)
         allowed = {os.path.basename(files[k]) for k in ('events', 'stderr', 'final', 'codex_out', 'codex_log',
                                                         'codex_log_legacy')}
-        if 1 <= n <= MAX_ATTEMPTS and name in allowed:
+        if 1 <= n <= _attempt_limit(job_id) and name in allowed:
             seen.append(n)
         else:
             ignored.append(name)
@@ -3322,8 +3737,8 @@ def _attempt_context(job_id: str, spec: dict, r: dict | None, receipt_final: str
     for n in range(1, last + 1):
         got = _read_progress(job_id, n, last_engine if n == last else None) or {}
         entry = next((a for a in reversed(atts) if a.get('n') == n), {})
-        # A failover always swaps engines, so attempt 2 of an unknown engine ran on the other one.
-        guess = primary if n % 2 else (primary and _other(primary))
+        # Retry-capable jobs cannot infer an engine from parity. Raw event/status evidence wins.
+        guess = (None if spec.get('retry_max') else primary if n % 2 else (primary and _other(primary)))
         engine = got.get('session_engine') or (last_engine if n == last else None) or entry.get('engine') or guess
         final = _read_text(_attempt_files(job_id, n)['final'])
         if not final.strip() and r and n == k:
@@ -3482,8 +3897,83 @@ def _coordination_parent():
 _WIP_REQUEST = ContextVar('twinlane_wip_request', default=None)  # the queued request this run replays
 
 
+def _dedupe_key(spec: dict) -> tuple | None:
+    primary = spec.get('primary') if isinstance(spec.get('primary'), dict) else {}
+    cwd, text = spec.get('cwd'), spec.get('brief_text')
+    if not isinstance(cwd, str) or not isinstance(text, str):
+        return None
+    return (spec.get('engine'), primary.get('model'), primary.get('tier'),
+            os.path.normcase(os.path.realpath(cwd)), hashlib.sha256(text.encode('utf-8', 'replace')).hexdigest())
+
+
+def live_duplicate(plan: dict) -> str | None:
+    """The id of a live job (queued or running, runner alive) with the same engine, model, tier, folder and brief
+    text, or None. A coordinated dispatch has its own replay identity and is never deduped here.
+
+    Advisory and read-only: it never blocks on a lock, and a job it cannot read is not a duplicate."""
+    if plan.get('coordination') is not None or plan.get('allow_duplicate'):
+        return None
+    key = _dedupe_key(plan)
+    if key is None:
+        return None
+    inside = os.environ.get('TWINLANE_ENGINE_JOB')  # a worker delegating its own brief is not resubmitting it
+    for jid in _live_candidates():
+        if jid == inside or os.path.exists(_p(jid, 'result.json')):
+            continue
+        spec = common.read_json(_p(jid, 'job.json'))
+        if not isinstance(spec, dict) or _dedupe_key(spec) != key:
+            continue
+        st = common.read_json(_p(jid, 'status.json'))
+        if not isinstance(st, dict) or st.get('status') not in ('queued', 'running'):
+            continue
+        pid, created = (st.get('pid'), st.get('pid_created')) if st.get('pid') else _runner_pid(jid)
+        if pid and _alive(pid, created):
+            return jid
+        # Before its runner exists, a job is live while the process that submitted it is: that process either
+        # becomes the runner (inline) or writes runner.pid before it exits (--bg).
+        sub, sub_created = spec.get('submitter_pid'), spec.get('submitter_created')
+        if type(sub) is int and type(sub_created) is int and _alive(sub, sub_created):
+            return jid
+    return None
+
+
+DEDUPE_LOCK_S = 60
+
+
+@contextmanager
+def _dedupe_admission(plan: dict):
+    """Serialize the duplicate check with publishing the job (state/dedupe.lock), so two identical submissions
+    cannot both pass it. Yields the plan to create, stamped with this submitter's identity. The check is advisory: if
+    the lock stays busy past DEDUPE_LOCK_S the job is created unchecked with a note, never refused or lost."""
+    if plan.get('coordination') is not None or plan.get('allow_duplicate'):
+        yield plan
+        return
+    plan = dict(plan, submitter_pid=os.getpid(), submitter_created=_self_created())
+    try:
+        held = common.file_lock(os.path.join(common.STATE, 'dedupe.lock'), DEDUPE_LOCK_S)
+        held.__enter__()
+    except TimeoutError:
+        notes = list(plan.get('notes') or []) + ['duplicate check skipped: dedupe.lock busy']
+        yield dict(plan, notes=notes)
+        return
+    try:
+        dup = live_duplicate(plan)
+        if dup:
+            raise Refusal(common.EXIT_REFUSED,
+                          f'duplicate of live job {dup} (same engine, model, folder and brief): '
+                          f'`twinlane wait {dup}`, or pass --allow-duplicate to start a second copy')
+        yield plan
+    finally:
+        held.__exit__(None, None, None)
+
+
 def create_job(plan: dict) -> str:
     _validate_owner(plan.get('owner'))
+    with _dedupe_admission(plan) as plan:
+        return _create_job_checked(plan)
+
+
+def _create_job_checked(plan: dict) -> str:
     request, requeue_argv = _WIP_REQUEST.get() or (None, None)
     _WIP_REQUEST.set(None)
     if plan.get('write') or plan.get('profile') == 'code':
@@ -3491,6 +3981,9 @@ def create_job(plan: dict) -> str:
         try:
             with wip.admission(plan['cwd'], 'run', plan.get('name') or plan.get('baton') or 'writer',
                                argv=requeue_argv, preserve=plan.get('preserve_existing_metadata') is True):
+                claim = os.environ.get(wip.CLAIM_ENV)
+                if request and claim:  # not in the coordination fingerprint (FINGERPRINT_KEYS / caller_intent)
+                    plan = dict(plan, wip_claim=claim)  # lets a later pump prove this request was admitted
                 jid = _admitted_job(plan)
                 if request:  # the job is on disk now: only here is a pumped request really done
                     try:
@@ -3530,12 +4023,13 @@ def _create_job(plan: dict, reserved_id: str | None = None) -> str:
             continue
     else:
         raise RuntimeError('could not allocate a job id')
-    spec = dict(plan, id=jid, created_at=common.iso(common.now()), writer_reservation_version=1)
+    spec = dict(plan, id=jid, created_at=common.iso(common.now()), writer_reservation_version=1,
+                retry_max=plan['retry_max'] if 'retry_max' in plan else retry.settings(common.load_policy())[0])
     _write_job_text(jid, 'brief.md', compose_brief(jid, plan['engine'], plan['profile'], plan['brief_text']))
     if isinstance(plan.get('caller_brief'), str):
         _write_job_text(jid, CALLER_BRIEF, plan['caller_brief'])
     _write_job_json(jid, 'job.json', spec)
-    _write_job_json(jid, 'status.json', {'status': 'queued', 'pid': None, 'engine': plan['engine'],
+    _write_job_json(jid, 'status.json', {'status': 'queued', 'phase': 'starting', 'pid': None, 'engine': plan['engine'],
                                                'created_at': spec['created_at']})
     _notify_owner(spec, dict(id=jid, engine=plan['engine'], status='queued'))
     return jid
@@ -3635,10 +4129,10 @@ def _cmd_run(argv) -> int:
                     return _coordination_replay_result(existing, args.json)
         elif parent is not None and parent.get('coordination') is not None:
             raise Refusal(common.EXIT_REFUSED, 'coordinated workers cannot drop task identity')
-        if not _PRESERVING_METADATA.get():
-            envhandoff.sweep(common.JOBS, HANDOFF)
         policy = common.load_policy()
         plan = plan_run(args, policy)
+        if not _PRESERVING_METADATA.get():
+            envhandoff.sweep(common.JOBS, HANDOFF)
         if envelope is not None:
             plan.update(coordination=envelope, caller_intent=intent)
     except ValueError as e:
@@ -3686,14 +4180,64 @@ def _cmd_run(argv) -> int:
     return EXIT_BY_STATUS.get(receipt['status'], common.EXIT_FAILED)
 
 
+def _detach_with_retry(jid, plan, argv):
+    policy = common.load_policy()
+    maximum, delays = retry.settings(policy)
+    # The detached runner must inherit the budget already spent on background startup. A plan with no
+    # timeout (the runner would refuse it anyway) has no budget to hand over and takes no retry.
+    timed = 'deadline_monotonic' in plan or isinstance((plan.get('primary') or {}).get('timeout_s'), (int, float))
+    deadline = _job_deadline(plan) if timed else None
+    if deadline is None:
+        maximum = 0
+    else:
+        spec = common.read_json(_p(jid, 'job.json'))
+        spec['deadline_monotonic'] = deadline
+        _write_job_json(jid, 'job.json', spec)
+    for index in range(maximum + 1):
+        if index:
+            policy = common.load_policy()
+            if index > retry.settings(policy)[0]:
+                raise common.DetachError('current retry policy no longer permits a background retry')
+            if _stop_requested(jid) or common.read_json(_p(jid, 'result.json')) is not None:
+                raise common.DetachError('stop or receipt before background retry; no launch')
+            if _tree_unresolved(jid) or _engine_state(jid, common.read_json(_p(jid, 'status.json'), {}) or {}) != common.DEAD:
+                raise common.DetachAmbiguous('engine identity is not DEAD before background retry')
+            # No slot or writer is owned yet: runner admission will acquire both normally.
+            if plan.get('coordination'):
+                from . import coordination
+                coordination.validate_runner(dict(plan, id=jid), jid)
+            if plan.get('write') or plan.get('profile') == 'code':
+                from . import wip
+                with wip.lock():
+                    wip.check(plan['cwd'], 'run', plan.get('name') or 'writer', policy, preserve=True)
+            why, _ = preflight(plan, plan['primary'], policy, fresh=True)
+            if why:
+                raise common.DetachError(why)
+        if deadline is not None and deadline - time.monotonic() <= MIN_RETRY_LAUNCH_S:
+            raise common.DetachError('timeout budget exhausted before background launch')
+        try:
+            return common.spawn_detached_ex(argv, cwd=common.ROOT,
+                                            log_path=_p(jid, 'runner.log'), require_survival=True,
+                                            handoff=_p(jid, HANDOFF))
+        except common.DetachAmbiguous:
+            raise
+        except common.DetachError as error:
+            if 'wmi start failed' not in str(error).lower() or index >= maximum:
+                raise
+            delay = delays[min(index, len(delays) - 1)]
+            if deadline - time.monotonic() <= delay + MIN_RETRY_LAUNCH_S:
+                raise
+            if not _retry_backoff(jid, plan['engine'], 0, delay, deadline=deadline):
+                raise common.DetachError('stop or timeout budget exhausted during background retry')
+            # _spawn_wmi uses a fresh environment handoff for each call; only unambiguous errors reach here.
+
+
 def _start_background(jid: str, plan: dict, as_json: bool) -> int:
     try:
         runner_argv = [sys.executable, common.TWINLANE_PY, '_job', jid]
         if plan.get('preserve_existing_metadata') is True:
             runner_argv.append('--preserve-existing-metadata')
-        d = common.spawn_detached_ex(runner_argv, cwd=common.ROOT,
-                                     log_path=_p(jid, 'runner.log'), require_survival=True,
-                                     handoff=_p(jid, HANDOFF))
+        d = _detach_with_retry(jid, plan, runner_argv)
         if not d.get('created'):
             raise common.DetachAmbiguous('runner started but its creation stamp is unavailable')
     except common.DetachAmbiguous as e:
@@ -3711,7 +4255,7 @@ def _start_background(jid: str, plan: dict, as_json: bool) -> int:
                 print(f'twinlane run: {reason}', file=sys.stderr)
             return common.EXIT_REFUSED
         return _refuse_background(jid, plan, as_json, e)
-    except common.DetachError as e:
+    except (common.DetachError, Refusal, ValueError, OSError) as e:
         return _refuse_background(jid, plan, as_json, e)
     _write_job_text(jid, 'runner.pid', f"{d['pid']} {d['created']}")
     spec = common.read_json(_p(jid, 'job.json'), {}) or {}
@@ -3741,12 +4285,16 @@ def _refuse_background(jid: str, plan: dict, as_json: bool, e: Exception) -> int
         holder, unwritten = False, f'the runner role could not be taken ({type(error).__name__})'
     else:
         unwritten = f'runner pid {holder[0]} holds the job' if holder else None
+    published = False
     if holder is None:
         try:
             if common.read_json(_p(jid, 'result.json')) is None:
                 _write_receipt(jid, receipt)
+                published = True
         finally:
             _release_runner(jid)
+    if published:
+        _completion(jid, receipt)
     payload = {'id': jid, 'refused': True, 'reason': reason}
     if unwritten:
         payload['receipt'] = f'not written: {unwritten}'
@@ -3772,6 +4320,9 @@ def cmd_job(argv) -> int:
 
 
 def cmd_jobs(argv) -> int:
+    if argv[:1] == ['reindex']:
+        from . import jobs_index
+        return jobs_index.cli(argv[1:])
     if argv[:1] == ['archive']:
         from . import archive
         return archive.cli(argv[1:])
@@ -3827,16 +4378,17 @@ def cmd_wait(argv) -> int:
         time.sleep(wait_s)
 
 
-COLLECTED = 'collected'    # jobs/<id>/collected: the time `twinlane result` last printed this receipt (only it writes it)
+COLLECTED = 'collected'    # jobs/<id>/collected: receipt read by result, inbox answer or ack
 
 
-def mark_collected(job_id: str) -> None:
+def mark_collected(job_id: str) -> bool:
     """Record that the receipt was read, so `twinlane board` can tell "finished, not yet read". Best effort: a
     read-only disk must not make `twinlane result` fail after it has printed."""
     try:
         _write_job_text(job_id, COLLECTED, common.iso(common.now()) + '\n')
+        return True
     except OSError:
-        pass
+        return False
 
 
 def cmd_result(argv) -> int:
@@ -4024,6 +4576,7 @@ def cmd_stop(argv) -> int:
             _write_receipt(jid, receipt)
     finally:
         _release_runner(jid)
+    _completion(jid, receipt)
     common.emit(receipt, args.json, f"{jid}: stopped (killed {killed or 'nothing alive'})")
     return common.EXIT_OK
 
@@ -4078,6 +4631,22 @@ def _job_ids() -> list[str]:
         # An enclosing board/command snapshot must not hide a newly admitted job.
         return sorted(observations.Snapshot().directories(), reverse=True)
     return observations.job_ids()
+
+
+def _indexed_jobs():
+    """Names remain the universe. No SQLite import, open or extra policy read when OFF."""
+    if not common.JOBS_INDEX_ENABLED:
+        return _job_ids(), None
+    from . import jobs_index
+    return jobs_index.names(), jobs_index.read()
+
+
+def _live_candidates(ids=None):
+    if not common.JOBS_INDEX_ENABLED:
+        return _job_ids() if ids is None else ids
+    from . import jobs_index
+    universe, rows = _indexed_jobs() if ids is None else (ids, jobs_index.read())
+    return [jid for jid in universe if not jobs_index.terminal(jid, rows)]
 
 
 def resolve_job(ref: str) -> str:
@@ -4284,9 +4853,15 @@ def job_status(job_id: str) -> str:
 
 
 @observations.command
-def list_jobs(limit: int | None = 20) -> list[dict]:
+def list_jobs(limit: int | None = 20, *, live_only=False) -> list[dict]:
     rows = []
-    for jid in _job_ids()[:limit] if limit else _job_ids():
+    if common.JOBS_INDEX_ENABLED:
+        from . import jobs_index
+        ids = jobs_index.names()
+    else:
+        ids = _job_ids()
+    ids = ids[:limit] if limit else ids
+    for jid in _live_candidates(ids) if live_only else ids:
         spec = observations.job_json(jid, default={}) or {}
         r = observations.job_json(jid, 'result.json')
         st = observations.job_json(jid, 'status.json', {}) or {}
@@ -4443,6 +5018,11 @@ COMMANDS = {'run': cmd_run, 'jobs': cmd_jobs, 'wait': cmd_wait, 'result': cmd_re
 
 
 def cli(cmd: str, argv) -> int:
+    if cmd in ('jobs', 'wait', 'result', 'stop'):
+        try:
+            common.load_policy()  # discover the opt-in on repair/collection paths
+        except SystemExit:
+            common.JOBS_INDEX_ENABLED = False  # cache discovery cannot break legacy collection
     fn = COMMANDS.get(cmd)
     if fn is None:
         print(f'twinlane: unknown jobs command {cmd!r}', file=sys.stderr)

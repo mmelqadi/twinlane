@@ -47,6 +47,7 @@ JOBS = os.path.join(HOME_DIR, 'jobs')
 BATONS = os.path.join(HOME_DIR, 'batons')
 BIN = os.path.join(HOME_DIR, 'bin')
 POLICY = os.path.join(os.path.dirname(__file__), 'policy.json')
+JOBS_INDEX_ENABLED = False  # refreshed by load_policy; OFF paths do no extra policy or SQLite I/O
 TWINLANE_PY = os.path.join(os.path.dirname(__file__), 'cli.py')
 CLAUDE_DIR = os.path.abspath(os.path.expanduser(os.environ.get('CLAUDE_CONFIG_DIR') or os.path.join(HOME, '.claude')))
 CODEX_DIR = os.path.abspath(os.path.expanduser(os.environ.get('CODEX_HOME') or os.path.join(HOME, '.codex')))
@@ -330,12 +331,19 @@ def load_policy() -> dict:
     if not isinstance(p, dict):
         raise SystemExit(f'twinlane: cannot read policy {POLICY}')
     config = os.environ.get('TWINLANE_CONFIG') or os.path.join(data_home(), 'config.json')
-    if not os.path.isfile(config):
-        return p
-    user = read_json(config)
-    if not isinstance(user, dict):
-        raise SystemExit(f'twinlane: invalid config {config}')
-    return _merge_config(p, user)
+    if os.path.isfile(config):
+        user = read_json(config)
+        if not isinstance(user, dict):
+            raise SystemExit(f'twinlane: invalid config {config}')
+        p = _merge_config(p, user)
+    configure_jobs_index(p)
+    return p
+
+
+def configure_jobs_index(policy):
+    global JOBS_INDEX_ENABLED
+    section = policy.get('jobs_index')
+    JOBS_INDEX_ENABLED = isinstance(section, dict) and section.get('enabled') is True
 
 
 def _merge_config(base: dict, override: dict) -> dict:

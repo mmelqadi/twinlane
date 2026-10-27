@@ -16,6 +16,7 @@ import os
 import re
 import sys
 import time
+from collections import Counter
 
 from . import common, observations
 from . import meter as meter_mod
@@ -142,8 +143,12 @@ def _tri(x):
 
 def _engine_view(name: str, sec, policy: dict, now) -> dict:
     sec = _d(sec)
+    if name == 'codex' and sec.get('source') == 'last-good':
+        sec = meter_mod.finish_codex(sec, policy, now)
     th = _d(policy.get('thresholds'))
     max_age = _d(policy.get(name)).get('stale_reading_max_age_s', 1800)
+    if name == 'codex' and sec.get('source') == 'last-good':
+        max_age = meter_mod.codex_last_good_max_age(policy)
     age = common.age_s(sec.get('reading_at'))
     status = _s(sec.get('status')) or 'unknown'
     note = _txt(sec.get('note'), 120)
@@ -170,6 +175,8 @@ def _engine_view(name: str, sec, policy: dict, now) -> dict:
             'max_pct': _num(sec.get('max_pct')), 'next_reset': nxt if isinstance(nxt, (str, int, float)) else None,
             'windows': windows, 'binding': next((w for w in windows if w['binding']), None), 'note': note,
             'stop_pct': _num(th.get('stop_pct')) or 85}
+    if sec.get('stale'):
+        view['stale'] = True
     if name == 'claude':
         view['extra_usage_enabled'] = _tri(sec.get('extra_usage_enabled'))
         view['hold'] = _txt(sec.get('hold'), 60) or None
@@ -372,14 +379,38 @@ def collect_jobs(now, show_all: bool, finished_n: int) -> dict:
     --all reads all. A job dir that cannot be read is `unreadable`."""
     from . import jobs
     live, finished, unreadable, scanned = [], [], [], 0
-    for jid in jobs._job_ids():
+    uncollected = Counter()
+    ids, indexed = jobs._indexed_jobs()
+    for jid in ids:
+        old = False
         if not show_all and len(finished) >= finished_n and not os.path.exists(jobs._p(jid, jobs.SURVIVOR)):
             age = _id_age_s(jid)  # a receipt whose engine outlived its kill is live at any age: always read
-            if age is not None and age > OLD_JOB_S:
-                receipt = common.read_json(jobs._p(jid, 'result.json'))
-                ended = common.age_s(receipt.get('ended_at')) if isinstance(receipt, dict) else None
-                if ended is not None and ended > ATTENTION_WINDOW_S:
-                    continue
+            old = age is not None and age > OLD_JOB_S
+        cached = None
+        if old and common.JOBS_INDEX_ENABLED:
+            from . import jobs_index
+            # Untrusted/missing/nonterminal rows must take the complete
+            # folder path, including any UNKNOWN engine at an old id.
+            cached = jobs_index.terminal(jid, indexed)
+        if cached is not None:
+            # A trusted index row is terminal; only an uncollected one opens job.json, for the owner the index lacks.
+            receipt = cached
+            if not os.path.isfile(jobs._p(jid, jobs.COLLECTED)):
+                _, spec = _file(jobs._p(jid, 'job.json'))
+                owner = _s(_d(spec).get('owner')) or ('none' if isinstance(spec, dict) else 'unknown')
+                uncollected[owner] += 1
+        else:
+            # Reuse command-scoped reads with _job_row, including receipts skipped by the display shortcut.
+            _, receipt = _file(jobs._p(jid, 'result.json'))
+            if isinstance(receipt, dict) and _s(receipt.get('status')) in jobs.TERMINAL \
+                    and not os.path.isfile(jobs._p(jid, jobs.COLLECTED)):
+                _, spec = _file(jobs._p(jid, 'job.json'))
+                owner = _s(_d(spec).get('owner')) or ('none' if isinstance(spec, dict) else 'unknown')
+                uncollected[owner] += 1
+        if old and (cached is not None or not common.JOBS_INDEX_ENABLED):
+            ended = common.age_s(receipt.get('ended_at')) if isinstance(receipt, dict) else None
+            if ended is not None and ended > ATTENTION_WINDOW_S:
+                continue
         try:
             row = _job_row(jid, now)
         except Exception:  # noqa: BLE001 - one damaged job dir must not blank the board
@@ -394,7 +425,8 @@ def collect_jobs(now, show_all: bool, finished_n: int) -> dict:
         else:
             finished.append(row)
     return {'live': live, 'finished': finished[: (len(finished) if show_all else finished_n)],
-            'unreadable': unreadable, 'scanned': scanned, '_all_finished': finished}
+            'unreadable': unreadable, 'scanned': scanned, '_all_finished': finished,
+            'receipts': {'uncollected': sum(uncollected.values()), 'by_owner': dict(sorted(uncollected.items()))}}
 
 
 # ---------------------------------------------------------------- batons
@@ -704,6 +736,7 @@ def collect(show_all: bool = False, finished_n: int = FINISHED_DEFAULT, now=None
 def _collect(show_all, finished_n, now, policy, file_only=False):
     now = now or common.now()
     policy = policy or common.load_policy()
+    common.configure_jobs_index(policy)
     meters = collect_meters(policy, now)
     jobs_data = collect_jobs(now, show_all, finished_n)
     if file_only:  # patrol: no transcript scan, claims provider, host sampling or git probes
@@ -740,8 +773,8 @@ def _collect(show_all, finished_n, now, policy, file_only=False):
     waiting = {kind: sorted([b for b in batons if b.get('waiting_on') == kind],
                             key=lambda b: (b.get('waiting_since') or '', b['slug'])) for kind in ('lead', 'user')}
     capacity_line = capacity.line('?' if busy is None else len(busy), (policy.get('wip') or {}).get('max_writers', 5),
-                                  len(wip.queue()), meters, now)
-    host_line, queue = host_and_queue(jobs_data['live'], policy)
+                                  queued_text(wip.queue()), meters, now)
+    host_line, queue, slots = host_and_queue(jobs_data['live'], policy)
     for row in lane_sessions:
         if (row.get('context') or {}).get('flag'):
             signals.append(_item(P_INFO, 'context', row['id'], context.label(row['context']) + ' (estimate)'))
@@ -752,13 +785,45 @@ def _collect(show_all, finished_n, now, policy, file_only=False):
         b.pop('root', None)
     return _scrub({'generated_at': common.iso(now), 'all': show_all, 'meters': meters, 'attention': attention,
                    'signals': signals, 'sessions': lane_sessions, 'waiting': waiting, 'capacity': capacity_line,
-                   'host': host_line, 'queue': queue,
+                   'host': host_line, 'slots': slots, 'queue': queue,
                    'lanes': {'busy': '?' if busy is None else len(busy), 'max': (policy.get('wip') or {}).get('max_writers', 5), 'idle': idle},
                    'jobs': jobs_data, 'batons': batons, 'worktrees': worktrees})
 
 
+def queued_text(rows: list) -> str:
+    """The writer-queue count for the capacity line. Requests the pump cannot start by itself are counted apart,
+    so a dead-letter queue does not read as waiting work."""
+    from . import wip
+    stuck = wip.stuck_summary(rows)
+    if not stuck:
+        return str(len(rows))
+    parts = ', '.join(f'{n} {why}' for why, n in sorted(stuck.items(), key=lambda kv: (-kv[1], kv[0])))
+    return f'{len(rows)} ({sum(stuck.values())} stuck: {parts})'
+
+
+def slots_line(live: list, policy: dict, reading) -> str:
+    """Engine slots in use against the cap, per engine, with the lower count host load allows right now.
+
+    Counts the board's live rows (status running), so it reads no job folder of its own."""
+    from . import hostload
+    bits = []
+    for e in ENGINES:
+        configured = max(1, int((policy.get(e) or {}).get('max_parallel') or 4))
+        running = sum(1 for r in live if r.get('engine') == e and r.get('status') == 'running')
+        waiting = sum(1 for r in live if r.get('engine') == e and r.get('status') == 'queued')
+        usable, _ = hostload.effective_parallel(configured, reading, policy)
+        bit = f'{e} {running}/{configured}'
+        if usable < configured:
+            bit += f' (host allows {usable})'
+        if waiting:
+            bit += f', {waiting} waiting'
+        bits.append(bit)
+    return 'slots: ' + ' · '.join(bits)
+
+
 def host_and_queue(live: list, policy: dict) -> tuple:
-    """The host-load line, and every job waiting for a slot with the reason it waits, in service order."""
+    """The host-load line, every job waiting for a slot with the reason it waits (in service order), and the
+    per-engine slots line."""
     from . import hostload, jobs
     try:
         reading = hostload.sample(policy)
@@ -778,7 +843,7 @@ def host_and_queue(live: list, policy: dict) -> tuple:
     waiting.sort(key=lambda w: (w['engine'] or '', w['priority'], str(w['waiting_since'] or ''), w['id']))
     for w in waiting:
         w['waiting_age'] = common.fmt_age(common.age_s(w['waiting_since']))
-    return hostload.line(reading, configured, policy), waiting
+    return hostload.line(reading, configured, policy), waiting, slots_line(live, policy, reading)
 
 
 # ---------------------------------------------------------------- rendering
@@ -826,6 +891,8 @@ def _engine_line(name: str, v, now_none: str = 'no reading') -> str:
         if v.get('on_credits'):
             parts.append('ON CREDITS')
     tag = f"[{v['source']}, {common.fmt_age(v['age_s'])} old]" if v['source'] != 'none' else '[none]'
+    if v.get('stale'):
+        tag = tag[:-1] + ', stale]'
     return f"{name}: {v['status']} " + ' | '.join(parts) + f' {tag}'
 
 
@@ -923,6 +990,12 @@ def _jobs_title(j: dict) -> str:
     return f"running/queued {len(j['live'])}" + (f", unreadable {len(j['unreadable'])}" if j['unreadable'] else '')
 
 
+def _receipts_line(j: dict) -> str:
+    summary = j.get('receipts', {'uncollected': 0, 'by_owner': {}})
+    owners = ', '.join(f'{owner} {n}' for owner, n in summary['by_owner'].items()) or 'none'
+    return f"receipts: {summary['uncollected']} uncollected (by owner: {owners})"
+
+
 def render_text(data: dict) -> str:
     data = _scrub(data)
     show_all = data['all']
@@ -940,6 +1013,8 @@ def render_text(data: dict) -> str:
     L.append(data.get('capacity', ''))
     if data.get('host'):
         L.append(data['host'])
+    if data.get('slots'):
+        L.append(data['slots'])
     L.append(f"idle lanes: {data.get('lanes', {}).get('idle', 0)}")
     for kind in ('lead', 'user'):
         L.append(f'== Waiting on {kind}')
@@ -959,6 +1034,7 @@ def render_text(data: dict) -> str:
         L.append(_more(len(diagnostic_rows) - signal_cap))
     live, more = _cap(data['jobs']['live'], 'live', show_all)
     L.append(f"== JOBS  {_jobs_title(data['jobs'])}")
+    L.append(_receipts_line(data['jobs']))
     L += ['  ' + _live_text(r) for r in live] or ['  none running']
     if more:
         L.append(_more(more))
@@ -1019,6 +1095,8 @@ def render_md(data: dict) -> str:
     L.append('- ' + data.get('capacity', ''))
     if data.get('host'):
         L.append('- ' + data['host'])
+    if data.get('slots'):
+        L.append('- ' + data['slots'])
     L.append(f"- idle lanes: {data.get('lanes', {}).get('idle', 0)}")
     for kind in ('lead', 'user'):
         L += ['', f'**Waiting on {kind}**']
@@ -1038,6 +1116,7 @@ def render_md(data: dict) -> str:
         L.append(f'- ... +{len(ds) - signal_cap} more (`--all`)')
     live, more = _cap(data['jobs']['live'], 'live', show_all)
     L += ['', f"**Jobs** - {_jobs_title(data['jobs'])}"]
+    L.append(_receipts_line(data['jobs']))
     L += _table(['job', 'engine', 'kind', 'status', 'age', 'model req/served', 'name', 'worktree'],
                 [[_code(r['id']), r['engine'], r['kind'], r['status'],
                   r['age'] + (f" ({r['timeout_pct']}% of timeout)" if r['timeout_pct'] is not None else ''),

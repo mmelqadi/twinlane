@@ -76,28 +76,38 @@ def make(paths, policy: dict | None, clock=time.monotonic) -> Stall | None:
 
 
 def wait(proc, timeout_s: float, stall: Stall | None, poll_s: float = 15, kill=None, grace_s: float = 10,
-         child_created=None):
+         child_created=None, progress=None, deadline=None):
     """`proc.wait(timeout_s)` that also kills the tree when `stall` trips.
 
     Returns the exit code. Raises subprocess.TimeoutExpired at the deadline, exactly like proc.wait, so the
     caller's timeout path is unchanged. On a stall the tree is killed, `stall.tripped` is set and the code
     is returned (None if the process outlived the kill; the caller records a survivor in that case).
-    `stall.kill_confirmed` tells whether the tree kill reported success; the runner never retries on False."""
-    if stall is None:
-        return proc.wait(timeout=timeout_s)
+    `stall.kill_confirmed` tells whether the tree kill reported success; the runner never retries on False.
+    `deadline` (time.monotonic) is an absolute end that also bounds the wait: time spent before this call, or
+    between the caller's arithmetic and this line, is never granted again."""
+    end = time.monotonic() + timeout_s
+    if deadline is not None:
+        end = min(end, deadline)
+    if stall is None and progress is None:
+        return proc.wait(timeout=timeout_s if deadline is None else max(0.0, end - time.monotonic()))
     kill = kill or common.kill_tree
-    deadline = time.monotonic() + timeout_s
+    deadline = end
     while True:
+        if progress:
+            progress()
         left = deadline - time.monotonic()
         if left <= 0:
             raise subprocess.TimeoutExpired(getattr(proc, 'args', None), timeout_s)
         chunk, began = min(poll_s, left), time.monotonic()
         try:
-            return proc.wait(timeout=chunk)
+            rc = proc.wait(timeout=chunk)
+            if progress:
+                progress()
+            return rc
         except subprocess.TimeoutExpired:
             if time.monotonic() - began < chunk / 2:
                 raise  # it gave up long before its time: it cannot be waited on in slices, so this is its deadline
-        if stall.check():
+        if stall is not None and stall.check():
             done = kill(proc.pid, child_created) if child_created is not None else kill(proc.pid)
             # The root exiting proves nothing about its children: only the kill's own report does.
             stall.kill_confirmed = done is True

@@ -42,6 +42,9 @@ def usable(engine: str, section: dict | None, policy: dict, urgent: bool) -> boo
     sec = section or {}
     if engine == 'claude' and claude_billing_hold(sec, policy):
         return False
+    if engine == 'codex' and sec.get('source') == 'last-good':
+        # Urgency never permits a cached reading at the stop line, or extends its original lifetime.
+        return sec.get('status') in USABLE and meter_mod.finish_codex(sec, policy)['status'] in USABLE
     status = sec.get('status', 'unknown')
     if status in USABLE:
         return True
