@@ -1827,10 +1827,10 @@ UNREAD_RE = re.compile(
     r"(?:(?:could not|couldn't|cannot|can't|can not|unable to|was unable to|failed to|did not manage to) "
     r"(?:read|access|open|inspect|see)"
     r"(?: (?:any|all|the|your|this))?(?: (?:source|repo|repository|workspace|checkout|code|project))?"
-    r" (?:repo|repository|workspace|checkout|code|project|files?)"
+    r" (?:repository|repo|workspace|checkout|codebase|code|project|files?)\b(?!'s\b)"
     r"|(?:shell|shell calls?|shell commands?|commands?) (?:is |are |was |were )?(?:unavailable|not available|hung|hanging|timed out)"
     r"|no shell (?:access|available))")
-UNREAD_VERDICT_RE = re.compile(r"^[\s*_#>\-]*(?:pass|block|fail|approve|reject)\b", re.I)
+UNREAD_VERDICT_RE = re.compile(r"^[\s*_#>\-]*(?:pass|block|fail|approve|reject)\b", re.I | re.M)
 UNREAD_QUOTED_RE = re.compile(
     '"[^"]*"' + '|`[^`]*`'
     + '|' + chr(0x201c) + '[^' + chr(0x201d) + ']*' + chr(0x201d)
@@ -1841,15 +1841,17 @@ UNREAD_HEAD_CHARS, UNREAD_MAX_CHARS = 600, 1500
 def _final_says_unread(text) -> bool:
     """True for a short final message that opens by saying the repository or files could not be read.
 
-    A message that opens with a verdict word (PASS, BLOCK, ...) is a result, and a phrase inside quotation marks or
-    backticks is being quoted, not reported; quoted spans are removed before matching."""
+    A message with a verdict word (PASS, BLOCK, ...) at the start of any line is a result, a phrase inside quotation
+    marks or backticks is being quoted, not reported, and a caveat about one part ("the repository's README") is not
+    the whole repository; quoted spans are removed from the whole text before the head window is cut."""
     if not isinstance(text, str) or len(text.strip()) >= UNREAD_MAX_CHARS:
         return False
-    body = text.strip()
-    if UNREAD_VERDICT_RE.match(body):
+    body = text.strip().replace(chr(0x2019), "'").replace(chr(0x2018), "'")
+    body = UNREAD_QUOTED_RE.sub(' ', body)
+    if UNREAD_VERDICT_RE.search(body):
         return False
-    head = ' '.join(body[:UNREAD_HEAD_CHARS].lower().split()).replace(chr(0x2019), "'").replace(chr(0x2018), "'")
-    return UNREAD_RE.search(UNREAD_QUOTED_RE.sub(' ', head)) is not None
+    head = ' '.join(body[:UNREAD_HEAD_CHARS].lower().split())
+    return UNREAD_RE.search(head) is not None
 
 
 # ---------------------------------------------------------------- failover
