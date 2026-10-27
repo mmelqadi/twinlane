@@ -12,6 +12,7 @@ import unittest
 from unittest import mock
 
 import test_support  # noqa: F401; isolate before importing runtime modules
+import twinlane
 from twinlane import baton, board, capacity, cli, common, guard, inbox, jobs, meter, observations, projects, sessions, watch, wip
 
 
@@ -406,7 +407,7 @@ class Papercuts(Fixture):
                     mock.patch.object(common, 'ensure_dirs', side_effect=AssertionError('write')), \
                     contextlib.redirect_stdout(io.StringIO()) as out:
                 self.assertEqual(cli.main(['--version']), 0)
-            self.assertEqual(out.getvalue(), 'twinlane 0.3.0.dev0' + suffix + '\n')
+            self.assertEqual(out.getvalue(), 'twinlane ' + twinlane.__version__ + suffix + '\n')
 
     def test_finished_job_status_and_unknown(self):
         self.spec(owner=None)
