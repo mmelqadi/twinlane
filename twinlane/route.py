@@ -108,6 +108,8 @@ def _earliest(*times) -> str | None:
 
 
 def _chosen(engine: str, kind: str, policy: dict, sec: dict, reason: str, fallback_used: bool) -> dict:
+    if (sec or {}).get('stale_ok'):
+        reason += f'; meter stale-ok (age {int(sec["stale_ok_age_s"]) // 60}m)'
     out = {'engine': engine, **_assignment(engine, kind, policy), 'reason': reason, 'wait_until': None,
            'fallback_used': fallback_used, 'refused': False, 'advice': None, 'blockers': []}
     if (sec or {}).get('status') == 'handoff':
@@ -193,7 +195,7 @@ def cli(argv) -> int:
               file=sys.stderr)
         return common.EXIT_USAGE
     # A forced Codex route never needs Claude, so it never spends the automatic token refresh.
-    m = meter_mod.read(fresh=a.fresh, policy=policy, auto_refresh=a.engine != 'codex')
+    m = meter_mod.read(fresh=a.fresh, policy=policy, auto_refresh=a.engine != 'codex', admission=True)
     d = decide(a.kind, m, policy, urgent=a.urgent, engine=a.engine)
     notice = meter_mod.refresh_notice(m)
     out = {'kind': a.kind, **d}

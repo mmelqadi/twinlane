@@ -208,7 +208,7 @@ def _routes(meter, policy: dict) -> dict:
 
 
 def collect_meters(policy: dict, now) -> dict:
-    raw = common.read_json(os.path.join(common.STATE, 'meter.json'))
+    raw = meter_mod.latest_observation(policy)
     if not isinstance(raw, dict) or not any(isinstance(raw.get(e), dict) for e in ENGINES):
         return {'cached': False, 'read_at': None, 'age_s': None, 'claude': None, 'codex': None, 'routes': {}}
     views = {e: _engine_view(e, raw.get(e), policy, now) for e in ENGINES}
@@ -406,7 +406,7 @@ def _mtime_ns(path: str) -> int:
         return 0
 
 
-def _baton_row(slug: str, raw, policy=None, session_rows=None) -> dict:
+def _baton_row(slug: str, raw, policy=None, session_rows=None, file_only=False) -> dict:
     from . import baton
     row = {'slug': slug, 'owner': None, 'age': '?', 'age_s': None, 'updated_at': None, 'next_action': None,
            'in_flight': [], 'approvals_pending': [], 'root': None, 'worktree': None, 'problems': []}
@@ -478,7 +478,8 @@ def _baton_row(slug: str, raw, policy=None, session_rows=None) -> dict:
     if not bad:
         row['stored_state'] = raw.get('state', 'active')
         from . import lanes
-        row['state'] = lanes.effective_state(raw, policy=policy, session_rows=session_rows)
+        row['state'] = raw.get('state', 'active') if file_only else lanes.effective_state(
+            raw, policy=policy, session_rows=session_rows)
         from . import inbox
         row['inbox'] = inbox.items([dict(raw, slug=slug)], policy=policy, session_rows=session_rows)
     else:
@@ -487,17 +488,26 @@ def _baton_row(slug: str, raw, policy=None, session_rows=None) -> dict:
 
 
 @observations.command
-def collect_batons(policy=None, session_rows=None) -> list[dict]:
+def collect_batons(policy=None, session_rows=None, file_only=False) -> list[dict]:
     """Read every baton file directly (not through baton.list_batons) so one damaged file becomes a row with
     `problems` instead of an exception."""
     from . import baton
     rows = []
-    for path in glob.glob(os.path.join(common.BATONS, '*.json')):
+    if file_only:
+        # glob suppresses scandir failures: patrol must distinguish denied from empty.
+        try:
+            names = os.listdir(common.BATONS)
+        except FileNotFoundError:
+            names = []
+        paths = [os.path.join(common.BATONS, n) for n in names if n.endswith('.json')]
+    else:
+        paths = glob.glob(os.path.join(common.BATONS, '*.json'))
+    for path in paths:
         slug = os.path.basename(path)[: -len('.json')]
         if not baton.valid_slug(slug):
             continue
         try:
-            row = _baton_row(slug, common.read_json(path), policy, session_rows)
+            row = _baton_row(slug, common.read_json(path), policy, session_rows, file_only=file_only)
         except Exception:  # noqa: BLE001
             row = dict(_baton_row(slug, None), problems=['unreadable'])
         row['_mtime'] = _mtime_ns(path)
@@ -683,11 +693,31 @@ def build_attention(meters: dict, jobs_data: dict, batons: list[dict], show_all:
 # ---------------------------------------------------------------- collect
 
 @observations.command
-def collect(show_all: bool = False, finished_n: int = FINISHED_DEFAULT, now=None, policy: dict | None = None) -> dict:
+def collect(show_all: bool = False, finished_n: int = FINISHED_DEFAULT, now=None, policy: dict | None = None,
+            file_only: bool = False) -> dict:
+    if file_only:
+        with common.nonspawning_liveness():
+            return _collect(show_all, finished_n, now, policy, file_only=True)
+    return _collect(show_all, finished_n, now, policy)
+
+
+def _collect(show_all, finished_n, now, policy, file_only=False):
     now = now or common.now()
     policy = policy or common.load_policy()
     meters = collect_meters(policy, now)
     jobs_data = collect_jobs(now, show_all, finished_n)
+    if file_only:  # patrol: no transcript scan, claims provider, host sampling or git probes
+        batons = collect_batons(policy, [], file_only=True)
+        signals = build_signals(meters, jobs_data, batons, show_all)
+        attention = build_attention(meters, jobs_data, batons, show_all)
+        finished = jobs_data.pop('_all_finished')
+        jobs_data['finished'] = []
+        for row in finished:
+            age = row.get('ended_age_s') if row.get('ended_age_s') is not None else row.get('age_s')
+            if age is not None and age <= ATTENTION_WINDOW_S:
+                jobs_data['finished'].append(row)
+        return _scrub({'meters': meters, 'jobs': jobs_data, 'batons': batons,
+                       'signals': signals, 'attention': attention})
     from . import sessions
     session_error = None
     try:

@@ -14,6 +14,7 @@ import os
 import secrets
 import shlex
 import subprocess
+import time
 from contextlib import contextmanager
 
 from . import common, observations
@@ -42,8 +43,8 @@ def queue():
     return data['queue']
 
 
-def save_queue(rows):
-    common.write_json(queue_path(), {'version': 1, 'queue': rows})
+def save_queue(rows, deadline=None):
+    common.write_json(queue_path(), {'version': 1, 'queue': rows}, deadline=deadline)
 
 
 CLAIMS_MAX_BYTES = 1 << 20  # provider stdout cap; claims for a handful of worktrees are tiny
@@ -370,7 +371,7 @@ def _spawn(row):
                                     cwd=row.get('cwd') or None, env=env, log_path=log)
 
 
-def pump(policy=None, dry_run=False, busy=None, spawn=None, reading=None):
+def pump(policy=None, dry_run=False, busy=None, spawn=None, reading=None, deadline=None):
     """Launch the next queued writer request when a lane is free and the host can take it.
 
     FIFO, reviews first. Returns {'launched': [...], 'skipped': [...], 'note': str}. The request is claimed
@@ -389,7 +390,7 @@ def pump(policy=None, dry_run=False, busy=None, spawn=None, reading=None):
         raise WipError('wip.max_writers must be a positive integer')
     reading = hostload.sample(policy) if reading is None else reading
     usable, host_why = hostload.effective_parallel(maximum, reading, policy)
-    with lock():
+    with lock(30 if deadline is None else max(0, deadline - time.monotonic())):
         pending = queue()
         if not pending:
             out['note'] = 'queue empty'
@@ -418,39 +419,48 @@ def pump(policy=None, dry_run=False, busy=None, spawn=None, reading=None):
         for i in chosen:  # claimed, not removed: a pump that dies from here on leaves the request in the queue
             pending[i]['pumping_at'] = stamp
             pending[i]['claim'] = secrets.token_hex(8)
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError('pump budget exhausted')
         if chosen:
-            save_queue(pending)
+            save_queue(pending, deadline=deadline)
         rows = [pending[i] for i in chosen]
     for row in rows:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError('pump budget exhausted; claimed requests need inspection')
         try:
             (spawn or _spawn)(row)
             out['launched'].append({'id': row.get('id'), 'argv': row['argv'], 'launched': True})
             _settle(row, stamp, started=True)
         except Exception as e:  # noqa: BLE001 - a request that failed to start stays queued, never lost
-            _settle(row, stamp, started=False)
+            if deadline is None:
+                _settle(row, stamp, started=False)
+            else:
+                _settle(row, stamp, started=False, deadline=deadline)
             out['skipped'].append({'id': row.get('id'), 'why': f'could not start: {type(e).__name__}'})
     return out
 
 
-def _settle(row, stamp, started):
+def _settle(row, stamp, started, deadline=None):
     """After the spawn. A started run keeps its claim: the request leaves the queue only when that run is admitted
     (`check` removes it), so a child that dies at once, or is ended with a job object it was born into, leaves a
     claimed request for a person instead of nothing. A run that did not start gives the claim back."""
     if started:
         return
-    with lock():
+    if deadline is not None and time.monotonic() >= deadline:
+        return
+    with lock(30 if deadline is None else max(0, deadline - time.monotonic())):
         rows = queue()
         for r in rows:
             if r.get('id') == row.get('id') and r.get('pumping_at') == stamp and r.get('claim') == row.get('claim'):
                 r.pop('pumping_at', None)
                 r.pop('claim', None)
-        save_queue(rows)
+        save_queue(rows, deadline=deadline)
 
 
-def pump_quietly(policy=None):
+def pump_quietly(policy=None, deadline=None):
     """The end-of-job hook: never raises, never blocks a runner for long."""
     try:
-        return pump(policy)
+        return pump(policy) if deadline is None else pump(policy, deadline=deadline)
     except Exception:  # noqa: BLE001 - a failed pump leaves the queue as it was
         return None
 

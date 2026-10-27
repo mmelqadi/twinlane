@@ -121,6 +121,141 @@ class HostLoad(unittest.TestCase):
         self.assertIn('slots 14/14', hostload.line(LOW, 14))
 
 
+class CpuAverage(unittest.TestCase):
+    """The CPU figure is an average over cpu_window_s of cumulative counters, not one 0.25 s window."""
+
+    def setUp(self):
+        self.path = hostload._hist_path()
+        self.addCleanup(lambda: os.path.exists(self.path) and os.remove(self.path))
+        if os.path.exists(self.path):
+            os.remove(self.path)
+        patcher = mock.patch.object(hostload.time, 'sleep')
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def history(self, points):
+        common.write_json(self.path, [list(p) for p in points])
+
+    @staticmethod
+    def steady(busy_pct, seconds, per_s=100):
+        """(t, idle, total) counters for a host that stayed `busy_pct` busy for `seconds`."""
+        return (seconds, int(seconds * per_s * (100 - busy_pct) / 100), seconds * per_s)
+
+    def test_a_spike_on_a_35_percent_host_reads_about_35_and_does_not_throttle(self):
+        # 19 s at 35% busy, then one second at 91%: the last window alone says 91, the 20 s average says ~38
+        t19 = self.steady(35, 19)
+        self.history([self.steady(35, 0), self.steady(35, 10), t19])
+        idle_now, total_now = t19[1] + 9, t19[2] + 100
+        pct = hostload._cpu_pct(lambda: (idle_now, total_now), 20, 20.0)
+        self.assertAlmostEqual(pct, 37.8, places=1)
+        self.assertEqual(hostload.effective_parallel(14, busy(cpu=pct)), (14, None))
+        self.assertLess(hostload.effective_parallel(14, busy(cpu=91))[0], 14)  # the single window did throttle
+
+    def test_a_sustained_overload_still_reads_high_and_still_throttles(self):
+        t19 = self.steady(97, 19)
+        self.history([self.steady(97, 0), self.steady(97, 10), t19])
+        pct = hostload._cpu_pct(lambda: (t19[1] + 3, t19[2] + 100), 20, 20.0)
+        self.assertAlmostEqual(pct, 97.0, places=1)
+        usable, why = hostload.effective_parallel(14, busy(cpu=pct))
+        self.assertLess(usable, 14)
+        self.assertIn('host busy: cpu 97%', why)
+
+    def test_less_than_a_window_of_history_uses_the_longest_span_but_at_least_five_seconds(self):
+        self.history([self.steady(30, 0)])
+        pct = hostload._cpu_pct(lambda: (70 * 8, 100 * 8), 20, 8.0)
+        self.assertAlmostEqual(pct, 30.0, places=1)
+
+    def _cold(self, pcts):
+        """A times() whose first call is the 'current' point, then pairs of counters whose busy share is pcts."""
+        seq = [(0, 0)]
+        idle = total = 0
+        for pct in pcts:
+            seq.append((idle, total))
+            idle, total = idle + (100 - pct), total + 100
+            seq.append((idle, total))
+        calls = iter(seq)
+        return lambda: next(calls)
+
+    def test_cold_start_takes_the_lowest_of_three_short_samples(self):
+        self.assertEqual(hostload._cpu_pct(self._cold([95, 40, 95]), 20, 100.0), 40.0)
+        self.assertEqual(hostload._cpu_pct(self._cold([95, 95, 95]), 20, 100.0), 95.0)
+
+    def test_a_span_under_five_seconds_is_still_a_cold_start(self):
+        self.history([self.steady(10, 0)])
+        self.assertEqual(hostload._cpu_pct(self._cold([95, 40, 95]), 20, 3.0), 40.0)
+
+    def test_backwards_counters_and_old_history_are_discarded(self):
+        self.history([(0, 5000, 10000), (10, 5100, 10100)])  # the next reading is below these: a reboot
+        self.assertEqual(hostload._cpu_pct(self._cold([60, 60, 70]), 20, 20.0), 60.0)
+        stored = common.read_json(self.path, None)
+        self.assertEqual([p[0] for p in stored], [20.0])  # only the new point survives
+        self.history([self.steady(10, 0), self.steady(10, 10)])  # newest point is over five minutes old
+        self.assertEqual(hostload._cpu_pct(self._cold([80, 80, 80]), 20, 1000.0), 80.0)
+        common.write_json(self.path, [['x'], 5, [1, 2, float('nan')], 'junk'])
+        self.assertEqual(hostload._cpu_pct(self._cold([50, 50, 50]), 20, 1000.0), 50.0)
+
+    def test_the_history_is_pruned_and_capped(self):
+        points = [self.steady(35, n) for n in range(0, 60)]
+        self.history(points)
+        hostload._cpu_pct(lambda: (65 * 61, 100 * 61), 20, 61.0)
+        stored = common.read_json(self.path, None)
+        self.assertLessEqual(len(stored), hostload.CPU_HIST_MAX)
+        self.assertGreaterEqual(min(p[0] for p in stored), 61 - 20 - 40)
+
+    def test_the_history_never_reaches_the_reading_or_the_board_line(self):
+        def fake_times():
+            return 65, 100
+
+        with mock.patch.object(hostload.common, 'IS_WIN', True),                 mock.patch.object(hostload, '_win_times', fake_times),                 mock.patch.object(hostload, '_win_free_mb', lambda: 4000),                 mock.patch.object(hostload, '_win_engine_procs', lambda: 2):
+            reading = hostload.measure(20, 50.0)
+        self.assertEqual(set(reading), {'cpu_pct', 'ram_free_mb', 'engine_procs', 'heap'})
+        self.assertNotIn('hist', hostload.line(reading, 14))
+        self.assertTrue(os.path.exists(self.path))  # kept in its own file, away from hostload.json
+
+    def test_a_gap_in_the_history_never_hides_a_load_inside_the_window(self):
+        # idle for 39 s, then 100% busy for the last 20 s; the only stored point is 59 s old
+        self.history([(0.0, 0, 0)])
+        idle_now, total_now = 3900, 5900
+        calls = iter([(idle_now, total_now)] + [(idle_now, total_now + 100 * k) for k in range(1, 20)])
+        pct = hostload._cpu_pct(lambda: next(calls), 20, 59.0)
+        self.assertGreaterEqual(pct, 99.0)  # not the ~34% a 59 s average would read
+
+    def test_a_long_window_survives_many_runners_sampling_every_second(self):
+        # 17% busy for 100 s, then 20 s at 100%; a 120 s window must read about 33%, not the last 20 s (100%)
+        def counters(t):
+            idle_s = min(t, 100) * 83
+            return idle_s, t * 100
+
+        pct = None
+        for t in range(1, 121):
+            pct = hostload._cpu_pct(lambda: counters(t), 120, float(t))
+        self.assertIsNotNone(pct)
+        self.assertLess(pct, 40.0)
+        self.assertLessEqual(len(common.read_json(self.path, None)), hostload.CPU_HIST_MAX)
+
+    def test_an_absurd_number_in_the_history_degrades_to_a_cold_start(self):
+        common.write_json(self.path, [[0, 1, 2]])
+        with open(self.path, 'w', encoding='utf-8') as handle:
+            handle.write('[[0, 1' + '0' * 400 + ', 5], [1, 2, 3]]')  # a valid JSON integer far beyond a float
+        ticks = iter(range(0, 10000, 50))
+
+        def fake_times():
+            n = next(ticks)
+            return n * 40, n * 100
+
+        with mock.patch.object(hostload.common, 'IS_WIN', True), mock.patch.object(hostload, '_win_times', fake_times),                 mock.patch.object(hostload, '_win_free_mb', lambda: 4000),                 mock.patch.object(hostload, '_win_engine_procs', lambda: 2):
+            reading = hostload.measure(20, 100.0)
+        self.assertIn('cpu_pct', reading)
+        self.assertIsNotNone(reading['cpu_pct'])
+
+    def test_cpu_window_setting_is_clamped_and_validated(self):
+        self.assertEqual(hostload.settings(None)['cpu_window_s'], 20)
+        self.assertEqual(hostload.settings({'hostload': {'cpu_window_s': 1}})['cpu_window_s'], 5)
+        self.assertEqual(hostload.settings({'hostload': {'cpu_window_s': 900}})['cpu_window_s'], 120)
+        self.assertEqual(hostload.settings({'hostload': {'cpu_window_s': 'x'}})['cpu_window_s'], 20)
+        self.assertEqual(hostload.settings({'hostload': {'cpu_window_s': float('inf')}})['cpu_window_s'], 20)
+
+
 class Clock:
     def __init__(self):
         self.t = 0.0

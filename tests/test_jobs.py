@@ -3222,15 +3222,16 @@ class UsageReceipts(JobsBase):
     def test_the_after_reading_is_re_read_once_when_it_predates_the_end_and_never_by_a_model(self):
         seen = []
 
-        def fake_meter(policy, fresh=False, auto_refresh=True):
-            seen.append((fresh, auto_refresh))
+        def fake_meter(policy, fresh=False, auto_refresh=True, admission=True):
+            seen.append((fresh, auto_refresh, admission))
             return usage_meter(at=-300) if not fresh else usage_meter(claude=(12.0, 40.0))
 
         spec = {'meter_before': usage_meter(at=-400), 'cwd': self.work}
         attempts = [{'engine': 'claude', 'argv': ['x'], 'started_at': common.iso(common.now())}]
         with mock.patch.object(jobs, '_meter', fake_meter):
             usage, after = jobs._job_usage('x', spec, attempts, {}, common.now(), None, quick=False)
-        self.assertEqual(seen, [(False, False), (True, False)])  # never an auto (model) refresh
+        # never an auto (model) refresh, and the usage receipt never takes the stale-ok admission substitute
+        self.assertEqual(seen, [(False, False, False), (True, False, False)])
         self.assertEqual(after['claude']['windows'][0]['pct'], 12.0)
         self.assertEqual(usage['claude']['delta']['five_hour'], 2.0)
 
@@ -3277,7 +3278,7 @@ class UsageReceipts(JobsBase):
     def test_bounded_after_meter_returns_at_the_deadline_with_a_daemon_thread(self):
         release = threading.Event()
         try:
-            with mock.patch.object(jobs, '_meter', lambda policy, fresh=False, auto_refresh=True: release.wait(30)):
+            with mock.patch.object(jobs, '_meter', lambda policy, fresh=False, auto_refresh=True, admission=True: release.wait(30)):
                 t0 = time.monotonic()
                 m, timed_out = jobs._bounded_after_meter({}, 0.2)
             self.assertTrue(timed_out)
@@ -3818,7 +3819,7 @@ class AutoRefreshPlanning(JobsBase):
         m['claude'].update(status='unknown', max_pct=None, windows=[],
                            token_expired_at=common.iso(common.now() - dt.timedelta(minutes=5)))
         # The refresh is a model call: it runs only when the last recorded reading shows extra usage OFF.
-        with mock.patch.object(jobs, '_meter', lambda policy, fresh=False, auto_refresh=True: m), \
+        with mock.patch.object(jobs, '_meter', lambda policy, fresh=False, auto_refresh=True, admission=True: m), \
                 mock.patch('twinlane.meter.refresh_blocker', return_value=None):
             rc, out, err = self.cli('run', '--brief', self.brief, '--cd', self.work, '--dry-run', '--json')
         self.assertEqual(rc, 0, out + err)
@@ -3833,7 +3834,7 @@ class AutoRefreshPlanning(JobsBase):
         m['claude'].update(status='unknown', max_pct=None, windows=[],
                            token_expired_at=common.iso(common.now() - dt.timedelta(minutes=5)))
         # The refresh is a model call: it runs only when the last recorded reading shows extra usage OFF.
-        with mock.patch.object(jobs, '_meter', lambda policy, fresh=False, auto_refresh=True: m),                 mock.patch('twinlane.meter.refresh_blocker', return_value=None):
+        with mock.patch.object(jobs, '_meter', lambda policy, fresh=False, auto_refresh=True, admission=True: m),                 mock.patch('twinlane.meter.refresh_blocker', return_value=None):
             rc, out, err = self.cli('run', '--brief', self.brief, '--cd', self.work, '--dry-run', '--json')
         self.assertEqual(rc, 0, out + err)
         text = json.dumps(json.loads(out))

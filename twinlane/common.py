@@ -10,6 +10,7 @@ import locale
 import hashlib
 import json
 import math
+import random
 import os
 import re
 import shutil
@@ -216,25 +217,58 @@ def write_text(path: str, text: str, *, create_parent=True) -> None:
     _atomic_write(path, lambda h: h.write(text), create_parent=create_parent)
 
 
+class LockWaitTimeout(TimeoutError):
+    """An explicitly extended lock wait exhausted its overall budget."""
+
+
 @contextmanager
-def file_lock(path: str, timeout_s: float = 120, poll_s: float = 0.05, *, create_parent=True):
+def file_lock(path: str, timeout_s: float = 120, poll_s: float = 0.05, *, create_parent=True,
+              wait_until=None, on_wait=None):
     """Exclusive OS lock on one byte of `path` (LockFileEx / flock).
 
     The OS drops the lock when its holder dies, so there is no staleness guess and no
     check-then-remove race. The lock file itself stays in place. `create_parent=False`
-    requires an existing parent, for in-folder lifecycle locks during archival."""
+    requires an existing parent, for in-folder lifecycle locks during archival. Job admission
+    may supply an absolute monotonic `wait_until`: jittered backoff, an `on_wait` callback,
+    and best-effort holder diagnostics then replace the ordinary short timeout."""
     if create_parent:
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
     try:
-        deadline = time.monotonic() + timeout_s
+        started = time.monotonic()
+        deadline = started + timeout_s if wait_until is None else wait_until
+        delay = poll_s
         while not _try_lock_fd(fd):
+            if on_wait is not None:
+                on_wait()
             if time.monotonic() > deadline:
+                if wait_until is not None:
+                    owner = read_json(path + '.owner.json', {}) or {}
+                    detail = ''
+                    if isinstance(owner, dict) and type(owner.get('pid')) is int:
+                        age = age_s(owner.get('at'))
+                        detail = f"; last observed holder pid {owner['pid']}"
+                        if age is not None:
+                            detail += f', age {max(0, age):.1f}s'
+                    raise LockWaitTimeout(f'lock stayed busy for {(time.monotonic() - started) / 60:.3f} '
+                                          f'minutes: {path}{detail}')
                 raise TimeoutError(f'lock busy: {path}')
-            time.sleep(poll_s)
+            time.sleep(poll_s if wait_until is None else
+                       min(max(0, deadline - time.monotonic()), random.uniform(0.5, 1.5) * delay))
+            delay = min(1.0, delay * 1.6)
+        if wait_until is not None:
+            try:
+                write_json(path + '.owner.json', {'pid': os.getpid(), 'at': iso(now())})
+            except OSError:
+                pass  # diagnostics only; never authority to reclaim a lock
         try:
             yield
         finally:
+            if wait_until is not None:
+                try:
+                    os.remove(path + '.owner.json')
+                except OSError:
+                    pass
             _unlock_fd(fd)
     finally:
         os.close(fd)
@@ -1727,6 +1761,19 @@ def _win_process_info(pid: int, k32=None) -> tuple[bool | None, int | None]:
     return obs['exists'], obs['created']
 
 
+_NO_SPAWN_LIVENESS = ContextVar('twinlane_no_spawn_liveness', default=False)
+
+
+@contextmanager
+def nonspawning_liveness():
+    """Observe identities without ps; unreadable identities remain UNKNOWN. Local to this context."""
+    token = _NO_SPAWN_LIVENESS.set(True)
+    try:
+        yield
+    finally:
+        _NO_SPAWN_LIVENESS.reset(token)
+
+
 def _posix_zombie(pid: int) -> bool:
     """True when the pid is a zombie: killed or exited and only waiting for its parent to reap it."""
     try:
@@ -1734,7 +1781,7 @@ def _posix_zombie(pid: int) -> bool:
             return h.read().rsplit(')', 1)[1].split()[0] == 'Z'
     except (OSError, IndexError):
         pass
-    if sys.platform != 'darwin':
+    if sys.platform != 'darwin' or _NO_SPAWN_LIVENESS.get():
         return False
     try:
         result = subprocess.run(['ps', '-o', 'stat=', '-p', str(pid)], capture_output=True, text=True, timeout=3)
@@ -1749,7 +1796,7 @@ def _posix_start_time(pid: int) -> int | None:
             return int(h.read().rsplit(')', 1)[1].split()[19])
     except (OSError, IndexError, ValueError):
         pass
-    if sys.platform != 'darwin':
+    if sys.platform != 'darwin' or _NO_SPAWN_LIVENESS.get():
         return None
     try:
         result = subprocess.run(['ps', '-o', 'lstart=', '-p', str(pid)], capture_output=True,
@@ -1790,14 +1837,18 @@ def process_created(pid) -> int | None:
 ALIVE, DEAD, UNKNOWN = 'alive', 'dead', 'unknown'
 
 
-def pid_state(pid, created=None) -> str:
+def pid_state(pid, created=None, *, spawn=True) -> str:
     """ALIVE, DEAD or UNKNOWN for a pid. With `created`, ALIVE means it is that same process (not a reused
     pid) and a readable creation time that differs is DEAD. On Windows a process this token cannot open still
     has its creation time read from a process snapshot, so a pid recycled by a SYSTEM service reads DEAD.
     UNKNOWN is a process that exists but whose creation time cannot be read by either route, or a pid whose
     existence the OS probe could not establish (with or without a stamp): it is neither provably ours nor
     provably gone, so callers must not call it dead and must not kill it. NEVER uses os.kill on Windows
-    (signal 0 would TerminateProcess)."""
+    (signal 0 would TerminateProcess). With spawn=False, POSIX never falls back to ps;
+    a live pid with an unreadable recorded identity returns UNKNOWN."""
+    if not spawn:
+        with nonspawning_liveness():
+            return pid_state(pid, created)
     try:
         pid = int(pid)
     except (TypeError, ValueError):

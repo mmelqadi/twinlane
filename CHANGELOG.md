@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+- Job admission waits on lock contention instead of failing: a runner that cannot take `slots.lock` or `writers.lock` keeps waiting with jittered backoff, shows `waiting for slot lock` (or writer lock) in `status.json`, and fails only after `jobs.lock_wait_s` (default 30 minutes) with the last observed holder. Process liveness is probed outside `slots.lock`, and every admission file is re-read under it, so the critical section stays short and the slot cap is still exact. One `jobs.lock_wait_s` bound covers a whole streak of lock waits and restarted scans; after three restarted scans in a row the next attempt probes inside the lock, so the oldest job always decides; `release_stale_writers` (a lead command) still fails after 30 s.
+
+- Retry transient Codex app-server meter failures once with a 30 s timeout. Dispatch can use a labelled stale-ok reading younger than 30 minutes (or the lower configured bound), only below handoff with known percentages, future resets and no paid credits. Preserve the genuine cache and its original timestamp; explicit meter/board output keeps the actual failure visible. Claude does not receive this fallback.
+- Patrol completeness: unreadable job receipts and baton directories cannot resolve open custody
+  or human-wait findings. Strict patrol inputs also cover meters, queue/brief stats, owner notices,
+  job markers/identity/output stats and policy loading. Missing/stale/unusable host evidence emits
+  an error; dependent findings remain stale and cannot authorize fixes. Unreadable previous state
+  freezes writes/fixes for recovery. LIMITS documents every reader and its failure behavior; a
+  parametrized evidence-failure matrix checks that no prior finding gains a false resolved event.
+  Runtime queue waits retain board/queue dependencies; legacy absolute briefs are strictly statted
+  without cwd; missing or malformed meter read_at/reading_at timestamps keep findings stale and
+  prevent pumping. The reader table and matrix cover every finding-source dependency.
+
+- `patrol`: bounded file-only checks of queued and running work, stale/unresolved custody, human waits
+  and sustained host load. Optional `--fix` only pumps ready requests and releases proven stale writers;
+  deduplicated reports, hourly reminders, JSON, bounded event history and repeat mode.
+  Host reading is cache-only; missing, stale (over five minutes) or unusable counters mean `unknown`
+  and preserve overload evidence as stale. `queue_ready` defers writer capacity to the pump;
+  `queue_claimed` never replays a reservation and asks for inspection after ten minutes. With `--fix`,
+  pump refusals become `queue_waiting` until evidence changes; `queue_stalled` requires a launch.
+  Stable condition keys keep changing load measurements in `detail` without reopening findings or
+  resetting hourly reminders. Quiet jobs respect `watchdog.enabled` and offer inspection when it is off.
+
+- Patrol review fixes: non-spawning liveness for live jobs and the file-only board (unknown
+  identities retain slots); stable runtime/pump wait categories keep changing measurements in
+  `detail` and preserve reminders; lock-free custody snapshots report incomplete folder/claim reads
+  as `patrol_error`, retaining earlier custody warnings as stale instead of resolving them.
+
 - Overload handling: host-load admission (the usable slots per engine fall with CPU, free RAM and live Codex
   process count and recover as load clears; a job waits with a reason such as `host busy: cpu 97%`, never refused),
   first-in-first-out slot order with reviews first, a hung-worker watchdog (kill the tree, requeue once, then fail
@@ -10,6 +38,7 @@
   A stall kill that is not confirmed is never retried and holds the worktree claim (`tree-unresolved.json`) until
   `twinlane stop JOB --tree-gone`; a job runs at most twice; a pumped request stays claimed until its run is admitted.
 
+- Host-load CPU is an average over `hostload.cpu_window_s` (default 20 s, 5..120) of a rolling counter history, not one 0.25 s window: spikes no longer read as "host busy: cpu 91%" while real use is about 35%, and a sustained overload still throttles. Cold start takes the lowest of three short samples.
 - Baton `waiting_on` dependencies and stable `waiting_since`, ranked board waits and idle counts.
 - `run --owner` completion history and inbox collection notices; file-only `watch` with independent,
   resumable cursors and cached usage/context crossings. Coordinating sessions re-arm after each wake.

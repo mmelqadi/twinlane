@@ -28,6 +28,8 @@ from . import common
 OAUTH_URL = 'https://api.anthropic.com/api/oauth/usage'
 OAUTH_TIMEOUT_S = 6
 APP_SERVER_TIMEOUT_S = 15
+APP_SERVER_RETRY_TIMEOUT_S = 30
+STALE_OK_CEILING_S = 1800  # no configuration can admit on a reading older than this
 ROLLOUT_FILES = 40
 STATUS_RANK = {'ok': 0, 'caution': 1, 'handoff': 2, 'stop': 3, 'out': 4}
 USABLE_STATUSES = ('ok', 'caution', 'handoff')
@@ -850,7 +852,7 @@ def _await_id(q: queue.Queue, want_id: int, deadline: float) -> dict:
     while True:
         left = deadline - time.monotonic()
         if left <= 0:
-            raise TimeoutError(f'no reply to request {want_id} within {APP_SERVER_TIMEOUT_S}s')
+            raise TimeoutError(f'no reply to request {want_id} before exchange deadline')
         try:
             line = q.get(timeout=left)
         except queue.Empty:
@@ -932,10 +934,16 @@ def app_server_exchange(argv: list[str], timeout: float = APP_SERVER_TIMEOUT_S) 
         _stop_process(proc)
 
 
+class _RetryableAppServerFailure(str):
+    """A timeout or closed output, kept distinct from deterministic exchange failures."""
+
+
 def _exchange_reading(argv: list[str], timeout: float) -> tuple[dict | None, str]:
     try:
         return parse_app_server(app_server_exchange(argv, timeout)), ''
-    except (OSError, TimeoutError, ConnectionError, RuntimeError, ValueError) as e:
+    except (TimeoutError, subprocess.TimeoutExpired, ConnectionError) as e:
+        return None, _RetryableAppServerFailure(f'app-server failed: {common.clip(str(e) or type(e).__name__, 160)}')
+    except (OSError, RuntimeError, ValueError) as e:
         return None, f'app-server failed: {common.clip(str(e) or type(e).__name__, 160)}'
 
 
@@ -955,7 +963,8 @@ def read_app_server(_argv=None, timeout: float = APP_SERVER_TIMEOUT_S) -> tuple[
             if reading:
                 reading['note'] = _join(reading.get('note'), f'codex CLI: {why}')
             else:
-                err = _join(err, f'codex CLI: {why}')
+                kind = _RetryableAppServerFailure if isinstance(err, _RetryableAppServerFailure) else str
+                err = kind(_join(err, f'codex CLI: {why}'))
         return reading, err
     except (OSError, ValueError) as e:
         return None, f'codex binary lookup failed: {common.clip(str(e) or type(e).__name__, 140)}'
@@ -1050,6 +1059,8 @@ def read_codex_raw(_argv=None, sessions_root=None, timeout: float = APP_SERVER_T
     """The app-server reading; when that fails, the newest local rollout reading unless rollout_fallback is off,
     in which case a failed exchange is source 'none' (status unknown) and no session file is opened."""
     reading, why = read_app_server(_argv, timeout)
+    if not reading and isinstance(why, _RetryableAppServerFailure):
+        reading, why = read_app_server(_argv, APP_SERVER_RETRY_TIMEOUT_S)
     if reading:
         return reading
     if not rollout_fallback:
@@ -1063,6 +1074,101 @@ def read_codex_raw(_argv=None, sessions_root=None, timeout: float = APP_SERVER_T
 
 # ---------------------------------------------------------------- read / cache
 
+def _failed_observation_path() -> str:
+    # Failed observations must not replace the genuine allowance cache.
+    return os.path.join(common.STATE, 'meter-codex-failure.json')
+
+
+def _observation_stamp(m) -> int:
+    if not isinstance(m, dict):
+        return -1
+    stamp = m.get('read_us')
+    return stamp if type(stamp) is int else (_us(m.get('read_at')) or -1)
+
+
+def _codex_unavailable(section) -> bool:
+    return (isinstance(section, dict) and section.get('status') == 'unknown'
+            and section.get('source') in ('none', 'unknown'))
+
+
+def _stale_ok_codex(policy: dict, now=None) -> dict | None:
+    """Revalidate genuine evidence, never a carry-forward. No timestamp or cache is refreshed."""
+    now = now or common.now()
+    cached = common.read_json(meter_path())
+    if not isinstance(cached, dict) or not isinstance(cached.get('claude'), dict):
+        return None
+    sec = cached.get('codex')
+    if not isinstance(sec, dict) or sec.get('source') not in ('app-server', 'rollout'):
+        return None
+    if sec.get('stale_ok') or sec.get('on_credits') or sec.get('status') not in ('ok', 'caution'):
+        return None
+    try:
+        maximum = (policy.get('meter') or {}).get('stale_ok_max_age_s', 1800)
+        existing = (policy.get('codex') or {}).get('stale_reading_max_age_s', 1800)
+        if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v <= 0
+               for v in (maximum, existing)):
+            return None
+        stamp = common.parse_time(sec.get('reading_at'))
+        if stamp is None:
+            return None
+        age = (now - stamp).total_seconds()
+        if age < 0 or age >= min(STALE_OK_CEILING_S, maximum, existing):
+            return None
+        pct = sec.get('max_pct')
+        if isinstance(pct, bool) or not isinstance(pct, (int, float)) or not math.isfinite(pct) or pct < 0:
+            return None
+        wins = sec.get('windows')
+        if not isinstance(wins, list) or not wins:
+            return None
+        for w in wins:
+            if not isinstance(w, dict) or w.get('rolled_over') or w.get('invalid_pct'):
+                return None
+            p = w.get('pct')
+            reset = common.parse_time(w.get('resets_at'))
+            if (isinstance(p, bool) or not isinstance(p, (int, float)) or not math.isfinite(p) or p < 0
+                    or reset is None or reset <= now):
+                return None
+        if pct != max(w['pct'] for w in wins):
+            return None
+        checked = finish_codex(sec, policy, now)
+        if checked['status'] not in ('ok', 'caution') or checked.get('on_credits'):
+            return None
+    except (TypeError, ValueError, OverflowError, AttributeError):
+        return None
+    checked.update(stale_ok=True, stale_ok_age_s=int(age))
+    checked['note'] = _join(f'meter stale-ok (age {int(age) // 60}m)', checked.get('note'))
+    return checked
+
+
+def _stale_ok_notice(m: dict, candidate: dict | None) -> dict:
+    if not candidate:
+        return m
+    sec = dict(m['codex'])
+    note = f'meter stale-ok (age {candidate["stale_ok_age_s"] // 60}m) available for dispatch; actual read failed'
+    sec['note'] = _join(note, sec.get('note'))
+    return dict(m, codex=sec)
+
+
+def latest_observation(policy=None) -> dict | None:
+    """Actual meter/board evidence; a stale-ok candidate is only a clearly labelled note."""
+    policy = policy or common.load_policy()
+    cached = common.read_json(meter_path())
+    failed = common.read_json(_failed_observation_path())
+    if (isinstance(failed, dict) and _codex_unavailable(failed.get('codex'))
+            and _observation_stamp(failed) >= _observation_stamp(cached)):
+        return _stale_ok_notice(failed, _stale_ok_codex(policy))
+    return cached if isinstance(cached, dict) else None
+
+
+def admission_meter(m: dict, policy: dict) -> dict:
+    """Only dispatch may substitute Codex evidence; Claude never receives this fallback."""
+    if _codex_unavailable(m.get('codex')):
+        candidate = _stale_ok_codex(policy)
+        if candidate:
+            return dict(m, codex=candidate)
+    return m
+
+
 def _safe(reader) -> dict:
     try:
         r = reader()
@@ -1072,13 +1178,15 @@ def _safe(reader) -> dict:
 
 
 def _cached_meter(policy: dict) -> dict | None:
-    m = common.read_json(meter_path())
+    m = latest_observation(policy)
     if not isinstance(m, dict) or not isinstance(m.get('claude'), dict) or not isinstance(m.get('codex'), dict):
         return None
     age = common.age_s(m.get('read_at'))
     if age is None or age > (policy.get('meter') or {}).get('cache_ttl_s', 120):
         return None
     for eng in ('claude', 'codex'):
+        if m[eng].get('stale_ok'):
+            return None
         a = common.age_s(m[eng].get('reading_at'))
         m[eng]['age_s'] = None if a is None else int(a)
     return m
@@ -1087,7 +1195,7 @@ def _cached_meter(policy: dict) -> dict | None:
 def cached_observation(policy=None):
     """Latest cached evidence, with freshness applied, and no probes or writes."""
     policy = policy or common.load_policy()
-    raw = common.read_json(meter_path(), {})
+    raw = latest_observation(policy)
     raw = raw if isinstance(raw, dict) else {}
     return dict(raw, claude=finish_claude(raw.get('claude') if isinstance(raw.get('claude'), dict) else {}, policy),
                 codex=finish_codex(raw.get('codex') if isinstance(raw.get('codex'), dict) else {}, policy))
@@ -1101,21 +1209,24 @@ def _cached_needs_refresh(cached: dict) -> bool:
 
 def read(fresh: bool = False, refresh_claude: bool = False, policy: dict | None = None,
          auto_refresh: bool = False, _claude_reader=None, _codex_reader=None, _run=None, _http=None,
-         rollout_fallback: bool | None = None) -> dict:
+         rollout_fallback: bool | None = None, admission: bool | None = None) -> dict:
     """Both meters. Uses state/meter.json when younger than the TTL unless fresh/refresh_claude.
 
     auto_refresh (route, run; never the hook or plain `twinlane meter`): when the Claude reading is
     unknown because the CLI token expired, spend ONE tiny Haiku call per expiry to renew it
     (policy.meter.auto_refresh_claude, default off). The result then carries `refreshed_now: ['claude']`.
 
-    rollout_fallback: None follows policy meter.codex_rollout_fallback; False never reads Codex rollout files."""
+    rollout_fallback: None follows policy meter.codex_rollout_fallback; False never reads Codex rollout files.
+    admission enables bounded Codex stale-ok evidence. By default it follows auto_refresh; dispatch callers
+    set it explicitly because forced Codex admission never needs Claude token renewal."""
     policy = policy or common.load_policy()
+    admission = auto_refresh if admission is None else admission
     started = common.now()  # the cache stamp is when this read began: no reading in it is older than that
     auto = auto_refresh and not refresh_claude and auto_refresh_enabled(policy)
     if not fresh and not refresh_claude:
         cached = _cached_meter(policy)
         if cached and not (auto and _cached_needs_refresh(cached)):
-            return cached
+            return admission_meter(cached, policy) if admission else cached
     if _claude_reader:
         claude_reader = _claude_reader
     elif auto:
@@ -1141,9 +1252,20 @@ def read(fresh: bool = False, refresh_claude: bool = False, policy: dict | None 
     now = common.now()
     m = {'read_at': common.iso(started), 'read_us': _us(started), 'claude': finish_claude(raw.get('claude'), policy, now),
          'codex': finish_codex(raw.get('codex'), policy, now)}
-    _cache_update(meter_path(), lambda cur: _merge_meter(cur, m))
+    if _codex_unavailable(m['codex']):
+        # Preserve meter.json byte-for-byte, including original read_at/reading_at.
+        # Explicit meter/board reads still see the actual failure from this sidecar.
+        _cache_update(_failed_observation_path(),
+                      lambda cur: m if _observation_stamp(m) >= _observation_stamp(cur) else None)
+    else:
+        _cache_update(meter_path(), lambda cur: _merge_meter(cur, m))
     if (raw.get('claude') or {}).get('refresh'):
         m['refreshed_now'] = ['claude']  # this call's own news; never written to the cache
+    if _codex_unavailable(m['codex']):
+        candidate = _stale_ok_codex(policy)
+        if admission and candidate:
+            return dict(m, codex=candidate)
+        return _stale_ok_notice(m, candidate)
     return m
 
 

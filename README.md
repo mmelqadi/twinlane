@@ -13,6 +13,12 @@ Works with Anthropic's Claude Code CLI and the OpenAI Codex CLI on Windows, macO
 
 ## What you can do
 
+Job admission waits through contention on `slots.lock` and `writers.lock`, with jittered retries
+and a visible `waiting for slot lock` or `waiting for writer lock` reason in `status.json` and the
+board. The default lock-wait bound is 30 minutes; set `jobs.lock_wait_s` in your config to change it.
+Process checks run outside the slot lock; admission rechecks job metadata under the lock before
+claiming capacity. Reviews retain priority and other waiters retain FIFO order.
+
 - **Wake the coordinating session.** Use `twinlane watch --name lead` to wait for completed jobs,
   batons waiting on lead, cached usage crossings and estimated context crossings.
 
@@ -139,6 +145,8 @@ Credits and extra usage are checked only when a job starts. A long Codex job can
 
 ## Common tasks
 
+Transient Codex meter failure: dispatch retries once, then may use a labelled `meter stale-ok (age Nm)` reading for up to 30 minutes; `twinlane meter --fresh` and the board still show the actual failure (see [LIMITS.md](LIMITS.md)).
+
 | I want to | Run |
 | --- | --- |
 | See both engines' usage, jobs and batons on one screen | `twinlane board` (`--md` for chat, `--watch 30` in a terminal) |
@@ -153,6 +161,7 @@ Credits and extra usage are checked only when a job starts. A long Codex job can
 | List exactly what landed, for a release | `twinlane ship plan` |
 | Check or clean up worktrees | `twinlane wt doctor`, then `twinlane wt prune` (dry run unless asked) |
 | See writer capacity and queued requests | `twinlane wip`; `twinlane wip next` pops one request without launching it; `twinlane wip pump` starts ready ones |
+| Find stalled work and safe recovery commands | `twinlane patrol`; `--fix` pumps ready requests and releases stale custody; `--loop 120 --quiet` repeats |
 | See why a job is waiting, and how busy the host is | `twinlane board` (host-load line and QUEUE section) |
 | See questions that need a person | `twinlane inbox` (ranked questions and hidden count; `--all` shows every question) |
 | Record a question's answer | `twinlane inbox answer task:H1 --grant "verbatim words"` or `--deny "reason"` |
@@ -161,6 +170,22 @@ Credits and extra usage are checked only when a job starts. A long Codex job can
 | Continue jobs lost to a reboot | `twinlane resume`, then `twinlane resume --all-lost --yes` |
 
 Every command takes `--help`. Exit codes: 0 ok, 2 usage, 3 refused by policy, 4 still running or lock held, 5 failed, 6 engine limit hit.
+
+Patrol's host reader is cache-only: it never samples the machine or starts a process. Missing samples,
+samples older than five minutes, and samples with no usable counters give host status `unknown`; they
+preserve the overload count and keep an existing overload finding as stale. `queue_ready` means engine
+slots and host allow the request; writer capacity is decided by the authoritative pump. With `--fix`,
+patrol records the pump's refusal as `queue_waiting`, retaining that reason on later reports until new
+evidence changes it. A `queue_stalled` finding requires a confirmed pump launch. `queue_claimed` marks an
+outstanding pump reservation, which patrol never replays; after ten minutes it asks a person to inspect
+it. Changing host measurements update `detail` without reopening a finding or resetting its hourly reminder.
+
+Patrol and `board.collect(file_only=True)` observe process liveness without spawning `ps`.
+On POSIX they use `/proc` when available or signal zero; an unreadable recorded identity stays
+`unknown` and occupies its slot. Runtime and pump queue waits use stable reason categories
+(host busy, engine stop, slots full, writer capacity, claimed, other); measurements stay in `detail`.
+Custody reporting takes no lock and creates no file. Failed folder or claim reads produce
+`patrol_error` and keep previous custody warnings stale until a complete snapshot is available.
 
 To teach a coding agent these commands, copy [`skills/twinlane/SKILL.md`](skills/twinlane/SKILL.md) into its skills folder (for example `~/.claude/skills/twinlane/` or `~/.codex/skills/twinlane/`).
 
@@ -323,12 +348,12 @@ Settings, all optional, in the user config:
 
 ```json
 {"hostload": {"enabled": true, "cpu_soft": 80, "cpu_hard": 98, "ram_free_soft_mb": 2048,
-              "ram_free_hard_mb": 512, "procs_soft": 16, "procs_hard": 32, "min_parallel": 2},
+              "ram_free_hard_mb": 512, "procs_soft": 16, "procs_hard": 32, "min_parallel": 2, "cpu_window_s": 20},
  "watchdog": {"enabled": true, "stall_s": 900, "poll_s": 15},
  "wip": {"autopump": true}}
 ```
 
-Between `soft` and `hard` the usable slots shrink linearly from `max_parallel` to `min_parallel`. A reading that cannot be taken never throttles.
+Between `soft` and `hard` the usable slots shrink linearly from `max_parallel` to `min_parallel`. A reading that cannot be taken never throttles. The CPU figure is the average over the last `cpu_window_s` seconds (5 to 120, default 20) from a short history of kernel counters kept in `state/hostload-cpu.json`, so a burst of short spikes does not read as an overload while a sustained one still does; with under 5 s of history it takes the lowest of three short samples.
 
 ## Worktree health
 

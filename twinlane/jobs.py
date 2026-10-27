@@ -13,6 +13,7 @@ from contextvars import ContextVar, copy_context
 import hashlib
 import json
 import os
+import random
 import re
 import secrets
 import shutil
@@ -30,6 +31,7 @@ _record_baton = None    # callable(slug, receipt) -> None
 _PRESERVING_METADATA = ContextVar('twinlane_preserving_metadata', default=False)
 _CURRENT_JOB = ContextVar('twinlane_current_metadata_job', default=None)
 _REAPED_CHILDREN = ContextVar('twinlane_reaped_children', default=None)
+_JOB_LOCK_DEADLINE = ContextVar('twinlane_job_lock_deadline', default=None)
 
 
 @contextmanager
@@ -118,7 +120,7 @@ def archive_lock(job_id: str, timeout_s=30):
     if path in held:
         yield
         return
-    with common.file_lock(path, timeout_s):
+    with common.file_lock(path, timeout_s, wait_until=_JOB_LOCK_DEADLINE.get()):
         _ARCHIVE_LOCKS.held = held | {path}
         try:
             yield
@@ -130,7 +132,7 @@ def archive_lock(job_id: str, timeout_s=30):
 def lifecycle_lock(job_id: str, name: str, timeout_s=30):
     with archive_lock(job_id, timeout_s):
         _, inner = lock_paths(job_id, name)
-        with common.file_lock(inner, timeout_s, create_parent=False):
+        with common.file_lock(inner, timeout_s, create_parent=False, wait_until=_JOB_LOCK_DEADLINE.get()):
             yield
 
 
@@ -190,7 +192,7 @@ def _other(engine: str) -> str:
 
 # ---------------------------------------------------------------- meter / route / baton access
 
-def _meter(policy: dict, fresh: bool = False, auto_refresh: bool = True) -> dict:
+def _meter(policy: dict, fresh: bool = False, auto_refresh: bool = True, admission: bool = True) -> dict:
     """auto_refresh renews an expired Claude token once per expiry (policy.meter.auto_refresh_claude)."""
     if _read_meter is not None:
         return _read_meter(policy)
@@ -220,7 +222,7 @@ def _meter(policy: dict, fresh: bool = False, auto_refresh: bool = True) -> dict
                     'cached underlying allowance is stale, unreadable or future-dated; no refresh performed')))
             cached[engine] = section
         return cached
-    return meter.read(fresh=fresh, policy=policy, auto_refresh=auto_refresh)
+    return meter.read(fresh=fresh, policy=policy, auto_refresh=auto_refresh, admission=admission)
 
 
 def _cached_meter() -> dict | None:
@@ -755,10 +757,88 @@ def tripwire_diff(before: dict, after: dict, cwd: str) -> dict:
 
 # ---------------------------------------------------------------- slots
 
-def slot_lock(timeout_s: float = 120):
+def slot_lock(timeout_s: float = 120, *, job_id=None, policy=None, deadline=None):
     """state/slots.lock held with an OS file lock: released by the OS if its holder dies, so there is
     no staleness guess (two waiters could each remove the other's fresh lock)."""
+    if job_id is not None:
+        return _job_start_lock('slots', job_id, policy, deadline)
     return common.file_lock(os.path.join(common.STATE, 'slots.lock'), timeout_s)
+
+
+def _lock_wait_seconds(policy=None):
+    policy = common.load_policy() if policy is None else policy
+    value = (policy.get('jobs') or {}).get('lock_wait_s', 1800)
+    try:
+        value = float(value)
+        if 0 < value < float('inf'):
+            return value
+    except (TypeError, ValueError):
+        pass
+    return 1800.0
+
+
+@contextmanager
+def _job_start_lock(name, job_id=None, policy=None, deadline=None, report=True):
+    """Extended waits only for job admission; owner sidecars are diagnostic, never leases."""
+    deadline = time.monotonic() + _lock_wait_seconds(policy) if deadline is None else deadline
+    noted = [False]
+
+    def waiting():
+        cell = _SLOT_STUCK.get()
+        if cell is not None and name == 'slots' and cell[0] is None:
+            cell[0] = time.monotonic()  # a native extended wait counts towards the same overall bound
+        if noted[0] or job_id is None or not report:
+            return
+        noted[0] = True  # the reason is a courtesy: a missing job folder or a failed write never fails the wait
+        if not os.path.isdir(_p(job_id, '')):
+            return
+        try:
+            st = common.read_json(_p(job_id, 'status.json'), {}) or {}
+            spec = common.read_json(_p(job_id, 'job.json'), {}) or {}
+            fields = {k: v for k, v in st.items() if k not in ('status', 'pid', 'pid_created', 'updated_at')}
+            fields.update(queue_reason=f"waiting for {'slot' if name == 'slots' else 'writer'} lock",
+                          waiting_lock=name, waiting_since=st.get('waiting_since') or common.iso(common.now()))
+            if name == 'slots':
+                fields.update(waiting_slot=True, queue_priority=queue_priority(spec.get('kind')))
+            _write_status(job_id, 'queued', **fields)
+        except OSError:
+            pass
+
+    _self_created()  # do not make the first process-identity query while holding the global lock
+    token = _JOB_LOCK_DEADLINE.set(deadline)
+    try:
+        with common.file_lock(os.path.join(common.STATE, name + '.lock'),
+                              wait_until=deadline, on_wait=waiting):
+            yield
+    finally:
+        _JOB_LOCK_DEADLINE.reset(token)
+
+
+_SLOT_PROBES = ContextVar('twinlane_slot_probes', default=None)
+
+
+class _AdmissionChanged(Exception):
+    pass
+
+
+@contextmanager
+def _slot_snapshot(engine, job_id, freeze=True):
+    """Probe processes outside slots.lock; reread ALL admission files under the lock.
+
+    An identity not observed in this attempt forces a new outside scan. Thus a concurrently
+    admitted runner is counted, never hidden by an old running-count snapshot. Nothing here
+    persists across attempts, and DEAD observations are tied to the recorded creation stamp.
+    """
+    probes = {'values': {}, 'frozen': False}
+    token = _SLOT_PROBES.set(probes)
+    try:
+        _self_created()
+        running_count(engine, exclude=job_id)
+        _waiters(engine, job_id)
+        probes['frozen'] = freeze  # the in-lock fallback probes only identities that appeared after the scan
+        yield
+    finally:
+        _SLOT_PROBES.reset(token)
 
 
 _SELF_CREATED = []
@@ -770,7 +850,29 @@ def _self_created():
     return _SELF_CREATED[0]
 
 
+def _inlock_budget() -> None:
+    """Work done while holding slots.lock (the in-lock probes of the fallback) stops at the shared bound and unwinds it."""
+    probes = _SLOT_PROBES.get()
+    # the streak's deadline, else the one this very lock wait ran under (a first attempt has no streak yet)
+    deadline = _SLOT_DEADLINE.get() or _JOB_LOCK_DEADLINE.get()
+    if probes is not None and probes.get('locked') and deadline is not None and time.monotonic() > deadline:
+        raise common.LockWaitTimeout('slot admission scan exceeded the lock-wait bound while holding slots.lock')
+
+
 def _pid_state(pid, created) -> str:
+    _inlock_budget()
+    probes = _SLOT_PROBES.get()
+    if probes is not None:
+        key = (repr(pid), repr(created))
+        if key not in probes['values']:
+            if probes['frozen']:
+                raise _AdmissionChanged()
+            probes['values'][key] = _probe_pid_state(pid, created)
+        return probes['values'][key]
+    return _probe_pid_state(pid, created)
+
+
+def _probe_pid_state(pid, created) -> str:
     if _PRESERVING_METADATA.get() and not (pid is None and created is None):
         if not common._valid_pid(pid) or not common._valid_stamp(created):
             return common.UNKNOWN
@@ -818,7 +920,7 @@ def _child_pending(job_id: str) -> bool:
     path = _p(job_id, CHILD_STARTING)
     if not os.path.exists(path):
         return False
-    if _preserve_job(job_id) or observations.active():
+    if _preserve_job(job_id) or observations.active() or _SLOT_PROBES.get() is not None:
         # Observe without reclaim. Pin bytes around the native check: a changed/unreadable
         # marker or invalid recorded identity holds; only definitive exact-stamp DEAD clears
         # the logical uncertainty. The file remains untouched, even across other tasks.
@@ -993,11 +1095,16 @@ def running_count(engine: str, exclude: str | None = None) -> int:
 
 
 def try_acquire_slot(job_id: str, engine: str, attempt: int, max_parallel: int) -> bool:
-    with slot_lock():
-        if running_count(engine, exclude=job_id) >= max_parallel:
-            return False
-        _write_status(job_id, 'running', engine=engine, attempt=attempt)
-        return True
+    try:
+        with _slot_snapshot(engine, job_id), slot_lock(job_id=job_id):
+            _SLOT_PROBES.get()['locked'] = True
+            if running_count(engine, exclude=job_id) >= max_parallel:
+                return False
+            _inlock_budget()
+            _write_status(job_id, 'running', engine=engine, attempt=attempt)
+            return True
+    except _AdmissionChanged:
+        return False
 
 
 def queue_priority(kind) -> int:
@@ -1033,32 +1140,81 @@ def slot_attempt(job_id: str, engine: str, attempt: int, configured: int, policy
     """(started, why not). The usable slots shrink as the host gets busy (hostload), and waiting jobs are
     served first-in-first-out with reviews first. A job is queued with a reason, never refused."""
     usable, host_why = hostload.effective_parallel(configured, hostload.sample(policy), policy)
-    with slot_lock():
-        running = running_count(engine, exclude=job_id)
-        if running >= usable:
-            return False, (f'engine slots full: {running}/{configured}' if running >= configured
-                           else host_why or f'engine slots full: {running}/{configured}')
-        ahead = [w for w in _waiters(engine, job_id) if w < _own_place(job_id)]
-        if len(ahead) >= usable - running:
-            return False, f"queued behind {len(ahead)} job{'' if len(ahead) == 1 else 's'}"
-        _write_status(job_id, 'running', engine=engine, attempt=attempt)
-        return True, None
+    # After SLOT_INLOCK_AFTER restarts in a row the snapshot is not frozen: under the lock only the identities that
+    # appeared since the outside scan are probed (a few, never the whole store), so that attempt cannot be
+    # invalidated and the oldest job always decides.
+    snapshot = _slot_snapshot(engine, job_id, freeze=not _SLOT_INLOCK.get())
+    try:
+        with snapshot, slot_lock(job_id=job_id, policy=policy, deadline=_SLOT_DEADLINE.get()):
+            _SLOT_PROBES.get()['locked'] = True
+            running = running_count(engine, exclude=job_id)
+            if running >= usable:
+                return False, (f'engine slots full: {running}/{configured}' if running >= configured
+                               else host_why or f'engine slots full: {running}/{configured}')
+            ahead = [w for w in _waiters(engine, job_id) if w < _own_place(job_id)]
+            if len(ahead) >= usable - running:
+                return False, f"queued behind {len(ahead)} job{'' if len(ahead) == 1 else 's'}"
+            waited = (common.read_json(_p(job_id, 'status.json'), {}) or {}).get('waiting_lock')
+            _inlock_budget()
+            _write_status(job_id, 'running', engine=engine, attempt=attempt)
+            return True, 'waited for slot lock' if waited else None
+    except _AdmissionChanged:
+        return False, ADMISSION_CHANGED
+
+
+ADMISSION_CHANGED = 'slot observations changed; retrying admission'
+SLOT_INLOCK_AFTER = 3
+WRITER_SWEEP_WAIT_S = 30  # release_stale_writers is a lead command: it fails fast, only job runners wait long
+_SLOT_DEADLINE = ContextVar('twinlane_slot_deadline', default=None)
+_SLOT_STUCK = ContextVar('twinlane_slot_stuck', default=None)
+_SLOT_INLOCK = ContextVar('twinlane_slot_inlock', default=False)
 
 
 def acquire_slot(job_id: str, engine: str, attempt: int, policy: dict) -> bool:
     """Blocks until a slot is free. Returns True when it had to wait. The reason it waits is in status.json."""
     configured = int(policy.get(engine, {}).get('max_parallel') or 4)
     waiting, last, since = False, None, None
+    stuck = [None]  # monotonic start of the current streak of lock waits / restarted scans; ONE bound covers it
+    changed = 0     # consecutive restarted scans
+    bound = _lock_wait_seconds(policy)
     while True:
-        started, why = slot_attempt(job_id, engine, attempt, configured, policy)
+        attempt_started = time.monotonic()
+        tokens = (_SLOT_DEADLINE.set(None if stuck[0] is None else stuck[0] + bound), _SLOT_STUCK.set(stuck),
+                  _SLOT_INLOCK.set(changed >= SLOT_INLOCK_AFTER))
+        try:
+            started, why = slot_attempt(job_id, engine, attempt, configured, policy)
+        except common.LockWaitTimeout:
+            raise
+        except TimeoutError as error:
+            if 'lock busy:' not in str(error):
+                raise
+            stuck[0] = attempt_started if stuck[0] is None else stuck[0]
+            if time.monotonic() - stuck[0] >= bound:
+                raise common.LockWaitTimeout(f'lock stayed busy for {bound / 60:.3f} '
+                                             'minutes: slots.lock') from error
+            started, why = False, 'waiting for slot lock'
+        finally:
+            for var, token in zip((_SLOT_DEADLINE, _SLOT_STUCK, _SLOT_INLOCK), tokens):
+                var.reset(token)
         if started:
-            return waiting
+            return waiting or why == 'waited for slot lock'
+        if why == ADMISSION_CHANGED:
+            changed += 1
+            stuck[0] = attempt_started if stuck[0] is None else stuck[0]
+            if time.monotonic() - stuck[0] >= bound:
+                raise common.LockWaitTimeout(f'slot admission stayed contended for {bound / 60:.3f} minutes')
+        else:
+            changed = 0
+            if why != 'waiting for slot lock':
+                stuck[0] = None  # a normal answer (slots full, queued behind, host busy) ends the streak
         if not waiting or why != last:
-            since = since or common.iso(common.now())
+            since = since or (common.read_json(_p(job_id, 'status.json'), {}) or {}).get('waiting_since') \
+                or common.iso(common.now())
             _write_status(job_id, 'queued', engine=engine, attempt=attempt, waiting_slot=True, queue_reason=why,
                           waiting_since=since, queue_priority=_own_place(job_id)[0])
             waiting, last = True, why
-        time.sleep(SLOT_POLL_S * (2.5 if (why or '').startswith('host busy') else 1))
+        time.sleep(SLOT_POLL_S * random.uniform(0.75, 1.25)
+                   * (2.5 if (why or '').startswith('host busy') else 1))
 
 
 def _write_status(job_id: str, status: str, **extra) -> None:
@@ -1840,7 +1996,90 @@ def _log_custody_release(job_id: str, cwd, why: str) -> None:
         pass
 
 
-def release_stale_writers(dry_run: bool = False) -> list:
+def stale_writers_snapshot(deadline: float | None = None) -> list:
+    """Read-only custody evidence, without locks or writes. Any incomplete claim read raises.
+
+    A missing writers folder is complete and empty; other listing failures, vanished/unreadable
+    claims and malformed owners cannot prove earlier custody warnings resolved. Release still
+    takes its own lock and revalidates each claim through release_stale_writers.
+    """
+    folder = os.path.join(common.STATE, 'writers')
+    try:
+        names = sorted(n for n in os.listdir(folder) if n.endswith('.json'))
+    except FileNotFoundError:
+        return []
+    out = []
+    def object_file(path):
+        try:
+            with open(path, encoding='utf-8') as handle:
+                value = json.load(handle)
+        except FileNotFoundError:
+            return None
+        if not isinstance(value, dict):
+            raise ValueError('incomplete custody evidence: ' + os.path.basename(path))
+        return value
+
+    def present(path):
+        try:
+            os.stat(path)
+            return True
+        except FileNotFoundError:
+            return False
+
+    with common.nonspawning_liveness(), observations.scope():
+        for name in names:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError('custody scan budget exhausted')
+            with open(os.path.join(folder, name), encoding='utf-8') as handle:
+                owner = json.load(handle)
+            if not isinstance(owner, dict) or not isinstance(owner.get('id'), str):
+                raise ValueError('unreadable writer claim: ' + name)
+            jid = owner['id']
+            try:
+                os.stat(_p(jid, ''))
+            except FileNotFoundError:
+                why = 'owner job folder is gone and its runner pid is dead' \
+                    if _pid_state(owner.get('pid'), owner.get('created')) == common.DEAD else None
+            else:
+                # Read once, strictly. _custody_stale's tolerant None is also used by
+                # admission/release and cannot distinguish an unreadable receipt.
+                receipt = object_file(_p(jid, 'result.json'))
+                st = object_file(_p(jid, 'status.json')) or {}
+                if receipt is None and st.get('status') not in ('queued', 'running', 'waiting'):
+                    raise ValueError('incomplete custody evidence: missing receipt/status')
+                why = None
+                markers = [present(_p(jid, m)) for m in (CHILD_STARTING, SURVIVOR, TREE_UNRESOLVED)]
+                if receipt is not None and receipt.get('status') not in TERMINAL:
+                    raise ValueError('incomplete custody evidence: invalid receipt status')
+                if receipt is not None and not isinstance(receipt.get('survivor'), dict) and not any(markers):
+                    pid, created = st.get('pid'), st.get('pid_created')
+                    if not pid:
+                        try:
+                            with open(_p(jid, 'runner.pid'), encoding='utf-8') as handle:
+                                parts = handle.read().split()
+                        except FileNotFoundError:
+                            parts = []
+                        if parts and (len(parts) not in (1, 2) or not all(p.isascii() and p.isdigit() for p in parts)):
+                            raise ValueError('incomplete custody evidence: invalid runner identity')
+                        pid = int(parts[0]) if parts else None
+                        created = int(parts[1]) if len(parts) == 2 else None
+                    states = [_pid_state(pid, created), _child_state(st)]
+                    if common.ALIVE not in states:
+                        if common.UNKNOWN not in states:
+                            why = 'job finished and its runner and engine are gone'
+                        else:
+                            ended = common.parse_time(receipt.get('ended_at')) or common.parse_time(st.get('updated_at'))
+                            if st.get('runner_finalized') is True and ended is not None and \
+                                    (common.now() - ended).total_seconds() >= CUSTODY_GRACE_S:
+                                why = 'job finished past custody grace and marked itself finalized; pid identity unreadable'
+                            else:
+                                raise ValueError('incomplete custody evidence: process identity unreadable')
+            if why:
+                out.append({'id': jid, 'cwd': owner.get('cwd'), 'why': why, 'released': False})
+    return out
+
+
+def release_stale_writers(dry_run: bool = False, deadline: float | None = None) -> list:
     """Remove writer claims whose job is finished and gone (see _custody_stale). -> rows with `released`."""
     out = []
     folder = os.path.join(common.STATE, 'writers')
@@ -1848,8 +2087,12 @@ def release_stale_writers(dry_run: bool = False) -> list:
         names = sorted(n for n in os.listdir(folder) if n.endswith('.json'))
     except OSError:
         return out
-    with common.file_lock(os.path.join(common.STATE, 'writers.lock'), 30):
+    # a lead command (patrol, wt doctor --fix): it fails fast, only job runners wait on the long bound
+    wait_until = time.monotonic() + WRITER_SWEEP_WAIT_S if deadline is None else deadline
+    with _job_start_lock('writers', deadline=wait_until):
         for name in names:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError('custody scan budget exhausted')
             path = os.path.join(folder, name)
             owner = common.read_json(path)
             if not isinstance(owner, dict) or not isinstance(owner.get('id'), str):
@@ -1865,6 +2108,8 @@ def release_stale_writers(dry_run: bool = False) -> list:
                 continue
             row = {'id': jid, 'cwd': owner.get('cwd'), 'why': why, 'released': False}
             if not dry_run:
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError('custody release budget exhausted')
                 try:
                     os.remove(path)
                     row['released'] = True
@@ -1889,7 +2134,7 @@ def _claim_writer(spec: dict) -> str | None:
         raise Refusal(common.EXIT_REFUSED,
                       f'cannot establish the worktree root: git says {top.strip()}, the folder walk says {cwd}')
     path = _writer_path(cwd)
-    with common.file_lock(os.path.join(common.STATE, 'writers.lock'), 30):
+    with _job_start_lock('writers', jid):
         if os.path.exists(path):
             if _PRESERVING_METADATA.get():
                 raise Refusal(common.EXIT_REFUSED, 'existing writer reservation is protected; no replacement or cleanup')
@@ -1972,7 +2217,7 @@ def _claim_writer(spec: dict) -> str | None:
 
 def _release_writer(path: str, job_id: str) -> None:
     try:
-        with common.file_lock(os.path.join(common.STATE, 'writers.lock'), 30):
+        with _job_start_lock('writers', job_id, report=False):
             owner = common.read_json(path)
             if isinstance(owner, dict) and owner.get('id') == job_id and not _writer_job_busy(job_id):
                 os.remove(path)
@@ -2332,9 +2577,9 @@ def _bounded_after_meter(policy: dict, timeout_s: float, notes: list | None = No
     def work():
         try:
             with meter_mod.deferred_cache_writes() as pending:
-                m = _meter(policy, auto_refresh=False)
+                m = _meter(policy, auto_refresh=False, admission=False)
                 if any(((common.age_s((m.get(e) or {}).get('reading_at')) or 0) > USAGE_AFTER_LAG_S) for e in ENGINES):
-                    m = _meter(policy, fresh=True, auto_refresh=False)
+                    m = _meter(policy, fresh=True, auto_refresh=False, admission=False)
             box['pending'], box['m'] = pending, m
         except BaseException as e:  # noqa: BLE001 - handed to the caller
             box['err'] = e
@@ -3829,6 +4074,9 @@ def _parse(ap: argparse.ArgumentParser, argv):
 # ---------------------------------------------------------------- listing / status
 
 def _job_ids() -> list[str]:
+    if _SLOT_PROBES.get() is not None:
+        # An enclosing board/command snapshot must not hide a newly admitted job.
+        return sorted(observations.Snapshot().directories(), reverse=True)
     return observations.job_ids()
 
 

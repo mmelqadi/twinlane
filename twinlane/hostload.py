@@ -11,6 +11,7 @@ nothing is measured unless a test installs a sampler, so a loaded CI machine can
 Thresholds live in the user config under "hostload" (all optional):
   enabled            true
   cpu_soft/cpu_hard  80 / 98   percent busy: slots shrink linearly between the two
+  cpu_window_s       20        the CPU figure averages this long (5..120), so a spike is not an overload
   ram_free_soft_mb   2048      free physical RAM: slots shrink below this ...
   ram_free_hard_mb   512       ... down to min_parallel at this
   procs_soft/hard    16 / 32   live codex / sandbox processes
@@ -28,9 +29,18 @@ import time
 from . import common
 
 DEFAULTS = {'enabled': True, 'cpu_soft': 80, 'cpu_hard': 98, 'ram_free_soft_mb': 2048, 'ram_free_hard_mb': 512,
-            'procs_soft': 16, 'procs_hard': 32, 'min_parallel': 2, 'sample_ttl_s': 3}
+            'procs_soft': 16, 'procs_hard': 32, 'min_parallel': 2, 'sample_ttl_s': 3, 'cpu_window_s': 20}
 # Image names that count as engine load: the Codex CLI and the sandbox helpers it spawns.
 ENGINE_PROCESS_NAMES = ('codex.exe', 'codex', 'codex-command-runner.exe', 'codex-windows-sandbox-setup.exe')
+
+# CPU is averaged over `cpu_window_s` from a short history of cumulative counters. With less than CPU_MIN_SPAN_S of
+# history (first call, or a stale file) the figure is the lowest of CPU_COLD_SAMPLES short windows instead: a spike
+# must be present in all of them to count.
+CPU_MIN_SPAN_S = 5
+CPU_HIST_MAX = 20
+CPU_HIST_STALE_S = 300
+CPU_HIST_KEEP_S = 40  # history kept beyond the window
+CPU_COLD_SAMPLES = 3
 
 _SAMPLER = None  # tests install a callable returning a sample dict
 
@@ -61,6 +71,7 @@ def settings(policy: dict | None) -> dict:
     if out['procs_hard'] <= out['procs_soft']:
         out['procs_hard'] = out['procs_soft'] + 1
     out['min_parallel'] = max(1, int(out['min_parallel']))
+    out['cpu_window_s'] = min(120, max(5, out['cpu_window_s']))
     return out
 
 
@@ -193,19 +204,85 @@ def _ps_engine_procs() -> int | None:
     return sum(1 for line in text.splitlines() if os.path.basename(line.strip()).lower() in names)
 
 
-def measure() -> dict:
-    """One real reading. Every field is None when it could not be read."""
-    out = {'cpu_pct': None, 'ram_free_mb': None, 'engine_procs': None, 'heap': None}
+def _busy_pct(idle: float, total: float) -> float | None:
+    if total <= 0:
+        return None
+    return round(max(0.0, min(100.0, 100.0 * (total - idle) / total)), 1)
+
+
+def _hist_path() -> str:
+    return os.path.join(common.STATE, 'hostload-cpu.json')
+
+
+def _read_hist(now: float, cur) -> list:
+    """The stored (t, idle, total) points, oldest first; [] when stale, from the future or not monotonic."""
+    raw = common.read_json(_hist_path(), None)
+    points = []
     try:
-        times = _win_times if common.IS_WIN else _posix_times
+        for p in raw if isinstance(raw, list) else []:
+            if isinstance(p, list) and len(p) == 3 and all(type(x) in (int, float) and math.isfinite(x) for x in p):
+                points.append((float(p[0]), p[1], p[2]))
+    except (OverflowError, ValueError, TypeError):
+        return []  # an absurd number in the file (10**400): the whole history is garbage
+    points.sort()
+    if not points or now - points[-1][0] > CPU_HIST_STALE_S or points[-1][0] > now + 1:
+        return []
+    for a, b in zip(points, points[1:]):
+        if b[1] < a[1] or b[2] < a[2]:
+            return []  # counters ran backwards (reboot, wrap): the old history says nothing
+    if cur[0] < points[-1][1] or cur[1] < points[-1][2]:
+        return []
+    return points
+
+
+def _cpu_pct(times, window_s: float, now: float) -> float | None:
+    """Busy share averaged over the last `window_s`, from a rolling history of cumulative counters."""
+    cur = times()
+    if not cur:
+        return None
+    point = (now, cur[0], cur[1])
+    hist = [p for p in _read_hist(now, cur) if now - p[0] <= window_s + CPU_HIST_KEEP_S]
+    base = None
+    for p in hist:  # oldest first: keep the newest point that is still at least a full window old
+        if now - p[0] >= window_s:
+            base = p
+    if base is None and hist and now - hist[0][0] >= CPU_MIN_SPAN_S:
+        base = hist[0]  # less than a window of history: the longest span there is
+    if base is not None and now - base[0] > 2 * window_s:
+        base = None  # a gap in the history: the average would cover far more than one window, and hide a recent load
+    # points are spaced so that CPU_HIST_MAX of them always span the whole window, however many runners sample
+    spacing = max(1.0, (window_s + CPU_HIST_KEEP_S) / (CPU_HIST_MAX - 1))
+    if not hist or now - hist[-1][0] >= spacing:
+        hist.append(point)
+    try:
+        common.write_json(_hist_path(), [list(p) for p in hist[-CPU_HIST_MAX:]])
+    except OSError:
+        pass
+    if base is not None:
+        pct = _busy_pct(point[1] - base[1], point[2] - base[2])
+        if pct is not None:
+            return pct
+    readings = []
+    for i in range(CPU_COLD_SAMPLES):
         first = times()
         time.sleep(0.25)
         second = times()
         if first and second:
-            idle, total = second[0] - first[0], second[1] - first[1]
-            if total > 0:
-                out['cpu_pct'] = round(max(0.0, min(100.0, 100.0 * (total - idle) / total)), 1)
-    except (OSError, ValueError, AttributeError, ImportError, IndexError):
+            pct = _busy_pct(second[0] - first[0], second[1] - first[1])
+            if pct is not None:
+                readings.append(pct)
+        if i < CPU_COLD_SAMPLES - 1:
+            time.sleep(0.2)
+    return min(readings) if readings else None
+
+
+def measure(window_s: float = DEFAULTS['cpu_window_s'], now: float | None = None) -> dict:
+    """One real reading. Every field is None when it could not be read."""
+    out = {'cpu_pct': None, 'ram_free_mb': None, 'engine_procs': None, 'heap': None}
+    try:
+        times = _win_times if common.IS_WIN else _posix_times
+        out['cpu_pct'] = _cpu_pct(times, window_s, time.time() if now is None else now)
+    except (OSError, ArithmeticError, ValueError, AttributeError, ImportError, IndexError, TypeError):
         pass
     if out['cpu_pct'] is None and not common.IS_WIN:
         out['cpu_pct'] = _loadavg_pct()
@@ -233,6 +310,18 @@ def _cache_path() -> str:
     return os.path.join(common.STATE, 'hostload.json')
 
 
+def cached(now: float | None = None) -> tuple[dict, float] | None:
+    """Last on-disk sample and its age, or None. Never measures, spawns or writes."""
+    reading = common.read_json(_cache_path(), None)
+    if not isinstance(reading, dict):
+        return None
+    at = reading.get('at')
+    now = time.time() if now is None else now
+    if type(at) not in (int, float) or not math.isfinite(at) or not 0 <= at <= now:
+        return None
+    return reading, now - at
+
+
 def sample(policy: dict | None = None, now: float | None = None) -> dict | None:
     """The shared host reading, at most `sample_ttl_s` old; None when disabled or nothing could be read."""
     cfg = settings(policy)
@@ -247,7 +336,7 @@ def sample(policy: dict | None = None, now: float | None = None) -> dict | None:
     if isinstance(cached, dict) and type(cached.get('at')) in (int, float) \
             and 0 <= now - cached['at'] <= cfg['sample_ttl_s']:
         return cached
-    reading = measure()
+    reading = measure(cfg['cpu_window_s'], now)
     reading['at'] = now
     try:
         common.write_json(_cache_path(), reading)

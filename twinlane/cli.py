@@ -4,6 +4,7 @@
   twinlane status                       both meters + running jobs + batons (one screen)
   twinlane status JOB                   job state, exit code, completion time and receipt
   twinlane watch [--name lead] [--timeout 3300] [--interval 5] [--json]   wait for coordination events
+  twinlane patrol [--fix] [--json] [--loop SECONDS] [--max-runs N] [--quiet]   file-only work checks
   twinlane --version                    development version and best-effort source commit
   twinlane board [--json | --md] [--all] [--finished N] [--watch SECONDS]   one read-only screen for a lead session
   twinlane meter [--json] [--fresh]
@@ -143,6 +144,9 @@ def main(argv=None):
     if argv and argv[0] == 'watch':
         from twinlane import watch
         return watch.cli(argv[1:])
+    if argv and argv[0] == 'patrol':
+        from twinlane import patrol
+        return patrol.cli(argv[1:])
     if argv and argv[0] == 'board':  # read-only: dispatched before ensure_dirs, so it creates no directory
         from twinlane import board
         return board.cli(argv[1:])
