@@ -367,7 +367,12 @@ def sample(policy: dict | None = None, now: float | None = None) -> dict | None:
 
 def _finite(value) -> bool:
     """A usable count: a real number that is not NaN or infinite (a garbled cache file must not raise)."""
-    return type(value) in (int, float) and math.isfinite(value)
+    if type(value) not in (int, float):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:  # a JSON integer too large for a float
+        return False
 
 
 def pressure(reading: dict | None, cfg: dict) -> tuple[float, str | None]:
