@@ -1830,28 +1830,29 @@ UNREAD_RE = re.compile(
     r" (?:repository|repo|workspace|checkout|codebase|code|project|files)\b(?!'s\b)"
     r"|(?:shell|shell calls?|shell commands?|commands?) (?:is |are |was |were )?(?:unavailable|not available|hung|hanging|timed out)"
     r"|no shell (?:access|available))")
-UNREAD_VERDICT_RE = re.compile(r"\b(?:pass|block|approve|reject|verdict|lgtm)\b", re.I)
+UNREAD_VERDICT_RE = re.compile(r"^[\s*_#>`-]*(?:verdict\s*[:-]?\s*)?[*_`]*(?:pass|block|approve|reject|lgtm)\b", re.I)
 UNREAD_QUOTED_RE = re.compile(
     '"[^"]*"' + '|(`+)[^`]*?' + chr(92) + '1'
     + '|' + chr(0x201c) + '[^' + chr(0x201d) + ']*' + chr(0x201d)
     + "|(?<!\\w)'[^']*'(?!\\w)")
-UNREAD_HEAD_CHARS, UNREAD_MAX_CHARS = 600, 1500
+UNREAD_SENTENCE_RE = re.compile(r"(?<=[.!?])\s|\n")
+UNREAD_HEAD_CHARS, UNREAD_MAX_CHARS = 300, 800
 
 
 def _final_says_unread(text) -> bool:
-    """True for a short final message that opens by saying the repository or files could not be read.
+    """True for a SHORT final message whose first sentence says the repository or files could not be read.
 
-    A message that uses a verdict word (PASS, BLOCK, ...) anywhere is a result, a phrase inside quotation marks or
-    backticks is being quoted, not reported, and a caveat about one part ("the repository's README", one file) is
-    not the whole repository; quoted spans are removed from the whole text before the head window is cut."""
-    if not isinstance(text, str) or len(text.strip()) >= UNREAD_MAX_CHARS:
+    Real reports are long and a review opens with its verdict, so the check is deliberately narrow: a message of
+    UNREAD_MAX_CHARS or more is never judged, one that starts with a verdict word (PASS, BLOCK, ...) is a result, a
+    phrase inside quotation marks or backticks is being quoted, and a caveat about one part ("the repository's
+    README") or a later sentence is not the whole task. A message the rule misses stays `done` and the lead reads it."""
+    if not isinstance(text, str):
         return False
-    body = text.strip().replace(chr(0x2019), "'").replace(chr(0x2018), "'")
-    body = UNREAD_QUOTED_RE.sub(' ', body)
-    if UNREAD_VERDICT_RE.search(body):
+    raw = text.strip().replace(chr(0x2019), "'").replace(chr(0x2018), "'")
+    if not raw or len(raw) >= UNREAD_MAX_CHARS or UNREAD_VERDICT_RE.match(raw):
         return False
-    head = ' '.join(body[:UNREAD_HEAD_CHARS].lower().split())
-    return UNREAD_RE.search(head) is not None
+    first = UNREAD_SENTENCE_RE.split(UNREAD_QUOTED_RE.sub(' ', raw).strip(), 1)[0]
+    return UNREAD_RE.search(' '.join(first[:UNREAD_HEAD_CHARS].lower().split())) is not None
 
 
 # ---------------------------------------------------------------- failover
