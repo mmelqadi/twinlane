@@ -1214,7 +1214,9 @@ def acquire_slot(job_id: str, engine: str, attempt: int, policy: dict, record: d
                  deadline=None) -> bool:
     """Blocks until a slot is free. Returns True when it had to wait. The reason it waits is in status.json.
 
-    Contention on slots.lock is a wait, never a failure: a busy host must not turn queued work into failed work.
+    Transient contention on slots.lock is a wait, not a failure: a busy host must not turn queued work into failed
+    work. Sustained contention past the lock-wait bound raises LockWaitTimeout, and the job's own deadline raises
+    JobDeadline (it wins when both have elapsed).
     When `record` is a dict and the job waited, it receives `slot_wait_s` and the distinct `slot_wait_reasons`
     (first SLOT_WAIT_REASONS_MAX), so the receipt shows what held a job back instead of only that it started late."""
     configured = int(policy.get(engine, {}).get('max_parallel') or 4)

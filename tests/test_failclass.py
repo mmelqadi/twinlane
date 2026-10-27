@@ -137,6 +137,47 @@ class PreflightReady(tj.JobsBase):
             with self.assertRaises(jobs.JobDeadline):  # a retry needs its floor
                 jobs._launch_budget({'deadline_monotonic': 100.5}, 7)
 
+    def test_queue_contention_that_spends_the_budget_stops_admission(self):
+        jid = '20261026-100010-codex-aaaa'; os.makedirs(jobs.job_dir(jid))
+        jobs._write_status(jid, 'queued', engine='codex')
+        clock, calls = [100.0], []
+        def full(*a, **k):
+            calls.append(clock[0]); clock[0] += 3  # each admission attempt costs 3 s of the job's budget
+            return False, 'engine slots full: 1/1'
+        with mock.patch.object(jobs.time, 'monotonic', side_effect=lambda: clock[0]),                 mock.patch.object(jobs.time, 'sleep', side_effect=lambda s: clock.__setitem__(0, clock[0] + s)),                 mock.patch.object(jobs, 'slot_attempt', side_effect=full):
+            with self.assertRaises(jobs.JobDeadline):
+                jobs.acquire_slot(jid, 'codex', 1, copy.deepcopy(tj.POLICY), deadline=105.0)
+        self.assertEqual(len(calls), 2)  # 100 s, then ~103 s after the jittered poll: none starts after 105 s
+        self.assertTrue(all(t < 105.0 for t in calls), calls)
+
+    def test_lock_wait_classification_and_internal_wait_report(self):
+        jid = '20261026-100011-codex-aaaa'; os.makedirs(jobs.job_dir(jid))
+        jobs._write_status(jid, 'queued', engine='codex')
+        policy = copy.deepcopy(tj.POLICY)
+        clock = [100.0]
+        with mock.patch.object(jobs.time, 'monotonic', side_effect=lambda: clock[0]):
+            # Unrelated TimeoutErrors are not lock waits: they propagate unchanged.
+            with mock.patch.object(jobs, 'slot_attempt', side_effect=TimeoutError('something else')):
+                with self.assertRaisesRegex(TimeoutError, 'something else'):
+                    jobs.acquire_slot(jid, 'codex', 1, policy, deadline=200.0)
+            # A lock-wait bound inside the job budget stays LockWaitTimeout ...
+            with mock.patch.object(jobs, 'slot_attempt', side_effect=common.LockWaitTimeout('bound')):
+                with self.assertRaises(common.LockWaitTimeout) as raised:
+                    jobs.acquire_slot(jid, 'codex', 1, policy, deadline=200.0)
+                self.assertNotIsInstance(raised.exception, jobs.JobDeadline)
+            # ... and becomes the job's timeout once the job deadline has also passed.
+            def late(*a, **k):
+                clock[0] = 300.0
+                raise common.LockWaitTimeout('bound')
+            with mock.patch.object(jobs, 'slot_attempt', side_effect=late):
+                with self.assertRaises(jobs.JobDeadline):
+                    jobs.acquire_slot(jid, 'codex', 1, policy, deadline=200.0)
+            # Admitted on the first attempt after an internal lock wait: reported as waited, with a reason.
+            rec = {}
+            with mock.patch.object(jobs, 'slot_attempt', return_value=(True, 'waited for slot lock')):
+                self.assertTrue(jobs.acquire_slot(jid, 'codex', 1, policy, record=rec, deadline=400.0))
+            self.assertEqual(rec['slot_wait_reasons'], ['waiting for slot lock'])
+
     def test_runner_hands_its_absolute_deadline_to_the_watchdog(self):
         jid = '20261026-100008-claude-aaaa'; os.makedirs(jobs.job_dir(jid))
         files = jobs._attempt_files(jid, 1)
