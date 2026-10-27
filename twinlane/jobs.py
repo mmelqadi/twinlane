@@ -1827,7 +1827,7 @@ UNREAD_RE = re.compile(
     r"^(?:[a-z][a-z ]{0,20}:\s+)?(?:(?:sorry|unfortunately)\s*[,.:-]*\s+)?"
     r"(?:(?:(?:i|we) )?(?:could not|couldn't|cannot|can't|can not|am unable to|was unable to|unable to|failed to|did not manage to) "
     r"(?:read|access|open|inspect|see)(?: (?:any|all|the|your|this))?(?: (?:source|repo|repository|workspace|checkout|code|project))?"
-    r" (?:repository|repo|workspace|checkout|codebase|code|project|files)(?=[ ]*(?:[.,;:!-]|$|(?:because|so|and|as|due|since|from|in|on|here|at|with|via)\b))"
+    r" (?:repository|repo|workspace|checkout|codebase|code|project|files)(?=[ ]*(?:[.,;:!-]|$|(?:because|so|and|as|due|since|from this (?:sandbox|environment|session))\b))"
     r"|(?:the )?(?:shell|shell calls?|shell commands?|commands?) (?:is|are|was|were) (?:unavailable|not available)"
     r"|no shell (?:access|available)(?=[ ]*(?:[.,;:!-]|$|(?:so|and|because|as|here|in|on)\b)))", re.I)
 UNREAD_VERDICT_RE = re.compile(r"^[\s*_#>`-]*(?:verdict\s*[:-]?\s*)?[*_`]*(?:pass|block|approve|reject|lgtm)\b", re.I)
@@ -1835,7 +1835,7 @@ UNREAD_QUOTED_RE = re.compile(
     '"[^"]*"' + '|(`+)[^`]*?' + chr(92) + '1'
     + '|' + chr(0x201c) + '[^' + chr(0x201d) + ']*' + chr(0x201d)
     + "|(?<!\\w)'[^']*'(?!\\w)")
-UNREAD_RECOVERED_RE = re.compile(r"\b(?:but|however|although|though|recovered|resolved|fixed|fix|now|eventually|after|once|retried|succeeded)\b")
+UNREAD_RECOVERED_RE = re.compile(r"\b(?:but|however|although|though|recovered|resolved|fixed|fix|now|eventually|after|once|retried|succeeded|completed|finished|reviewed|done)\b")
 UNREAD_SENTENCE_RE = re.compile(r"(?<=[.!?])\s|\n")
 UNREAD_HEAD_CHARS, UNREAD_MAX_CHARS = 300, 800
 
